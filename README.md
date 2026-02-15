@@ -1,53 +1,73 @@
-# 🎙️ 2025 Discord Real-time STT Bot (High Performance)
+# 🎙️ Discord Real-time STT Bot
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue?style=for-the-badge&logo=python&logoColor=white)
 ![Discord.py](https://img.shields.io/badge/Discord.py-2.0%2B-5865F2?style=for-the-badge&logo=discord&logoColor=white)
 ![Faster-Whisper](https://img.shields.io/badge/Faster--Whisper-Large--v3-success?style=for-the-badge)
 ![Silero VAD](https://img.shields.io/badge/Silero%20VAD-High%20Accuracy-orange?style=for-the-badge)
 
-> **The Ultimate Low-Latency Speech-to-Text Solution for Discord.**
-> Built for speed, accuracy, and stability using a multi-process architecture.
+> **High-performance, low-latency Speech-to-Text for Discord voice channels.**
+> Process-isolated architecture ensures the bot **never** freezes during inference.
 
 ---
 
-## ⚡ Why This Project?
+## ⚡ Key Features
 
-This is not just another Discord bot. It is a **highly optimized engineering solution** designed to solve the common pitfalls of real-time audio processing: **Latency**, **Freezing**, and **Accuracy**.
-
-Most bots fail because they run heavy AI models on the same thread as the Discord heartbeat, causing "Application did not respond" errors. We solved this with a **Process-Isolated Architecture**.
-
-### 🚀 Key Engineering Highlights
-
--   **Multiprocessing Core**: The STT engine runs in a completely separate process, communicating via IPC Queues. The bot *never* freezes, even under heavy load.
--   **Zero-Latency Feel**:
-    -   **Ring Buffer Technology**: Captures 300ms of pre-speech context so the first syllable is never cut off.
-    -   **Silero VAD**: State-of-the-art Voice Activity Detection filters out breathing and keyboard clicks instantly.
-    -   **Faster-Whisper**: Uses CTranslate2-powered Whisper for 4x faster inference than standard OpenAI Whisper.
--   **Memory Safe**: Implements an **Auto-Cleanup Garbage Collector** that aggressively frees memory for inactive users.
+| Feature | Implementation |
+|---|---|
+| **Multiprocessing Core** | STT runs in an isolated process — bot never freezes |
+| **Anti-aliased Resampling** | `torchaudio` Kaiser-window filter (48 kHz → 16 kHz) |
+| **Ring Buffer** | 320 ms pre-speech context — first syllable is never cut |
+| **Silero VAD** | State-of-the-art voice activity detection |
+| **Faster-Whisper** | CTranslate2 — 4× faster than OpenAI Whisper |
+| **Structured Logging** | Python `logging` with module-level loggers |
+| **Graceful Shutdown** | Signal handlers for clean exit |
+| **Per-User State** | Encapsulated `UserState` dataclass per speaker |
 
 ---
 
 ## 🛠️ Architecture
 
-This project uses a sophisticated pipeline to handle audio streams.
-
 ```mermaid
 graph TD
-    subgraph "Main Process (Discord Bot)"
-        A[Discord Gateway] -->|Opus Audio| B(AudioSink)
-        B -->|PCM 48kHz| C{Resampler}
+    subgraph "Main Process — Discord Bot"
+        A[Discord Gateway] -->|Opus Audio| B["AudioSink<br/>(bot/audio_sink.py)"]
+        B -->|PCM 48kHz Stereo| C["Resampler<br/>(audio/resampler.py)"]
         C -->|PCM 16kHz Mono| D[IPC Audio Queue]
-        H[IPC Result Queue] -->|JSON| I[Message Sender]
+        H[IPC Result Queue] -->|JSON| I["ResultHandler<br/>(bot/client.py)"]
     end
 
-    subgraph "STT Process (Isolated)"
-        D --> E[Ring Buffer]
-        E -->|Frame| F{Silero VAD}
-        F -- Speech Detected --> G[Accumulator]
-        F -- Silence --> G
-        G -- End of Speech --> J[Faster-Whisper Model]
-        J -->|Text| H
+    subgraph "STT Process — Isolated"
+        D --> E["UserStateManager<br/>(stt/user_state.py)"]
+        E -->|32ms Frames| F["Silero VAD<br/>(stt/vad.py)"]
+        F -->|Speech Segments| G["Faster-Whisper<br/>(stt/transcriber.py)"]
+        G -->|Text| H
     end
+```
+
+---
+
+## 📁 Project Structure
+
+```
+Discord-Realtime-STT-Bot/
+├── main.py                 # Entry point (graceful shutdown)
+├── config.py               # Grouped configuration (dataclasses)
+├── bot/
+│   ├── client.py           # Bot setup, commands, result handler
+│   └── audio_sink.py       # AudioSink + resampling bridge
+├── audio/
+│   ├── resampler.py        # torchaudio anti-aliased resampling
+│   └── ring_buffer.py      # Generic ring buffer
+├── stt/
+│   ├── processor.py        # STT process main loop
+│   ├── vad.py              # Silero VAD wrapper
+│   ├── transcriber.py      # Faster-Whisper wrapper
+│   └── user_state.py       # Per-user state dataclass + manager
+├── utils/
+│   └── logging.py          # Structured logging config
+├── requirements.txt
+├── .env                    # DISCORD_TOKEN=your_token_here
+└── README.md
 ```
 
 ---
@@ -56,7 +76,7 @@ graph TD
 
 ### Prerequisites
 -   **Python 3.10+**
--   **NVIDIA GPU** (Highly Recommended for <0.5s latency)
+-   **NVIDIA GPU** (Recommended for <0.5s latency)
 -   **FFmpeg** (Required for audio processing)
 
 ### 1. Clone & Install
@@ -65,63 +85,66 @@ git clone https://github.com/your-repo/discord-stt-bot.git
 cd discord-stt-bot
 pip install -r requirements.txt
 ```
-> *Note: This installs `torch` and `faster-whisper`. The total size may exceed 2GB.*
+> *Note: `torch` + `faster-whisper` may exceed 2 GB total.*
 
 ### 2. Configuration
-Create a `.env` file in the root directory:
+Create a `.env` file:
 ```env
 DISCORD_TOKEN=your_super_secret_token_here
 ```
 
+Fine-tune settings in `config.py` (all grouped by category).
+
 ### 3. Run
 ```bash
-python bot.py
+python main.py
 ```
 
 ---
 
 ## ⚙️ Configuration (`config.py`)
 
-We believe in **Configuration as Code**. All magic numbers are exposed in `config.py` for fine-tuning.
-
-| Category | Variable | Default | Description |
-| :--- | :--- | :--- | :--- |
-| **STT** | `STT_MODEL_ID` | `deepdml/faster-whisper...` | The HuggingFace model ID. |
-| | `STT_DEVICE` | `cuda` | Use `cpu` if you don't have a GPU. |
-| | `STT_BEAM_SIZE` | `1` | Lower is faster. Higher is more accurate. |
-| **VAD** | `RING_BUFFER_SIZE` | `10` | Pre-speech context buffer (10 frames ≈ 320ms). |
-| | `FRAME_DURATION_MS` | `32` | Frame size for Silero VAD (Do not change). |
-| **System** | `USER_TIMEOUT_SECONDS` | `60` | Seconds before clearing inactive user memory. |
+| Group | Setting | Default | Description |
+|:---|:---|:---|:---|
+| **STT** | `model_id` | `deepdml/faster-whisper-large-v3-turbo-ct2` | HuggingFace model ID |
+| | `device` | `cuda` | `cpu` if no GPU |
+| | `beam_size` | `1` | Lower = faster, Higher = accurate |
+| **VAD** | `ring_buffer_frames` | `10` | Pre-speech context (~320 ms) |
+| | `frame_samples` | `512` | Silero requires 512 @ 16 kHz |
+| **Audio** | `input_sample_rate` | `48000` | Discord Opus decoded rate |
+| | `output_sample_rate` | `16000` | Whisper input rate |
+| **Process** | `user_timeout_seconds` | `60` | Inactive user cleanup |
 
 ---
 
 ## 🖥️ Usage
 
-1.  **Summon**: Type `!join` in any text channel.
-2.  **Speak**: Just talk. The bot listens to everyone simultaneously.
-3.  **Dismiss**: Type `!leave` to save resources.
+1.  **Summon**: `!join` in any text channel
+2.  **Speak**: Talk — the bot listens to everyone simultaneously
+3.  **Dismiss**: `!leave` to disconnect
+4.  **Stop**: `Ctrl+C` for graceful shutdown
 
 ---
 
 ## 🧩 Troubleshooting
 
 **Q: The bot joins but doesn't transcribe.**
-> **A:** Check your console. If you see `Silero VAD loaded`, wait for the model to download. Also, ensure the user has permission to speak.
+> Check console logs. Ensure Silero VAD and Whisper model downloaded successfully.
 
 **Q: It's too slow!**
-> **A:** Ensure `STT_DEVICE` is set to `cuda` in `config.py`. Running `large-v3` on CPU is not recommended. Switch to `base` or `small` for CPU usage.
+> Set `device = "cuda"` in `config.py`. Running `large-v3` on CPU is not recommended.
 
-**Q: "Input audio chunk is too short" error?**
-> **A:** This was a known issue with Silero VAD frame sizes. We have fixed it by enforcing a **512-sample (32ms)** frame size in the code.
+**Q: CUDA out of memory?**
+> Switch to a smaller model (`base`, `small`) or use `compute_type = "int8"`.
 
 ---
 
 ## 📜 License
 
-This project is licensed under the MIT License. Feel free to fork, modify, and use it in your own projects.
+MIT License — free to fork, modify, and use.
 
 ---
 
 <div align="center">
-  <sub>Built with ❤️ by <b>Antigravity</b> for the Open Source Community.</sub>
+  <sub>Built with ❤️ for the Open Source Community.</sub>
 </div>
