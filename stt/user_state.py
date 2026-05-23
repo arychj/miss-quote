@@ -74,22 +74,44 @@ class UserStateManager:
 
     # ── cleanup ───────────────────────────────────
 
-    def remove(self, user_id: int) -> None:
+    def remove(self, user_id: int) -> UserState | None:
         if user_id in self._users:
-            del self._users[user_id]
+            state = self._users.pop(user_id)
             logger.info("User removed: %s", user_id)
+            return state
+        return None
 
-    def cleanup_inactive(self) -> list[int]:
-        """Remove users exceeding the timeout. Returns removed IDs."""
+    def remove_all(self) -> list[UserState]:
+        """Remove and return every active user state."""
+        states = list(self._users.values())
+        self._users.clear()
+        if states:
+            logger.info("Removed all user states (%d).", len(states))
+        return states
+
+    def stale_speech_states(self) -> list[UserState]:
+        """Return speaking users with no fresh audio past the flush timeout."""
+        now = time.time()
+        return [
+            state for state in self._users.values()
+            if state.is_speaking
+            and now - state.last_activity > process_cfg.speech_flush_timeout_seconds
+        ]
+
+    def cleanup_inactive(self) -> list[UserState]:
+        """Remove users exceeding the timeout. Returns removed states."""
         now = time.time()
         expired = [
             uid for uid, s in self._users.items()
             if now - s.last_activity > process_cfg.user_timeout_seconds
         ]
+        states: list[UserState] = []
         for uid in expired:
-            self.remove(uid)
-            logger.info("User %s timed out — cleaned up.", uid)
-        return expired
+            state = self.remove(uid)
+            if state:
+                states.append(state)
+                logger.info("User %s timed out; cleaned up.", uid)
+        return states
 
     @property
     def active_count(self) -> int:

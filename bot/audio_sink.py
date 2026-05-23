@@ -5,6 +5,8 @@ and forwards it to the STT process via IPC queue.
 
 from __future__ import annotations
 
+import queue
+import time
 from multiprocessing import Queue as MPQueue
 from typing import Optional, Union
 
@@ -27,6 +29,8 @@ class STTAudioSink(AudioSink):
         super().__init__()
         self._queue = audio_queue
         self._resampler = AudioResampler()
+        self._dropped_frames = 0
+        self._last_drop_log = 0.0
         logger.info("STTAudioSink initialised.")
 
     def wants_opus(self) -> bool:
@@ -42,7 +46,18 @@ class STTAudioSink(AudioSink):
             return
         try:
             resampled = self._resampler.resample(data.pcm)
-            self._queue.put((user.id, resampled))
+            self._queue.put_nowait((user.id, resampled))
+        except queue.Full:
+            self._dropped_frames += 1
+            now = time.monotonic()
+            if now - self._last_drop_log >= 5:
+                logger.warning(
+                    "Audio queue full; dropped %d frames in the last %.1fs.",
+                    self._dropped_frames,
+                    now - self._last_drop_log if self._last_drop_log else 0.0,
+                )
+                self._dropped_frames = 0
+                self._last_drop_log = now
         except Exception as exc:
             logger.error("AudioSink write error: %s", exc)
 

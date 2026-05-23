@@ -1,0 +1,20 @@
+[Unit]
+Description=Discord Realtime STT Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=discord-stt
+Group=discord-stt
+WorkingDirectory=/opt/discord-stt-bot
+EnvironmentFile=/etc/discord-stt-bot.env
+ExecStart=/opt/discord-stt-bot/.venv/bin/python /opt/discord-stt-bot/main.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGTERM
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
