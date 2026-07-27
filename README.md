@@ -24,9 +24,30 @@ graph TD
     G --> H["/transcripts/YYYY-MM-DD.jsonl"]
 ```
 
-Everything runs on one event loop in one process. Each completed utterance is dispatched as its own task, bounded by a semaphore, so speakers are transcribed concurrently instead of queueing behind one another.
+Everything runs on one event loop in one process. The split that matters is between the two halves of the pipeline: **audio handling is local and serial, transcription is remote and parallel.**
 
-VAD is the only in-band CPU work: Silero on 512-sample frames costs roughly 0.26 ms per frame.
+### Local: serial, continuous, cheap
+
+Resampling and VAD are ordinary blocking calls, run one frame at a time. They are a steady cost for as long as audio arrives, not a per-utterance burst — VAD has to see every frame, because VAD is what decides which frames are speech.
+
+| Work | Cost | Rate, per speaker |
+|---|---:|---|
+| soxr resample, per 20 ms Discord frame | 0.046 ms | 50/s |
+| Silero VAD, per 32 ms frame | 0.082 ms | 31.25/s |
+
+That is **~4.9 ms of CPU per speaker per second of audio**, or about 0.5% of one core — 5% at ten concurrent speakers. Being serial costs nothing at this magnitude, which is why there is no worker process: a process boundary would cost more in serialization than the work it isolated.
+
+Resampling runs on voice-recv's router thread, which holds a lock across all speakers, so nothing slow may be added there. Frames reach the event loop via `loop.call_soon_threadsafe`.
+
+### Remote: parallel, bounded
+
+At each speech-to-silence edge the buffered utterance is handed to `asyncio.create_task` and the coroutine immediately parks on socket I/O — the loop is free in the same tick. Nothing in this process ever blocks on transcription.
+
+The ASR server accepts overlapping utterances, so speakers do not queue behind one another; measured against a GPU-backed Wyoming server, eight simultaneous 0.88 s utterances completed in 223 ms against 555 ms if run serially. A single utterance round-trips in about 70 ms.
+
+`MAX_CONCURRENT_TRANSCRIPTIONS` caps how many are in flight. A further utterance ending while the cap is reached parks on the semaphore — it does not stall the loop and does not drop audio, it simply waits to open its connection. The bound exists so a busy channel cannot fan out unbounded connections against an ASR that other services may share; throughput gains past four are marginal anyway.
+
+Upstream got this backwards: it called `transcribe()` inline in the per-frame loop, so the expensive remote half ran serially while audio backed up in a queue until frames were silently dropped.
 
 ---
 
