@@ -13,15 +13,52 @@ Transcription is delegated to a [Wyoming](https://github.com/rhasspy/wyoming) AS
 
 ## How it works
 
-```mermaid
-graph TD
-    A[Discord Gateway] -->|48 kHz stereo PCM| B["STTAudioSink<br/>(bot/audio_sink.py)"]
-    B -->|soxr resample| C["16 kHz mono int16"]
-    C --> D["Silero VAD, per 32 ms frame<br/>(stt/vad.py)"]
-    D -->|per-user buffer + pre-roll| E["Speech to silence edge"]
-    E -->|bounded asyncio task| F["Wyoming client<br/>(stt/wyoming_client.py)"]
-    F -->|Transcript| G["TranscriptWriter<br/>(transcript/writer.py)"]
-    G --> H["/transcripts/YYYY-MM-DD.jsonl"]
+```
+                            Discord gateway
+                                   │
+                                   │  48 kHz stereo PCM, 20 ms frames
+                                   ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  voice-recv router thread                    SERIAL             │
+│                                                                 │
+│  STTAudioSink.write ── soxr resample ──► 16 kHz mono   0.046 ms │
+│                                                                 │
+│  Holds the router lock across every speaker: nothing slow here. │
+└────────────────────────────────┬────────────────────────────────┘
+                                 │  loop.call_soon_threadsafe
+                                 ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  event loop                                  SERIAL             │
+│                                                                 │
+│  Silero VAD, per 32 ms frame                           0.082 ms │
+│         └─► per-speaker speech_buffer + ring-buffer pre-roll    │
+│                                                                 │
+│  ~4.9 ms of CPU per speaker per second of audio.                │
+└────────────────────────────────┬────────────────────────────────┘
+                                 │  speech → silence edge
+                                 ▼
+                        asyncio.create_task
+                                 │
+         ┌───────────────────────┼───────────────────────┐
+         │                       │                       │
+         ▼                       ▼                       ▼           PARALLEL
+   ┌───────────┐           ┌───────────┐           ┌───────────┐
+   │  Wyoming  │           │  Wyoming  │           │  Wyoming  │   one connection
+   │utterance 1│           │utterance 2│           │utterance N│   per utterance
+   └─────┬─────┘           └─────┬─────┘           └─────┬─────┘
+         │                       │                       │        N ≤ MAX_CONCURRENT_
+         └───────────────────────┼───────────────────────┘            TRANSCRIPTIONS
+                                 │
+                                 ▼
+                   Wyoming ASR server, off-box
+                   ($WYOMING_HOST:$WYOMING_PORT)
+                                 │
+                                 │  Transcript, ~70 ms per utterance
+                                 ▼
+                          TranscriptWriter
+                                 │
+                                 ▼
+                 $TRANSCRIPT_DIR/YYYY-MM-DD.jsonl
 ```
 
 Everything runs on one event loop in one process. The split that matters is between the two halves of the pipeline: **audio handling is local and serial, transcription is remote and parallel.**
@@ -56,7 +93,7 @@ Upstream got this backwards: it called `transcribe()` inline in the per-frame lo
 JSON Lines, one object per utterance, appended and flushed as produced:
 
 ```json
-{"ts":"2026-07-26T21:14:03.412-07:00","user_id":195623847,"user":"erik","channel":"general-voice","text":"that should work"}
+{"ts":"2026-07-26T21:14:03.412-07:00","user_id":1234567890,"user":"someone","channel":"general-voice","text":"that should work"}
 ```
 
 Files roll over on the local calendar date, resolved through `TZ`, and timestamps carry an explicit UTC offset. A session spanning midnight writes into two files. `user_id` is recorded alongside the display name because display names change.

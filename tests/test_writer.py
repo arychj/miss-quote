@@ -9,8 +9,8 @@ from transcript.writer import TranscriptWriter
 
 TIMEZONE = "America/Los_Angeles"
 KEEP_FOREVER = -1
-USER_ID = 195623847
-USER = "erik"
+USER_ID = 1234567890
+USER = "someone"
 CHANNEL = "general-voice"
 
 
