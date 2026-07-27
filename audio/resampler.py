@@ -1,28 +1,29 @@
 """
-High-quality audio resampler for the Discord → Whisper pipeline.
+Audio resampler for the Discord → ASR pipeline.
 
 Converts 48 kHz stereo int16 PCM (Discord Opus output)
-           → 16 kHz mono  int16 PCM (Whisper input).
+           → 16 kHz mono  int16 PCM (Silero and Wyoming input).
 
-Uses torchaudio for anti-aliased resampling.
+Resampling is load-bearing rather than a convenience: Silero only accepts
+512-sample frames at 16 kHz, so it cannot be delegated to the ASR server.
 """
 
 from __future__ import annotations
 
 import numpy as np
-import torch
-import torchaudio.functional as F
+import soxr
 
 from config import audio_cfg
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-# Pre-compute the resampling kernel once (thread-safe, immutable).
-_RESAMPLE_KWARGS = dict(
-    orig_freq=audio_cfg.input_sample_rate,
-    new_freq=audio_cfg.output_sample_rate,
-)
+STEREO_INTERLEAVED_SHAPE = (-1, audio_cfg.input_channels)
+CHANNEL_AXIS = 1
+
+# VHQ is the bit-exact-enough end of soxr's quality ladder and costs microseconds
+# on 20 ms frames.
+RESAMPLE_QUALITY = "VHQ"
 
 
 class AudioResampler:
@@ -43,18 +44,18 @@ class AudioResampler:
         bytes
             Raw PCM int16, 16 kHz, mono.
         """
-        # 1. bytes → numpy int16 → reshape to (samples, 2)
-        samples = np.frombuffer(pcm_bytes, dtype=np.int16).reshape(-1, 2)
+        samples = np.frombuffer(pcm_bytes, dtype=np.int16).reshape(
+            *STEREO_INTERLEAVED_SHAPE
+        )
 
-        # 2. Stereo → Mono (average L/R channels)
-        mono = samples.mean(axis=1).astype(np.int16)
+        # Average in int32 so a pair of near-full-scale samples cannot wrap.
+        mono = samples.astype(np.int32).mean(axis=CHANNEL_AXIS).astype(np.int16)
 
-        # 3. int16 → float32 tensor  (torchaudio expects float)
-        tensor = torch.from_numpy(mono.astype(np.float32))
+        resampled = soxr.resample(
+            mono,
+            audio_cfg.input_sample_rate,
+            audio_cfg.output_sample_rate,
+            quality=RESAMPLE_QUALITY,
+        )
 
-        # 4. Resample with anti-aliasing (Kaiser-window low-pass filter)
-        resampled = F.resample(tensor, **_RESAMPLE_KWARGS)
-
-        # 5. float32 → int16 bytes
-        out = resampled.numpy().astype(np.int16)
-        return out.tobytes()
+        return resampled.astype(np.int16).tobytes()

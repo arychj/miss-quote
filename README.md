@@ -1,223 +1,230 @@
-# 🎙️ Discord Real-time STT Bot
+<p align="center">
+  <img src="assets/miss-quote.png" alt="miss-quote" width="180">
+</p>
 
-![Python](https://img.shields.io/badge/Python-3.10%2B-blue?style=for-the-badge&logo=python&logoColor=white)
-![Discord.py](https://img.shields.io/badge/Discord.py-2.0%2B-5865F2?style=for-the-badge&logo=discord&logoColor=white)
-![Faster-Whisper](https://img.shields.io/badge/Faster--Whisper-Large--v3-success?style=for-the-badge)
-![Silero VAD](https://img.shields.io/badge/Silero%20VAD-High%20Accuracy-orange?style=for-the-badge)
+# miss-quote
 
-> **High-performance, low-latency Speech-to-Text for Discord voice channels.**
-> Process-isolated architecture ensures the bot **never** freezes during inference.
+![Python](https://img.shields.io/badge/Python-3.12-blue?style=for-the-badge&logo=python&logoColor=white)
+![Discord.py](https://img.shields.io/badge/Discord.py-2.4%2B-5865F2?style=for-the-badge&logo=discord&logoColor=white)
+![Wyoming](https://img.shields.io/badge/Wyoming-ASR-success?style=for-the-badge)
+![Silero VAD](https://img.shields.io/badge/Silero%20VAD-ONNX-orange?style=for-the-badge)
 
----
+> Transcribes Discord voice channels to a daily, per-speaker JSONL transcript.
 
-## ⚡ Key Features
-
-| Feature | Implementation |
-|---|---|
-| **Multiprocessing Core** | STT runs in an isolated process — bot never freezes |
-| **Anti-aliased Resampling** | `torchaudio` Kaiser-window filter (48 kHz → 16 kHz) |
-| **Ring Buffer** | 320 ms pre-speech context — first syllable is never cut |
-| **Silero VAD** | State-of-the-art voice activity detection |
-| **Faster-Whisper** | CTranslate2 — 4× faster than OpenAI Whisper |
-| **Structured Logging** | Python `logging` with module-level loggers |
-| **Graceful Shutdown** | Signal handlers for clean exit |
-| **Per-User State** | Encapsulated `UserState` dataclass per speaker |
+Transcription is delegated to a [Wyoming](https://github.com/rhasspy/wyoming) ASR server rather than run in-process, so the bot is a CPU-only workload with no GPU, no model weights, and no cache volume. It is a hard fork of [Leehyunbin0131/Discord-Realtime-STT-Bot](https://github.com/Leehyunbin0131/Discord-Realtime-STT-Bot), which ran `faster-whisper` on a local GPU.
 
 ---
 
-## 🛠️ Architecture
+## How it works
 
 ```mermaid
 graph TD
-    subgraph "Main Process — Discord Bot"
-        A[Discord Gateway] -->|Opus Audio| B["AudioSink<br/>(bot/audio_sink.py)"]
-        B -->|PCM 48kHz Stereo| C["Resampler<br/>(audio/resampler.py)"]
-        C -->|PCM 16kHz Mono| D[IPC Audio Queue]
-        H[IPC Result Queue] -->|JSON| I["ResultHandler<br/>(bot/client.py)"]
+    A["Discord gateway"] -->|"48 kHz stereo PCM, 20 ms frames"| B
+
+    subgraph LOCAL["SERIAL &mdash; in process, ~4.9 ms CPU per speaker per second of audio"]
+        direction TB
+        B["STTAudioSink.write<br/><i>voice-recv router thread</i>"]
+        B -->|"soxr resample &mdash; 0.046 ms"| C["16 kHz mono int16"]
+        C -->|"loop.call_soon_threadsafe"| D["Silero VAD, per 32 ms frame<br/><i>event loop</i> &mdash; 0.082 ms"]
+        D --> E["per-speaker speech_buffer<br/>+ ring-buffer pre-roll"]
     end
 
-    subgraph "STT Process — Isolated"
-        D --> E["UserStateManager<br/>(stt/user_state.py)"]
-        E -->|32ms Frames| F["Silero VAD<br/>(stt/vad.py)"]
-        F -->|Speech Segments| G["Faster-Whisper<br/>(stt/transcriber.py)"]
-        G -->|Text| H
+    E -->|"speech to silence edge<br/>asyncio.create_task"| REMOTE
+
+    subgraph REMOTE["PARALLEL &mdash; one connection per utterance, N &le; MAX_CONCURRENT_TRANSCRIPTIONS"]
+        direction LR
+        F["Wyoming client<br/>utterance 1"]
+        G["Wyoming client<br/>utterance 2"]
+        H["Wyoming client<br/>utterance N"]
+        F ~~~ G ~~~ H
     end
+
+    REMOTE -->|"Transcribe / AudioStart / AudioChunk* / AudioStop"| I
+
+    I["Wyoming ASR server<br/><i>WYOMING_HOST:WYOMING_PORT</i>"] -->|"Transcript, ~70 ms"| J["TranscriptWriter"]
+    J --> K["TRANSCRIPT_DIR/YYYY-MM-DD.jsonl"]
 ```
+
+Everything runs on one event loop in one process. The split that matters is between the two halves of the pipeline: **audio handling is local and serial, transcription is remote and parallel.**
+
+### Local: serial, continuous, cheap
+
+Resampling and VAD are ordinary blocking calls, run one frame at a time. They are a steady cost for as long as audio arrives, not a per-utterance burst — VAD has to see every frame, because VAD is what decides which frames are speech.
+
+| Work | Cost | Rate, per speaker |
+|---|---:|---|
+| soxr resample, per 20 ms Discord frame | 0.046 ms | 50/s |
+| Silero VAD, per 32 ms frame | 0.082 ms | 31.25/s |
+
+That is **~4.9 ms of CPU per speaker per second of audio**, or about 0.5% of one core — 5% at ten concurrent speakers. Being serial costs nothing at this magnitude, which is why there is no worker process: a process boundary would cost more in serialization than the work it isolated.
+
+Resampling runs on voice-recv's router thread, which holds a lock across all speakers, so nothing slow may be added there. Frames reach the event loop via `loop.call_soon_threadsafe`.
+
+### Remote: parallel, bounded
+
+At each speech-to-silence edge the buffered utterance is handed to `asyncio.create_task` and the coroutine immediately parks on socket I/O — the loop is free in the same tick. Nothing in this process ever blocks on transcription.
+
+The ASR server accepts overlapping utterances, so speakers do not queue behind one another; measured against a GPU-backed Wyoming server, eight simultaneous 0.88 s utterances completed in 223 ms against 555 ms if run serially. A single utterance round-trips in about 70 ms.
+
+`MAX_CONCURRENT_TRANSCRIPTIONS` caps how many are in flight. A further utterance ending while the cap is reached parks on the semaphore — it does not stall the loop and does not drop audio, it simply waits to open its connection. The bound exists so a busy channel cannot fan out unbounded connections against an ASR that other services may share; throughput gains past four are marginal anyway.
+
+Upstream got this backwards: it called `transcribe()` inline in the per-frame loop, so the expensive remote half ran serially while audio backed up in a queue until frames were silently dropped.
 
 ---
 
-## 📁 Project Structure
+## Transcript format
+
+JSON Lines, one object per utterance, appended and flushed as produced:
+
+```json
+{"ts":"2026-07-26T21:14:03.412-07:00","user_id":1234567890,"user":"someone","channel":"general-voice","text":"that should work"}
+```
+
+Files roll over on the local calendar date, resolved through `TZ`, and timestamps carry an explicit UTC offset. A session spanning midnight writes into two files. `user_id` is recorded alongside the display name because display names change.
+
+---
+
+## Configuration
+
+Every setting is read from the environment; `.env` is loaded if present. Nothing about a particular deployment is baked into the image, so the same image runs anywhere the variables below point it at.
+
+### Discord
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `DISCORD_TOKEN` | — | Bot token. **Required** — the bot exits immediately without it |
+| `COMMAND_PREFIX` | `!` | Prefix for the `!join` / `!leave` commands |
+| `AUTOJOIN` | `true` | Join when a human enters a voice channel; leave when it empties. Accepts `true/false`, `1/0`, `yes/no`, `on/off` |
+
+### ASR
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `WYOMING_HOST` | `localhost` | Hostname or service name of the Wyoming ASR server |
+| `WYOMING_PORT` | `10300` | Wyoming's conventional port |
+| `STT_LANGUAGE` | `en` | Sent as `Transcribe.language` |
+| `MAX_CONCURRENT_TRANSCRIPTIONS` | `4` | Ceiling on in-flight utterances, so a busy channel cannot open unbounded connections against a shared ASR |
+
+### Transcripts
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TRANSCRIPT_DIR` | `/transcripts` | Directory the daily files are written to |
+| `TZ` | `America/Los_Angeles` | Rollover boundary and the offset stamped on each line |
+| `RETENTION_DAYS` | `-1` | Days to keep. `-1`, or any value below `1`, keeps forever |
+
+### Speech segmentation
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `SPEECH_FLUSH_TIMEOUT_SECONDS` | `2.0` | Transcribe a speech buffer that stopped receiving audio, e.g. a speaker who muted mid-sentence |
+| `USER_TIMEOUT_SECONDS` | `60` | Discard per-user VAD state after this much silence |
+| `LOG_LEVEL` | `INFO` | Standard Python log levels |
+
+VAD thresholds, the pre-roll depth, and the Wyoming chunk size are deliberately **not** environment variables — they are tied to Silero's fixed 512-sample frame and live in `config.py`.
+
+### Retention
+
+Pruning is **off by default**. Any value below `1` disables it entirely, so `0` is a no-op rather than "delete everything" and a mis-set variable cannot destroy the archive. When set to a positive `N`, files older than `N` days are deleted, aged by the **filename date** rather than mtime — the filename is the authoritative record of the day covered, while mtime misjudges a file appended to late or restored from backup. Pruning runs at startup and on each date rollover.
+
+### Auto-join
+
+With `AUTOJOIN` enabled the bot connects as soon as a non-bot member enters a voice channel, and disconnects once the channel empties of humans. A bot can occupy only one voice channel per guild, so if a second channel becomes active it stays where it is rather than hopping, which would fragment both transcripts.
+
+The `!join` and `!leave` commands remain available either way. They require **Message Content Intent** to be enabled in the Discord Developer Portal.
+
+---
+
+## Changes from upstream
+
+Upstream ran `faster-whisper` in-process on a GPU. Moving transcription to a network call removed the reason for most of the machinery around it.
+
+| Area | Upstream | Here |
+|---|---|---|
+| Transcription | `faster-whisper` in-process, GPU | Wyoming client, one connection per utterance |
+| Concurrency | Child process + three IPC queues, to keep blocking inference off the event loop | One process, one event loop; each utterance is a bounded `asyncio` task |
+| Dispatch | Transcription called inline in the per-frame loop, serializing every speaker behind one utterance until the audio queue overflowed and dropped frames | Per-utterance tasks bounded by a semaphore, so speakers overlap |
+| Resampling | `torchaudio` | `soxr` |
+| VAD | Silero via `torch.hub` | Silero via `onnxruntime`, model vendored in-repo |
+| Output | Logged and printed; never persisted | Per-day JSONL file, flushed per utterance |
+| Deployment | systemd unit | Container image |
+
+Removed outright: the multiprocessing layer and its queues, the STT health-check thread and its supervisor, `torch` / `torchaudio` / `faster-whisper`, the model and fallback-model settings (`STT_MODEL_ID`, `STT_DEVICE`, `STT_COMPUTE_TYPE`, `STT_BEAM_SIZE`, every `STT_FALLBACK_*`), all `*_QUEUE_MAXSIZE` tuning, `RESULT_POLL_INTERVAL`, `STT_HEALTH_CHECK_INTERVAL`, `SHUTDOWN_TIMEOUT_SECONDS`, and the systemd deployment.
+
+Kept intact because they are the non-obvious part: `stt/user_state.py`'s per-user VAD state machine with stale-speech flushing, and `audio/ring_buffer.py`'s pre-roll buffer, which is what stops the first syllable being clipped.
+
+Added: `AUTOJOIN`, `RETENTION_DAYS`, `TRANSCRIPT_DIR`, `TZ`, `WYOMING_HOST`, `WYOMING_PORT`, `MAX_CONCURRENT_TRANSCRIPTIONS`.
+
+> **Note on the vendored VAD model.** Silero v5's ONNX graph scores the current frame *together with* the trailing 64 samples of the previous one. Fed a bare 512-sample frame it does not error — it silently returns near-zero probability on unmistakable speech, and the bot transcribes nothing. `stt/vad.py` carries that context between calls, and `tests/test_vad.py` guards it with real speech; silence-based tests pass either way and will not catch a regression.
+
+---
+
+## Project structure
 
 ```
-Discord-Realtime-STT-Bot/
-├── main.py                 # Entry point (graceful shutdown)
-├── config.py               # Grouped configuration (dataclasses)
+miss-quote/
+├── main.py                    # Entry point
+├── config.py                  # Grouped configuration (dataclasses)
 ├── bot/
-│   ├── client.py           # Bot setup, commands, result handler
-│   └── audio_sink.py       # AudioSink + resampling bridge
+│   ├── client.py              # Bot setup, voice lifecycle, auto-join policy
+│   └── audio_sink.py          # AudioSink + resampling bridge
 ├── audio/
-│   ├── resampler.py        # torchaudio anti-aliased resampling
-│   └── ring_buffer.py      # Generic ring buffer
+│   ├── resampler.py           # soxr 48 kHz stereo to 16 kHz mono
+│   └── ring_buffer.py         # Pre-speech context buffer
 ├── stt/
-│   ├── processor.py        # STT process main loop
-│   ├── vad.py              # Silero VAD wrapper
-│   ├── transcriber.py      # Faster-Whisper wrapper
-│   └── user_state.py       # Per-user state dataclass + manager
-├── utils/
-│   └── logging.py          # Structured logging config
-├── deploy/
-│   └── systemd/            # Ubuntu systemd service example
-├── requirements.txt
-├── .env.example            # Environment template
-├── .gitignore
-└── README.md
+│   ├── vad.py                 # Silero VAD via onnxruntime
+│   ├── user_state.py          # Per-user VAD state machine
+│   ├── processor.py           # Segmentation and bounded dispatch
+│   ├── wyoming_client.py      # Per-utterance Wyoming round-trip
+│   └── models/
+│       └── silero_vad.onnx    # Vendored (~2 MB)
+├── transcript/
+│   └── writer.py              # Daily-rollover JSONL appender + retention
+└── utils/
+    └── logging.py
 ```
+
+The Silero model is vendored rather than installed, because the `silero-vad` package declares `torch` even in ONNX mode.
 
 ---
 
-## 📦 Installation
-
-### Prerequisites (Ubuntu)
--   **Python 3.10+**
--   **FFmpeg** and **Opus** runtime libraries
--   **NVIDIA GPU** is recommended for low latency, but CPU fallback is supported
+## Development
 
 ```bash
-sudo apt update
-sudo apt install -y python3 python3-venv python3-pip git rsync ffmpeg libopus0 build-essential
+python3.12 -m venv .venv && source .venv/bin/activate
+pip install -r requirements-dev.txt
+pytest
 ```
 
-### 1. Clone & Install
-```bash
-git clone https://github.com/your-repo/discord-stt-bot.git
-cd discord-stt-bot
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-```
-> *Note: `torch` + `faster-whisper` may exceed 2 GB total.*
-
-### 2. Configuration
-Create a `.env` file from the checked-in template:
+The ASR path is the riskiest integration and is worth exercising on its own, before any Discord wiring. Point `WYOMING_HOST` at any reachable Wyoming server and send the bundled speech fixture through the client:
 
 ```bash
-cp .env.example .env
-nano .env
+WYOMING_HOST=<asr-host> python -c "
+import asyncio, wave
+from stt.wyoming_client import transcribe
+with wave.open('tests/fixtures/speech_16k_mono.wav', 'rb') as f:
+    pcm = f.readframes(f.getnframes())
+print(asyncio.run(transcribe(pcm)))
+"
 ```
 
-At minimum, set:
-
-```env
-DISCORD_TOKEN=your_super_secret_token_here
-```
-
-For CPU-only Ubuntu servers, start with:
-
-```env
-STT_DEVICE=cpu
-STT_COMPUTE_TYPE=int8
-STT_MODEL_ID=base
-```
-
-For CUDA deployments, install the PyTorch build that matches your driver/CUDA runtime before installing the rest of the requirements. See the official PyTorch install selector for the correct index URL.
-
-### 3. Discord Developer Portal
-- Enable the **Message Content Intent** for the bot.
-- Invite the bot with permissions to read/send messages and connect/speak in voice channels.
-
-### 4. Run
-```bash
-source .venv/bin/activate
-python main.py
-```
+A correct setup prints `That should work.` in well under a second.
 
 ---
 
-## ⚙️ Configuration (`.env`)
+## Deployment
 
-Runtime settings are loaded from environment variables, usually via `.env`.
+GitHub Actions builds the image and pushes it to GHCR for the repository it runs in; no registry configuration is required beyond the workflow's `packages: write` permission. New GHCR packages are private by default, so the package must be made public once, after the first run, unless the cluster is given a pull secret.
 
-| Group | Setting | Default | Description |
-|:---|:---|:---|:---|
-| **Discord** | `DISCORD_TOKEN` | required | Bot token |
-| | `COMMAND_PREFIX` | `!` | Prefix command trigger |
-| **STT** | `STT_MODEL_ID` | `deepdml/faster-whisper-large-v3-turbo-ct2` | HuggingFace model ID |
-| | `STT_DEVICE` | `cuda` | Use `cpu` if no GPU |
-| | `STT_COMPUTE_TYPE` | `float16` | Use `int8` for CPU |
-| | `STT_LANGUAGE` | `ko` | Transcription language |
-| | `STT_BEAM_SIZE` | `1` | Lower = faster, higher = more accurate |
-| **Process** | `AUDIO_QUEUE_MAXSIZE` | `512` | Backpressure limit for incoming audio |
-| | `SPEECH_FLUSH_TIMEOUT_SECONDS` | `2.0` | Flush final speech if Discord stops sending frames |
-| | `USER_TIMEOUT_SECONDS` | `60` | Inactive user cleanup |
-| **Audio** | `input_sample_rate` | `48000` | Discord Opus decoded rate |
-| | `output_sample_rate` | `16000` | Whisper input rate |
+Runtime requirements:
 
----
+- **A reachable Wyoming ASR server** — set `WYOMING_HOST` and `WYOMING_PORT`. There is no default that will work out of the box.
+- **A writable volume at `TRANSCRIPT_DIR`.** Use a shared (`ReadWriteMany`) volume if anything else will need to read the transcripts; a single-writer volume locks them to this pod and forces an export step later.
+- **A single replica.** Two instances would double-join the voice channel and double-write the transcript.
+- **No GPU and no node constraints** — transcription is a network call.
 
-## 🧭 Ubuntu systemd Deployment
-
-The repository includes an example unit at `deploy/systemd/discord-stt-bot.service.example`.
-
-Example layout:
+**Cutting a git tag is the deploy action.** Pushing to `main` produces `latest` and a sha tag, neither of which is orderable; a release needs a semver tag, which is what a pinned deployment references and what dependency automation can raise a bump against:
 
 ```bash
-sudo useradd --system --create-home --home-dir /opt/discord-stt-bot discord-stt
-sudo rsync -a --exclude .git ./ /opt/discord-stt-bot/
-sudo chown -R discord-stt:discord-stt /opt/discord-stt-bot
-sudo cp /opt/discord-stt-bot/.env.example /etc/discord-stt-bot.env
-sudo nano /etc/discord-stt-bot.env
-sudo chmod 600 /etc/discord-stt-bot.env
-sudo chown root:root /etc/discord-stt-bot.env
-sudo cp /opt/discord-stt-bot/deploy/systemd/discord-stt-bot.service.example /etc/systemd/system/discord-stt-bot.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now discord-stt-bot
+git tag v0.1.0 && git push origin v0.1.0
 ```
-
-Check logs:
-
-```bash
-journalctl -u discord-stt-bot -f
-```
-
-If using an NVIDIA GPU, make sure the `discord-stt` user can access the GPU devices and that the installed `torch` wheel matches the host driver/CUDA runtime.
-
----
-
-## 🖥️ Usage
-
-1.  **Summon**: `!join` in any text channel
-2.  **Speak**: Talk — the bot listens to everyone simultaneously
-3.  **Dismiss**: `!leave` to disconnect
-4.  **Stop**: `Ctrl+C` for graceful shutdown
-
----
-
-## 🧩 Troubleshooting
-
-**Q: The bot joins but doesn't transcribe.**
-> Check console logs. Ensure Silero VAD and Whisper model downloaded successfully.
-
-**Q: It's too slow!**
-> Set `device = "cuda"` in `config.py`. Running `large-v3` on CPU is not recommended.
-
-**Q: CUDA out of memory?**
-> Switch to a smaller model (`base`, `small`) or use `compute_type = "int8"`.
-
-**Q: I see "Audio queue full" warnings.**
-> STT inference is slower than the incoming voice stream. Use a smaller model, GPU acceleration, or increase `AUDIO_QUEUE_MAXSIZE` if the host has enough memory.
-
-**Q: The service exits right after startup.**
-> Check `DISCORD_TOKEN`, Discord privileged intents, native voice dependencies, and model download/network access in `journalctl -u discord-stt-bot -e`.
-
----
-
-## 📜 License
-
-MIT License — free to fork, modify, and use.
-
----
-
-<div align="center">
-  <sub>Built with ❤️ for the Open Source Community.</sub>
-</div>
