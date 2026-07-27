@@ -1,43 +1,96 @@
 """
-Discord bot client setup, slash/prefix commands, and result handling.
+Discord bot client setup, voice lifecycle, and command handling.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
-import queue
-from multiprocessing import Queue as MPQueue
+from enum import Enum
+from typing import Any
 
 import discord
 import discord.ext.voice_recv
 from discord.ext import commands
 
 from bot.audio_sink import STTAudioSink
-from config import discord_cfg, process_cfg
+from config import discord_cfg
+from stt.processor import STTProcessor
+from transcript.writer import TranscriptWriter
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 
-class STTBot:
-    """Wraps a commands.Bot with STT-specific lifecycle management."""
+class VoiceAction(Enum):
+    """What a voice-state change should make the bot do."""
+    NONE = "none"
+    JOIN = "join"
+    LEAVE = "leave"
 
-    def __init__(
-        self,
-        audio_queue: MPQueue,
-        result_queue: MPQueue,
-        command_queue: MPQueue,
-    ) -> None:
-        self._audio_q = audio_queue
-        self._result_q = result_queue
-        self._cmd_q = command_queue
-        self._result_task: asyncio.Task | None = None
+
+def humans_in(channel: Any) -> int:
+    """Count non-bot members currently in a voice channel."""
+    if channel is None:
+        return 0
+    return sum(1 for member in channel.members if not member.bot)
+
+
+def plan_voice_action(
+    before: Any,
+    after: Any,
+    current_channel: Any,
+    autojoin: bool,
+) -> tuple[VoiceAction, Any]:
+    """
+    Decide how to react to another member's voice-state change.
+
+    Pure so the policy can be tested without a gateway connection. A bot may
+    occupy only one voice channel per guild, so once connected it stays put
+    rather than hopping to a newly active channel — hopping would fragment both
+    transcripts.
+    """
+    if not autojoin or before.channel == after.channel:
+        return VoiceAction.NONE, None
+
+    if current_channel is None:
+        if after.channel is not None:
+            return VoiceAction.JOIN, after.channel
+        return VoiceAction.NONE, None
+
+    if before.channel == current_channel and humans_in(current_channel) == 0:
+        return VoiceAction.LEAVE, current_channel
+
+    return VoiceAction.NONE, None
+
+
+class _Bot(commands.Bot):
+    """A Bot that drains the processor before the loop goes away."""
+
+    def __init__(self, processor: STTProcessor, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._processor = processor
+
+    async def close(self) -> None:
+        # SIGTERM lands here on pod termination; buffered speech is only lost if
+        # it is not flushed before the loop stops.
+        await self._processor.stop()
+        await super().close()
+
+
+class STTBot:
+    """Wraps a commands.Bot with voice-transcription lifecycle management."""
+
+    def __init__(self) -> None:
+        self._writer = TranscriptWriter()
+        self._processor = STTProcessor(self._writer)
 
         intents = discord.Intents.default()
         intents.message_content = True
+        intents.voice_states = True
+        intents.members = True
 
-        self._bot = commands.Bot(
+        self._bot = _Bot(
+            self._processor,
             command_prefix=discord_cfg.command_prefix,
             intents=intents,
         )
@@ -61,8 +114,9 @@ class STTBot:
         @bot.event
         async def on_ready() -> None:
             logger.info("Logged in as %s (ID: %s)", bot.user, bot.user.id)
-            if self._result_task is None or self._result_task.done():
-                self._result_task = bot.loop.create_task(self._poll_results())
+            self._processor.start(asyncio.get_running_loop())
+            if discord_cfg.autojoin:
+                await self._join_active_channels()
 
         @bot.event
         async def on_voice_state_update(
@@ -70,16 +124,58 @@ class STTBot:
             before: discord.VoiceState,
             after: discord.VoiceState,
         ) -> None:
-            if before.channel == after.channel:
+            if bot.user is not None and member.id == bot.user.id:
+                if before.channel and not after.channel:
+                    self._processor.flush_all("bot disconnected")
                 return
 
-            if bot.user and member.id == bot.user.id and before.channel:
-                self._send_command("FLUSH_ALL", None)
-                return
+            if before.channel and before.channel != after.channel:
+                self._processor.flush_user(member.id, "user left channel")
 
-            # Notify STT process when a user leaves or switches channels.
-            if before.channel:
-                self._send_command("LEAVE", member.id)
+            guild_voice = member.guild.voice_client
+            current = guild_voice.channel if guild_voice else None
+            action, channel = plan_voice_action(
+                before, after, current, discord_cfg.autojoin
+            )
+
+            if action is VoiceAction.JOIN:
+                await self._connect(channel)
+            elif action is VoiceAction.LEAVE:
+                logger.info("Channel '%s' is empty; leaving.", channel)
+                await self._disconnect(guild_voice)
+
+    async def _join_active_channels(self) -> None:
+        """Pick up channels that already had people in them when the bot started."""
+        for guild in self._bot.guilds:
+            if guild.voice_client is not None:
+                continue
+            for channel in guild.voice_channels:
+                if humans_in(channel) > 0:
+                    await self._connect(channel)
+                    break
+
+    # ── voice lifecycle ───────────────────────────
+
+    async def _connect(self, channel: discord.abc.Connectable) -> None:
+        try:
+            voice_client = await channel.connect(
+                cls=discord.ext.voice_recv.VoiceRecvClient,
+            )
+            voice_client.listen(STTAudioSink(self._processor, channel))
+            logger.info("Joined voice channel: %s", channel)
+        except Exception as exc:
+            logger.error("Could not join %s: %s", channel, exc)
+
+    async def _disconnect(self, voice_client: discord.VoiceClient | None) -> None:
+        if voice_client is None:
+            return
+
+        self._processor.flush_all("leaving channel")
+        await self._processor.drain()
+
+        if voice_client.is_listening():
+            voice_client.stop_listening()
+        await voice_client.disconnect()
 
     # ── commands ──────────────────────────────────
 
@@ -98,60 +194,17 @@ class STTBot:
             if ctx.voice_client is not None:
                 await ctx.voice_client.move_to(channel)
             else:
-                vc = await channel.connect(
-                    cls=discord.ext.voice_recv.VoiceRecvClient,
-                )
-                vc.listen(STTAudioSink(self._audio_q))
+                await self._connect(channel)
 
             await ctx.send(f"🎙️ Joined **{channel}** — listening.")
-            logger.info("Joined voice channel: %s", channel)
 
         @bot.command(name="leave")
         async def cmd_leave(ctx: commands.Context) -> None:
             """Leave the current voice channel."""
-            if ctx.voice_client:
-                self._send_command("FLUSH_ALL", None)
-                await ctx.voice_client.disconnect()
-                await ctx.send("👋 Left the voice channel.")
-                logger.info("Left voice channel.")
-            else:
+            if not ctx.voice_client:
                 await ctx.send("❌ I am not in a voice channel.")
+                return
 
-    def _send_command(self, command: str, payload: object) -> None:
-        try:
-            self._cmd_q.put_nowait((command, payload))
-        except queue.Full:
-            logger.warning("Command queue is full; dropped %s command.", command)
-        except Exception as exc:
-            logger.error("Failed to send %s command: %s", command, exc)
-
-    # ── result polling ────────────────────────────
-
-    async def _poll_results(self) -> None:
-        """Async loop that drains the result queue and logs transcriptions."""
-        logger.info("Result polling task started.")
-        while True:
-            try:
-                drained = False
-                while True:
-                    try:
-                        result = self._result_q.get_nowait()
-                    except queue.Empty:
-                        break
-                    drained = True
-                    logger.info(
-                        "📝 [User %s] %s  (latency %s)",
-                        result["user_id"],
-                        result["text"],
-                        result["latency"],
-                    )
-                    # Pretty-print to console as well
-                    print(json.dumps(result, ensure_ascii=False))
-
-                if drained:
-                    await asyncio.sleep(0)
-                else:
-                    await asyncio.sleep(process_cfg.result_poll_interval)
-            except Exception as exc:
-                logger.error("Result poll error: %s", exc)
-                await asyncio.sleep(1)
+            await self._disconnect(ctx.voice_client)
+            await ctx.send("👋 Left the voice channel.")
+            logger.info("Left voice channel.")
