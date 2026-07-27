@@ -1,4 +1,8 @@
-# 🎙️ miss-quote
+<p align="center">
+  <img src="assets/miss-quote.png" alt="miss-quote" width="180">
+</p>
+
+# miss-quote
 
 ![Python](https://img.shields.io/badge/Python-3.12-blue?style=for-the-badge&logo=python&logoColor=white)
 ![Discord.py](https://img.shields.io/badge/Discord.py-2.4%2B-5865F2?style=for-the-badge&logo=discord&logoColor=white)
@@ -13,52 +17,32 @@ Transcription is delegated to a [Wyoming](https://github.com/rhasspy/wyoming) AS
 
 ## How it works
 
-```
-                            Discord gateway
-                                   │
-                                   │  48 kHz stereo PCM, 20 ms frames
-                                   ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  voice-recv router thread                    SERIAL             │
-│                                                                 │
-│  STTAudioSink.write ── soxr resample ──► 16 kHz mono   0.046 ms │
-│                                                                 │
-│  Holds the router lock across every speaker: nothing slow here. │
-└────────────────────────────────┬────────────────────────────────┘
-                                 │  loop.call_soon_threadsafe
-                                 ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  event loop                                  SERIAL             │
-│                                                                 │
-│  Silero VAD, per 32 ms frame                           0.082 ms │
-│         └─► per-speaker speech_buffer + ring-buffer pre-roll    │
-│                                                                 │
-│  ~4.9 ms of CPU per speaker per second of audio.                │
-└────────────────────────────────┬────────────────────────────────┘
-                                 │  speech → silence edge
-                                 ▼
-                        asyncio.create_task
-                                 │
-         ┌───────────────────────┼───────────────────────┐
-         │                       │                       │
-         ▼                       ▼                       ▼           PARALLEL
-   ┌───────────┐           ┌───────────┐           ┌───────────┐
-   │  Wyoming  │           │  Wyoming  │           │  Wyoming  │   one connection
-   │utterance 1│           │utterance 2│           │utterance N│   per utterance
-   └─────┬─────┘           └─────┬─────┘           └─────┬─────┘
-         │                       │                       │        N ≤ MAX_CONCURRENT_
-         └───────────────────────┼───────────────────────┘            TRANSCRIPTIONS
-                                 │
-                                 ▼
-                   Wyoming ASR server, off-box
-                   ($WYOMING_HOST:$WYOMING_PORT)
-                                 │
-                                 │  Transcript, ~70 ms per utterance
-                                 ▼
-                          TranscriptWriter
-                                 │
-                                 ▼
-                 $TRANSCRIPT_DIR/YYYY-MM-DD.jsonl
+```mermaid
+graph TD
+    A["Discord gateway"] -->|"48 kHz stereo PCM, 20 ms frames"| B
+
+    subgraph LOCAL["SERIAL &mdash; in process, ~4.9 ms CPU per speaker per second of audio"]
+        direction TB
+        B["STTAudioSink.write<br/><i>voice-recv router thread</i>"]
+        B -->|"soxr resample &mdash; 0.046 ms"| C["16 kHz mono int16"]
+        C -->|"loop.call_soon_threadsafe"| D["Silero VAD, per 32 ms frame<br/><i>event loop</i> &mdash; 0.082 ms"]
+        D --> E["per-speaker speech_buffer<br/>+ ring-buffer pre-roll"]
+    end
+
+    E -->|"speech to silence edge<br/>asyncio.create_task"| REMOTE
+
+    subgraph REMOTE["PARALLEL &mdash; one connection per utterance, N &le; MAX_CONCURRENT_TRANSCRIPTIONS"]
+        direction LR
+        F["Wyoming client<br/>utterance 1"]
+        G["Wyoming client<br/>utterance 2"]
+        H["Wyoming client<br/>utterance N"]
+        F ~~~ G ~~~ H
+    end
+
+    REMOTE -->|"Transcribe / AudioStart / AudioChunk* / AudioStop"| I
+
+    I["Wyoming ASR server<br/><i>WYOMING_HOST:WYOMING_PORT</i>"] -->|"Transcript, ~70 ms"| J["TranscriptWriter"]
+    J --> K["TRANSCRIPT_DIR/YYYY-MM-DD.jsonl"]
 ```
 
 Everything runs on one event loop in one process. The split that matters is between the two halves of the pipeline: **audio handling is local and serial, transcription is remote and parallel.**
