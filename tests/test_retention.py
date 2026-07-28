@@ -3,12 +3,19 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from transcript.writer import TranscriptWriter
+from transcript.writer import Source, TranscriptWriter
 
 TIMEZONE = "America/Los_Angeles"
 KEEP_FOREVER = -1
 DISABLED_BY_ZERO = 0
 KEEP_A_WEEK = 7
+
+SOURCE = Source(
+    guild_id=987654321, guild="ste.haus", channel_id=456123, channel="general-voice"
+)
+OTHER_CHANNEL = Source(
+    guild_id=987654321, guild="ste.haus", channel_id=999888, channel="side-room"
+)
 
 
 def _today() -> date:
@@ -21,13 +28,15 @@ def _today() -> date:
     return datetime.now(ZoneInfo(TIMEZONE)).date()
 
 
-def _seed(directory, days_ago: int) -> None:
+def _seed(directory, days_ago: int, source=SOURCE) -> None:
     day = _today() - timedelta(days=days_ago)
-    (directory / f"{day.isoformat()}.jsonl").write_text("{}\n")
+    channel_directory = directory / source.relative_directory
+    channel_directory.mkdir(parents=True, exist_ok=True)
+    (channel_directory / f"{day.isoformat()}.jsonl").write_text("{}\n")
 
 
 def _names(directory) -> set[str]:
-    return {path.name for path in directory.glob("*.jsonl")}
+    return {path.name for path in directory.rglob("*.jsonl")}
 
 
 @pytest.mark.parametrize("retention_days", [KEEP_FOREVER, DISABLED_BY_ZERO])
@@ -65,7 +74,12 @@ def test_positive_retention_removes_only_old_files(tmp_path) -> None:
 
 def test_age_comes_from_filename_not_mtime(tmp_path) -> None:
     """A stale file touched recently must still be pruned."""
-    old = tmp_path / f"{(_today() - timedelta(days=90)).isoformat()}.jsonl"
+    old = (
+        tmp_path
+        / SOURCE.relative_directory
+        / f"{(_today() - timedelta(days=90)).isoformat()}.jsonl"
+    )
+    old.parent.mkdir(parents=True, exist_ok=True)
     old.write_text("{}\n")
     old.touch()  # mtime is now; the filename says otherwise
 
@@ -77,7 +91,8 @@ def test_age_comes_from_filename_not_mtime(tmp_path) -> None:
 
 
 def test_unrecognised_filenames_are_left_alone(tmp_path) -> None:
-    stray = tmp_path / "notes.jsonl"
+    stray = tmp_path / SOURCE.relative_directory / "notes.jsonl"
+    stray.parent.mkdir(parents=True, exist_ok=True)
     stray.write_text("{}\n")
 
     TranscriptWriter(
@@ -85,3 +100,18 @@ def test_unrecognised_filenames_are_left_alone(tmp_path) -> None:
     )
 
     assert stray.exists()
+
+
+def test_pruning_reaches_every_channel(tmp_path) -> None:
+    """Retention walks the whole tree, not just the root."""
+    _seed(tmp_path, days_ago=30, source=SOURCE)
+    _seed(tmp_path, days_ago=30, source=OTHER_CHANNEL)
+    _seed(tmp_path, days_ago=1, source=OTHER_CHANNEL)
+
+    TranscriptWriter(
+        directory=tmp_path, timezone=TIMEZONE, retention_days=KEEP_A_WEEK
+    )
+
+    survivors = _names(tmp_path)
+
+    assert survivors == {f"{(_today() - timedelta(days=1)).isoformat()}.jsonl"}

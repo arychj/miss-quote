@@ -16,7 +16,7 @@ from config import process_cfg, stt_cfg, vad_cfg
 from stt.user_state import UserState, UserStateManager
 from stt.vad import SileroVAD
 from stt.wyoming_client import transcribe
-from transcript.writer import TranscriptWriter
+from transcript.writer import Source, TranscriptWriter
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -26,7 +26,7 @@ logger = get_logger(__name__)
 class Speaker:
     """Display identity for a user, refreshed on every frame they send."""
     name: str
-    channel: str
+    source: Source
 
 
 class STTProcessor:
@@ -71,7 +71,7 @@ class STTProcessor:
 
     # ── ingest ────────────────────────────────────
 
-    def submit(self, user_id: int, name: str, channel: str, pcm: bytes) -> None:
+    def submit(self, user_id: int, name: str, source: Source, pcm: bytes) -> None:
         """
         Hand one resampled frame to the event loop.
 
@@ -80,12 +80,12 @@ class STTProcessor:
         """
         if self._loop is None:
             return
-        self._loop.call_soon_threadsafe(self._feed, user_id, name, channel, pcm)
+        self._loop.call_soon_threadsafe(self._feed, user_id, name, source, pcm)
 
     # ── event-loop side ───────────────────────────
 
-    def _feed(self, user_id: int, name: str, channel: str, pcm: bytes) -> None:
-        self._speakers[user_id] = Speaker(name=name, channel=channel)
+    def _feed(self, user_id: int, name: str, source: Source, pcm: bytes) -> None:
+        self._speakers[user_id] = Speaker(name=name, source=source)
 
         state = self._users.get_or_create(user_id)
         state.raw_buffer.extend(pcm)
@@ -160,7 +160,7 @@ class STTProcessor:
             return
 
         await asyncio.to_thread(
-            self._writer.write, user_id, speaker.name, speaker.channel, text
+            self._writer.write, speaker.source, user_id, speaker.name, text
         )
         logger.info("📝 [%s] %s", speaker.name, text)
 

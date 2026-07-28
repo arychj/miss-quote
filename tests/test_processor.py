@@ -6,11 +6,13 @@ import pytest
 import stt.processor as processor_module
 from config import vad_cfg
 from stt.processor import STTProcessor
-from transcript.writer import TranscriptWriter
+from transcript.writer import Source, TranscriptWriter
 
 TIMEZONE = "America/Los_Angeles"
 KEEP_FOREVER = -1
-CHANNEL = "general-voice"
+SOURCE = Source(
+    guild_id=987654321, guild="ste.haus", channel_id=456, channel="general-voice"
+)
 
 ALICE = (101, "alice")
 BOB = (202, "bob")
@@ -87,7 +89,7 @@ async def build(monkeypatch, tmp_path, transcripts):
 
 def _speak(processor: STTProcessor, speaker: tuple[int, str], frames: int) -> None:
     user_id, name = speaker
-    processor._feed(user_id, name, CHANNEL, b"\x00" * (vad_cfg.frame_bytes * frames))
+    processor._feed(user_id, name, SOURCE, b"\x00" * (vad_cfg.frame_bytes * frames))
 
 
 def _trigger(processor: STTProcessor, speaker: tuple[int, str], on: bool) -> None:
@@ -97,7 +99,7 @@ def _trigger(processor: STTProcessor, speaker: tuple[int, str], on: bool) -> Non
 
 def _lines(tmp_path) -> list[dict]:
     lines = []
-    for path in sorted(tmp_path.glob("*.jsonl")):
+    for path in sorted(tmp_path.rglob("*.jsonl")):
         lines += [json.loads(line) for line in path.read_text().splitlines()]
     return lines
 
@@ -120,10 +122,13 @@ async def test_utterance_reaches_the_transcript(build, tmp_path, transcripts):
             "ts": _lines(tmp_path)[0]["ts"],
             "user_id": ALICE[0],
             "user": ALICE[1],
-            "channel": CHANNEL,
             "text": "hello there",
         }
     ]
+
+    written = list(tmp_path.rglob("*.jsonl"))
+    assert len(written) == 1
+    assert written[0].relative_to(tmp_path).parent == SOURCE.relative_directory
 
 
 async def test_pre_roll_is_prepended_on_speech_onset(build, transcripts):
