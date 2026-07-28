@@ -10,6 +10,13 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  TAG_PREFIX: v
+  INITIAL_VERSION: 0.1.0
+
+# Two merges landing together must not race for the same patch number.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   test:
@@ -32,11 +39,52 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       packages: write
 
     steps:
+      # Tags carry the version, so the full history has to come along.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # A merge to main bumps the patch; an explicit v* tag publishes itself,
+      # which is how minor and major releases get cut.
+      - name: Resolve the version to publish
+        id: version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [ "$REF_TYPE" = "tag" ]; then
+            version="${REF_NAME#$TAG_PREFIX}"
+            should_tag=false
+          else
+            latest="$(git tag --list "${TAG_PREFIX}*" | sort -V | tail -n 1)"
+
+            if [ -z "$latest" ]; then
+              version="$INITIAL_VERSION"
+            else
+              current="${latest#$TAG_PREFIX}"
+              major="${current%%.*}"
+              remainder="${current#*.}"
+              minor="${remainder%%.*}"
+              patch="${remainder#*.}"
+              version="${major}.${minor}.$((patch + 1))"
+            fi
+
+            should_tag=true
+          fi
+
+          {
+            echo "version=$version"
+            echo "major_minor=${version%.*}"
+            echo "should_tag=$should_tag"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Publishing $version"
 
       - uses: docker/setup-buildx-action@v3
 
@@ -48,17 +96,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Semver tags come from git tags, diverging from crppr's latest+sha:
-      # Renovate cannot order sha tags, so without an ordered scheme there is
-      # nothing for it to raise a bump against.
+      # Semver tags rather than crppr's latest+sha: Renovate cannot order sha
+      # tags, so without an ordered scheme there is nothing for it to bump.
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ steps.version.outputs.version }}
+            type=raw,value=${{ steps.version.outputs.major_minor }}
             type=sha
             type=raw,value=latest,enable={{is_default_branch}}
 
@@ -71,3 +118,20 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # After the push, never before: a tag written ahead of a failing build
+      # leaves a version that resolves in git and nowhere else. GITHUB_TOKEN
+      # deliberately does not retrigger this workflow.
+      - name: Publish the git tag
+        if: steps.version.outputs.should_tag == 'true' && github.event_name != 'pull_request'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          tag="${TAG_PREFIX}${VERSION}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$tag" -m "Release $tag"
+          git push origin "$tag"
