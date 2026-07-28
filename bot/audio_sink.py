@@ -11,6 +11,7 @@ import discord
 from discord.ext.voice_recv import AudioSink, VoiceData
 
 from audio.resampler import AudioResampler
+from config import file_cfg
 from stt.processor import STTProcessor
 from transcript.writer import Source
 from utils.logging import get_logger
@@ -67,7 +68,10 @@ class STTAudioSink(AudioSink):
         try:
             resampled = self._resampler.resample(data.pcm)
             self._processor.submit(
-                user.id, user.display_name, self._source, resampled
+                user.id,
+                file_cfg.name_for(user.id, user.display_name),
+                self._source,
+                resampled,
             )
         except Exception as exc:
             logger.error("AudioSink write error: %s", exc)

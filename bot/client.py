@@ -13,7 +13,7 @@ import discord.ext.voice_recv
 from discord.ext import commands
 
 from bot.audio_sink import STTAudioSink
-from config import discord_cfg
+from config import discord_cfg, file_cfg
 from stt.processor import STTProcessor
 from transcript.writer import TranscriptWriter
 from utils.logging import get_logger
@@ -123,6 +123,7 @@ class STTBot:
         @bot.event
         async def on_ready() -> None:
             logger.info("Logged in as %s (ID: %s)", bot.user, bot.user.id)
+            self._report_allowlist()
             self._processor.start(asyncio.get_running_loop())
             self._start_listen_watchdog()
             if discord_cfg.autojoin:
@@ -153,6 +154,28 @@ class STTBot:
             elif action is VoiceAction.LEAVE:
                 logger.info("Channel '%s' is empty; leaving.", channel)
                 await self._disconnect(guild_voice)
+
+    def _report_allowlist(self) -> None:
+        """
+        Say which servers the bot will join, loudly if the answer is none.
+
+        A missing or empty allowlist is a silent no-op otherwise, and silence is
+        the hardest failure to diagnose in this bot.
+        """
+        if not file_cfg.allowed_servers:
+            logger.warning(
+                "No servers are allowed (%s %s); the bot will not join any voice channel.",
+                file_cfg.path,
+                "is empty" if file_cfg.found else "not found",
+            )
+            return
+
+        allowed = ", ".join(
+            f"{guild.name} ({guild.id})"
+            for guild in self._bot.guilds
+            if file_cfg.allows(guild.id)
+        )
+        logger.info("Allowed servers: %s", allowed or "none of the servers joined")
 
     def _start_listen_watchdog(self) -> None:
         if self._watchdog is not None and not self._watchdog.done():
@@ -193,7 +216,7 @@ class STTBot:
     async def _join_active_channels(self) -> None:
         """Pick up channels that already had people in them when the bot started."""
         for guild in self._bot.guilds:
-            if guild.voice_client is not None:
+            if guild.voice_client is not None or not file_cfg.allows(guild.id):
                 continue
             for channel in guild.voice_channels:
                 if humans_in(channel) > 0:
@@ -203,6 +226,16 @@ class STTBot:
     # ── voice lifecycle ───────────────────────────
 
     async def _connect(self, channel: discord.abc.Connectable) -> None:
+        guild = getattr(channel, "guild", None)
+
+        if guild is None or not file_cfg.allows(guild.id):
+            logger.warning(
+                "Refusing to join '%s': server %s is not in the allowlist.",
+                channel,
+                getattr(guild, "id", "unknown"),
+            )
+            return
+
         try:
             voice_client = await channel.connect(
                 cls=discord.ext.voice_recv.VoiceRecvClient,

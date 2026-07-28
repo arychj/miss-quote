@@ -21,3 +21,5 @@ requirements-dev.txt
 
 *.log
 README.md
+todo.md
+config.yaml

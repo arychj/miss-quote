@@ -1,0 +1,20 @@
+# Settings that do not flatten into environment variables.
+#
+# Mounted into the pod at /config/config.yaml from a ConfigMap; override the
+# location with CONFIG_FILE. Read once at startup, so editing it means
+# restarting the pod. The values below are placeholders.
+
+# Servers the bot may join, by ID.
+#
+# A server that is not listed here is never joined, by autojoin or by an
+# explicit !join. An empty list, or a missing file, means the bot joins nothing:
+# recording a server it should not have is not something you can take back.
+allowed_servers:
+  - 123456789012345678
+
+# Names to record instead of the one Discord reports, by user ID.
+#
+# Discord nicknames are freely editable and frequently not a name at all, which
+# makes them poor labels for a transcript a summarizer will later read.
+user_names:
+  234567890123456789: Speaker One
