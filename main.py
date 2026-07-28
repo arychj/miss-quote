@@ -20,7 +20,10 @@ def main() -> None:
         logger.critical("DISCORD_TOKEN is not set. Aborting.")
         sys.exit(1)
 
+    from bot import voice_patches
     from bot.client import STTBot
+
+    voice_patches.apply()
 
     bot = STTBot()
 

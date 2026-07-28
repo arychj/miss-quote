@@ -20,6 +20,9 @@ from utils.logging import get_logger
 
 logger = get_logger(__name__)
 
+# How often to check that a connected voice client is still receiving audio.
+LISTEN_WATCHDOG_INTERVAL_SECONDS = 15.0
+
 
 class VoiceAction(Enum):
     """What a voice-state change should make the bot do."""
@@ -69,10 +72,14 @@ class _Bot(commands.Bot):
     def __init__(self, processor: STTProcessor, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._processor = processor
+        self.background_tasks: list[asyncio.Task] = []
 
     async def close(self) -> None:
         # SIGTERM lands here on pod termination; buffered speech is only lost if
         # it is not flushed before the loop stops.
+        for task in self.background_tasks:
+            task.cancel()
+
         await self._processor.stop()
         await super().close()
 
@@ -94,6 +101,8 @@ class STTBot:
             command_prefix=discord_cfg.command_prefix,
             intents=intents,
         )
+        self._watchdog: asyncio.Task | None = None
+
         self._register_events()
         self._register_commands()
 
@@ -115,6 +124,7 @@ class STTBot:
         async def on_ready() -> None:
             logger.info("Logged in as %s (ID: %s)", bot.user, bot.user.id)
             self._processor.start(asyncio.get_running_loop())
+            self._start_listen_watchdog()
             if discord_cfg.autojoin:
                 await self._join_active_channels()
 
@@ -143,6 +153,42 @@ class STTBot:
             elif action is VoiceAction.LEAVE:
                 logger.info("Channel '%s' is empty; leaving.", channel)
                 await self._disconnect(guild_voice)
+
+    def _start_listen_watchdog(self) -> None:
+        if self._watchdog is not None and not self._watchdog.done():
+            return
+
+        self._watchdog = asyncio.create_task(self._watch_listening())
+        self._bot.background_tasks.append(self._watchdog)
+
+    async def _watch_listening(self) -> None:
+        """
+        Re-attach a sink when a connected voice client stops receiving.
+
+        `PacketRouter` calls `stop_listening()` from its `finally`, so anything
+        that kills that thread leaves the bot in the channel and deaf. Nothing
+        in discord.py re-arms it, and the failure is silent.
+        """
+        while True:
+            await asyncio.sleep(LISTEN_WATCHDOG_INTERVAL_SECONDS)
+
+            try:
+                for guild in self._bot.guilds:
+                    voice_client = guild.voice_client
+                    if voice_client is None or not voice_client.is_connected():
+                        continue
+                    if voice_client.is_listening():
+                        continue
+
+                    logger.warning(
+                        "Voice receive stopped in '%s'; re-attaching the sink.",
+                        voice_client.channel,
+                    )
+                    voice_client.listen(
+                        STTAudioSink(self._processor, voice_client.channel)
+                    )
+            except Exception as exc:
+                logger.error("Listen watchdog error: %s", exc)
 
     async def _join_active_channels(self) -> None:
         """Pick up channels that already had people in them when the bot started."""
