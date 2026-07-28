@@ -2,36 +2,20 @@
 
 Known compromises to come back to. Each entry says what is wrong, why it was accepted, and what "done" looks like.
 
-## Restore end-to-end encryption for voice (DAVE)
+## Replace the patched voice-receive internals
 
-**Current state.** `bot/voice_patches.disable_dave()` clears `discord.voice_state.has_dave` at startup, so the bot advertises DAVE protocol version 0 in the voice IDENTIFY and Discord falls back to transport-only encryption.
+**Current state.** `bot/voice_patches.py` monkeypatches two `PacketDecoder` methods at startup: `_process_packet` to decrypt DAVE frames before Opus sees them, and `pop_data` to drop packets the decoder rejects instead of ending voice receive.
 
-**Why.** discord.py 2.7.1 ships `davey` and advertises DAVE version 1. `discord-ext-voice-recv`, pinned at `ac04ea7b`, has no DAVE support whatsoever: grepping the installed package for `dave` or `mls` returns nothing. It therefore hands still-MLS-encrypted payloads to the Opus decoder, every packet fails as `corrupted stream`, and the bot transcribes nothing. Advertising version 0 is what makes voice receive work at all today.
+**Why.** Discord has required DAVE, its MLS end-to-end encryption, on every non-stage voice call since 2026-03-02; a client that advertises no support is rejected at the handshake with close code 4017. discord.py negotiates the MLS session and holds it on the connection state, but `discord-ext-voice-recv`, pinned at `ac04ea7b`, has no DAVE support at all, so it fed still-encrypted payloads to the Opus decoder. The repository's last commit is 2025-06-18 and both fixes sit unmerged: [PR #54](https://github.com/imayhaveborkedit/discord-ext-voice-recv/pull/54) for decryption, [PR #57](https://github.com/imayhaveborkedit/discord-ext-voice-recv/pull/57) for the decode guard.
 
-**What this costs.** Media is still encrypted on the wire with `aead_xchacha20_poly1305_rtpsize`, so a passive network observer sees nothing. What is given up is confidentiality *from Discord*: the voice server holds the media key and can decrypt the audio, which is how Discord worked before DAVE rolled out in 2024.
+**What this costs.** The patches reach into library internals — `PacketDecoder._process_packet`, `_decode_packet`, `_get_cached_member`, `_last_seq`/`_last_ts` — none of which are public API. `_process_packet` in particular is a reimplementation of the pinned version with the speaker resolved before decoding rather than after, so it silently drifts if the pin ever moves. Both patches are idempotent and guarded, but neither is a substitute for upstream support.
 
-DAVE is negotiated per call, so this downgrades encryption for **every participant in any channel the bot joins**, not just the bot. Anyone in those channels should know that.
+**What done looks like.** Either #54 and #57 land and the pin moves past them, or a maintained replacement for `discord-ext-voice-recv` appears with DAVE support. At that point `bot/voice_patches.py` goes away and `tests/test_voice_patches.py` with it. The watchdog in `bot/client.py` should stay regardless, since it covers causes neither patch addresses.
 
-**What done looks like.** Any one of:
-
-- Upstream merges DAVE support. [PR #54](https://github.com/imayhaveborkedit/discord-ext-voice-recv/pull/54) adds decryption in `opus.py` and is open; the repository's last commit is 2025-06-18, so this may never land.
-- We implement MLS decryption ourselves against `davey` and drop `disable_dave()`.
-- A maintained replacement for `discord-ext-voice-recv` appears with DAVE support.
-
-Whichever path, the finish line is `disable_dave()` deleted and `tests/test_voice_patches.py::test_disable_dave_stops_advertising_e2ee` gone with it.
-
-## Drop the packet-decode guard when upstream fixes the router
-
-**Current state.** `bot/voice_patches.guard_packet_decoding()` wraps `PacketDecoder.pop_data` so an undecodable packet returns `None` instead of raising.
-
-**Why.** `PacketRouter._do_run` has no per-packet guard and `PacketRouter.run` calls `stop_listening()` from its `finally`, so one bad packet permanently ends voice receive for the connection. Known triggers beyond DAVE include a participant starting their camera ([#49](https://github.com/imayhaveborkedit/discord-ext-voice-recv/issues/49)) and the plain `corrupted stream` reports in [#43](https://github.com/imayhaveborkedit/discord-ext-voice-recv/issues/43).
-
-**What done looks like.** [PR #57](https://github.com/imayhaveborkedit/discord-ext-voice-recv/pull/57) lands upstream and the pin moves past it, at which point the patch can go. The watchdog in `bot/client.py` should stay regardless, since it covers causes we have not seen.
-
-## Verify audio actually decodes correctly
+## Verify audio decodes to the right words
 
 **Current state.** Unverified. No transcript has ever been produced.
 
-**Why it is open.** [Issue #53](https://github.com/imayhaveborkedit/discord-ext-voice-recv/issues/53) reports that on discord.py 2.7.1 voice packets decode to audible gibberish with no error raised, which we would not have hit yet because DAVE was failing louder and earlier. If it is real, the symptom is transcripts full of nonsense rather than an empty directory.
+**Why it is open.** [Issue #53](https://github.com/imayhaveborkedit/discord-ext-voice-recv/issues/53) reports that on discord.py 2.7.1 voice packets can decode to audible gibberish with no error raised. Until DAVE decryption worked there was no way to reach that question, because every packet failed earlier and louder.
 
-**What done looks like.** Someone speaks in a voice channel and the resulting JSONL line matches what they said.
+**What done looks like.** Someone speaks in a voice channel and the resulting JSONL line matches what they said. The failure mode to watch for is confident nonsense rather than an empty directory.

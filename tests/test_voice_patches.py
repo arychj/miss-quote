@@ -1,12 +1,14 @@
-import discord.voice_client
-import discord.voice_state
 import pytest
-from discord.ext.voice_recv.opus import PacketDecoder
+from discord.ext.voice_recv.opus import PacketDecoder, VoiceData
 from discord.opus import OpusError
 
 from bot import voice_patches
 
 CORRUPTED_STREAM = -4
+SPEAKER_ID = 4242
+ENCRYPTED = b"encrypted-opus-frame"
+PLAINTEXT = b"plaintext-opus-frame"
+OPUS_SILENCE = b"\xf8\xff\xfe"
 
 
 def _opus_error() -> OpusError:
@@ -15,50 +17,189 @@ def _opus_error() -> OpusError:
 
     OpusError.__init__ calls opus_strerror through ctypes, which needs libopus
     loaded. The container has it; a bare test environment does not, and the
-    guard catches the exception rather than inspecting it.
+    patches catch the exception rather than inspecting it.
     """
     error = OpusError.__new__(OpusError)
     error.code = CORRUPTED_STREAM
     return error
 
 
-@pytest.fixture(autouse=True)
-def restore_dave(monkeypatch):
-    """Patches mutate imported modules; keep them out of other tests."""
-    monkeypatch.setattr(discord.voice_state, "has_dave", discord.voice_state.has_dave)
-    monkeypatch.setattr(discord.voice_client, "has_dave", discord.voice_client.has_dave)
+class FakeSession:
+    """Stands in for davey's DaveSession."""
+
+    def __init__(self, ready: bool = True, error: Exception | None = None) -> None:
+        self.ready = ready
+        self.error = error
+        self.decrypted: list[tuple[int, bytes]] = []
+        self.passthrough_calls = 0
+
+    def set_passthrough_mode(self, enabled: bool, expiry: int | None = None) -> None:
+        self.passthrough_calls += 1
+
+    def decrypt(self, user_id: int, media_type, packet: bytes) -> bytes:
+        if self.error is not None:
+            raise self.error
+        self.decrypted.append((user_id, packet))
+        return PLAINTEXT
 
 
-def test_disable_dave_stops_advertising_e2ee():
-    monkeypatched = discord.voice_state
-    monkeypatched.has_dave = True
+class FakePacket:
+    """A real-looking RTP packet whose payload the test controls."""
 
-    voice_patches.disable_dave()
+    def __init__(self, data: bytes | None = ENCRYPTED, real: bool = True) -> None:
+        self.decrypted_data = data
+        self.sequence = 7
+        self.timestamp = 99
+        self._real = real
 
-    assert monkeypatched.has_dave is False
+    def __bool__(self) -> bool:
+        return self._real
 
-
-def test_disable_dave_leaves_voice_client_alone():
-    """
-    VoiceClient.__init__ raises RuntimeError when its own has_dave is false.
-
-    The two modules hold separate bindings, so clearing both would stop voice
-    connecting at all rather than just downgrading the encryption.
-    """
-    discord.voice_state.has_dave = True
-    discord.voice_client.has_dave = True
-
-    voice_patches.disable_dave()
-
-    assert discord.voice_client.has_dave is True
+    def is_silence(self) -> bool:
+        return self.decrypted_data == OPUS_SILENCE
 
 
-def test_disable_dave_is_idempotent():
-    discord.voice_state.has_dave = False
+class FakeMember:
+    id = SPEAKER_ID
 
-    voice_patches.disable_dave()
+    def __repr__(self) -> str:
+        return "speaker"
 
-    assert discord.voice_state.has_dave is False
+
+class FakeDecoder:
+    """Enough of PacketDecoder for the patched _process_packet to run."""
+
+    def __init__(self, session: FakeSession | None, member=FakeMember()) -> None:
+        self._session = session
+        self._member = member
+        self._cached_id = None
+        self._last_seq = -1
+        self._last_ts = -1
+        self.ssrc = 1
+        self.decoded: list[bytes | None] = []
+
+        self.sink = type("Sink", (), {"wants_opus": lambda self: False})()
+        self.sink.voice_client = type(
+            "VC",
+            (),
+            {
+                "_connection": type("C", (), {})(),
+                "_get_id_from_ssrc": lambda self, ssrc: None,
+            },
+        )()
+        self.sink.voice_client._connection.dave_session = session
+
+    def _get_cached_member(self):
+        return self._member
+
+    def _decode_packet(self, packet):
+        self.decoded.append(packet.decrypted_data)
+        return packet, b"pcm"
+
+
+@pytest.fixture
+def process(monkeypatch):
+    """Apply the DAVE patch to a stand-in decoder rather than the real one."""
+    monkeypatch.setattr(
+        PacketDecoder, "_process_packet", lambda self, packet: None, raising=False
+    )
+    voice_patches.enable_dave_decryption()
+    return PacketDecoder._process_packet
+
+
+def test_encrypted_frame_is_decrypted_before_decoding(process):
+    session = FakeSession()
+    decoder = FakeDecoder(session)
+    packet = FakePacket()
+
+    data = process(decoder, packet)
+
+    assert session.decrypted == [(SPEAKER_ID, ENCRYPTED)]
+    assert decoder.decoded == [PLAINTEXT], "Opus must see the decrypted payload"
+    assert data.pcm == b"pcm"
+
+
+def test_passthrough_is_enabled_once_per_decoder(process):
+    session = FakeSession()
+    decoder = FakeDecoder(session)
+
+    for _ in range(5):
+        process(decoder, FakePacket())
+
+    assert session.passthrough_calls == 1
+
+
+def test_failed_decryption_drops_the_frame_without_raising(process):
+    session = FakeSession(error=RuntimeError("bad epoch"))
+    decoder = FakeDecoder(session)
+    packet = FakePacket()
+
+    data = process(decoder, packet)
+
+    assert data.pcm == b""
+    assert decoder.decoded == [], "a frame that failed to decrypt must not be decoded"
+
+
+def test_silence_packets_are_passed_through_untouched(process):
+    session = FakeSession()
+    decoder = FakeDecoder(session)
+    packet = FakePacket(data=OPUS_SILENCE)
+
+    process(decoder, packet)
+
+    assert session.decrypted == []
+    assert decoder.decoded == [OPUS_SILENCE]
+
+
+def test_fake_packets_are_not_decrypted(process):
+    """Loss-concealment packets carry no payload to decrypt."""
+    session = FakeSession()
+    decoder = FakeDecoder(session)
+
+    process(decoder, FakePacket(data=b"", real=False))
+
+    assert session.decrypted == []
+
+
+def test_frames_pass_through_until_the_session_is_ready(process):
+    session = FakeSession(ready=False)
+    decoder = FakeDecoder(session)
+
+    process(decoder, FakePacket())
+
+    assert session.decrypted == []
+    assert decoder.decoded == [ENCRYPTED]
+
+
+def test_missing_session_does_not_raise(process):
+    decoder = FakeDecoder(None)
+
+    data = process(decoder, FakePacket())
+
+    assert data.pcm == b"pcm"
+
+
+def test_unresolved_member_is_not_decrypted(process):
+    """Decryption is keyed by speaker, so an unknown speaker has nothing to try."""
+    session = FakeSession()
+    decoder = FakeDecoder(session, member=None)
+
+    process(decoder, FakePacket())
+
+    assert session.decrypted == []
+
+
+def test_dave_patch_is_not_applied_twice(monkeypatch):
+    monkeypatch.setattr(
+        PacketDecoder, "_process_packet", lambda self, packet: None, raising=False
+    )
+
+    voice_patches.enable_dave_decryption()
+    once = PacketDecoder._process_packet
+
+    voice_patches.enable_dave_decryption()
+
+    assert PacketDecoder._process_packet is once
 
 
 class _Decoder:
@@ -77,7 +218,6 @@ class _Decoder:
 
 @pytest.fixture
 def guarded(monkeypatch):
-    """Apply the decode guard to a stand-in decoder rather than the real one."""
     monkeypatch.setattr(PacketDecoder, "pop_data", _Decoder.pop_data, raising=False)
     voice_patches.guard_packet_decoding()
     return PacketDecoder.pop_data
