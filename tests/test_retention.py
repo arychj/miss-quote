@@ -1,4 +1,5 @@
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -10,8 +11,18 @@ DISABLED_BY_ZERO = 0
 KEEP_A_WEEK = 7
 
 
+def _today() -> date:
+    """
+    Resolve today in TIMEZONE, the clock the writer prunes against.
+
+    date.today() reads the host zone, which disagrees with TIMEZONE for part
+    of every day and makes the retention boundary depend on when the suite runs.
+    """
+    return datetime.now(ZoneInfo(TIMEZONE)).date()
+
+
 def _seed(directory, days_ago: int) -> None:
-    day = date.today() - timedelta(days=days_ago)
+    day = _today() - timedelta(days=days_ago)
     (directory / f"{day.isoformat()}.jsonl").write_text("{}\n")
 
 
@@ -44,7 +55,7 @@ def test_positive_retention_removes_only_old_files(tmp_path) -> None:
     )
 
     survivors = _names(tmp_path)
-    today = date.today()
+    today = _today()
 
     assert f"{(today - timedelta(days=3)).isoformat()}.jsonl" in survivors
     assert f"{today.isoformat()}.jsonl" in survivors
@@ -54,7 +65,7 @@ def test_positive_retention_removes_only_old_files(tmp_path) -> None:
 
 def test_age_comes_from_filename_not_mtime(tmp_path) -> None:
     """A stale file touched recently must still be pruned."""
-    old = tmp_path / f"{(date.today() - timedelta(days=90)).isoformat()}.jsonl"
+    old = tmp_path / f"{(_today() - timedelta(days=90)).isoformat()}.jsonl"
     old.write_text("{}\n")
     old.touch()  # mtime is now; the filename says otherwise
 
