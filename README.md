@@ -78,15 +78,19 @@ Transcripts are filed one directory per guild, one per voice channel inside it, 
 
 ```
 TRANSCRIPT_DIR/
-└── 987654321-ste-haus/
-    ├── 456123-general-voice/
+└── 123456789012345678-first-server/
+    ├── 456123456789012345-general-voice/
     │   ├── 2026-07-26.jsonl
     │   └── 2026-07-27.jsonl
-    └── 999888-side-room/
+    └── 999888777666555444-side-room/
         └── 2026-07-27.jsonl
 ```
 
-Each directory is named `<id>-<slug>`. The ID leads because it is stable; the slug follows so the tree is readable without looking anything up. Names are lowercased and reduced to `a-z0-9_-`, which drops dots and separators rather than escaping them, so no guild or channel name can express a path traversal wherever it appears in the string. Renaming a guild or channel starts a new directory rather than moving the old one, and both remain findable by their shared ID prefix.
+Each directory is named `<id>-<name>`. The ID leads because it is stable; the name follows so the tree is readable without looking anything up.
+
+The guild uses its **alias from `known_servers`**, not its Discord name, so renaming the server changes nothing about where its transcripts land. Channels have no alias and still can be renamed, which starts a new directory; the shared channel ID prefix keeps both findable.
+
+Names are lowercased and reduced to `a-z0-9_-`, which drops dots and separators rather than escaping them, so no name can express a path traversal wherever it appears in the string.
 
 JSON Lines, one object per utterance, appended and flushed as produced:
 
@@ -102,20 +106,29 @@ Files roll over on the local calendar date, resolved through `TZ`, and timestamp
 
 ## Configuration
 
-Lists and mappings do not flatten into environment variables, so they live in `config.yaml`, mounted at `/config/config.yaml` from a ConfigMap. Point `CONFIG_FILE` elsewhere to override the location. The file is read once at startup, so editing it means restarting the pod. The IDs shipped in the repo copy are placeholders.
+Mappings do not flatten into environment variables, so they live in `config.yaml`, mounted at `/config/config.yaml` from a ConfigMap. Point `CONFIG_FILE` elsewhere to override the location. The file is read once at startup, so editing it means restarting the pod. The IDs in the repo copy are placeholders.
 
 ```yaml
-allowed_servers:
-  - 123456789012345678
+known_servers:
+  123456789012345678: first-server
+  876543210987654321: second-server
 
 user_names:
-  234567890123456789: Speaker One
+  first-server:
+    234567890123456789: Speaker One
+  second-server:
+    234567890123456789: Someone Else
 ```
 
-`allowed_servers` is a hard gate on joining. A server that is not listed is never joined, by autojoin or by an explicit `!join`, and an empty list or a missing file means the bot joins nothing at all. That direction is deliberate: joining no server is something you notice and fix, while recording a server the bot should not have been in is not something you can take back. The startup log always says which servers are allowed, and warns when the answer is none.
+`known_servers` maps each server's ID to an alias, and it is the only place an ID appears. Everything else keys off the alias, including transcript directories, so renaming a server on Discord changes nothing about where its transcripts land or which roster applies to it.
 
-`user_names` replaces the display name Discord reports for a speaker. Discord nicknames are freely editable and often not a name at all, which makes them poor labels in a transcript that a summarizer will later read. IDs may be quoted or bare; both are read as integers.
+It is also a hard gate on joining. A server that is not listed is never joined, by autojoin or by an explicit `!join`, and an empty mapping or a missing file means the bot joins nothing at all. That direction is deliberate: joining no server is something you notice and fix, while recording a server the bot should not have been in is not something you can take back.
 
+On startup the bot reconciles the file against the servers it is actually in, and says so. Three things can be wrong and none of them raise on their own: nothing is configured, a server is configured but the bot was never invited, or the bot is in a server nobody configured. Each is logged, so none has to be discovered by noticing an empty transcript directory.
+
+`user_names` replaces the display name Discord reports for a speaker, per server. Discord nicknames are freely editable and often not a name at all, which makes them poor labels in a transcript that a summarizer will later read. The roster is per server because the same person can be known differently in two places. IDs may be quoted or bare; both are read as integers.
+
+## Environment
 
 Every setting is read from the environment; `.env` is loaded if present. Nothing about a particular deployment is baked into the image, so the same image runs anywhere the variables below point it at.
 

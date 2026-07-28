@@ -4,17 +4,27 @@
 # location with CONFIG_FILE. Read once at startup, so editing it means
 # restarting the pod. The values below are placeholders.
 
-# Servers the bot may join, by ID.
+# Servers the bot may join, by ID, each mapped to an alias.
 #
-# A server that is not listed here is never joined, by autojoin or by an
-# explicit !join. An empty list, or a missing file, means the bot joins nothing:
-# recording a server it should not have is not something you can take back.
-allowed_servers:
-  - 123456789012345678
+# The ID appears here and nowhere else: everything below keys off the alias, and
+# so do transcript directories, so renaming a server on Discord changes nothing.
+# A server that is not listed is never joined, by autojoin or by an explicit
+# !join, and an empty mapping means the bot joins nothing: recording a server it
+# should not have is not something you can take back.
+known_servers:
+  123456789012345678: first-server
+  876543210987654321: second-server
 
-# Names to record instead of the one Discord reports, by user ID.
+# Names to record instead of the one Discord reports, per server, by user ID.
 #
 # Discord nicknames are freely editable and frequently not a name at all, which
-# makes them poor labels for a transcript a summarizer will later read.
+# makes them poor labels for a transcript a summarizer will later read. The
+# mapping is per server because the same person can be known differently in two
+# places, and one server's roster should not label another's.
 user_names:
-  234567890123456789: Speaker One
+  first-server:
+    234567890123456789: Speaker One
+    345678901234567890: Speaker Two
+
+  second-server:
+    234567890123456789: Someone Else

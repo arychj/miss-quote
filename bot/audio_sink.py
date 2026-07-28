@@ -39,16 +39,25 @@ class STTAudioSink(AudioSink):
         # A sink is bound to one channel for its lifetime, so the origin is
         # resolved once here rather than per frame.
         guild = getattr(channel, "guild", None)
+        self._guild_id = getattr(guild, "id", UNKNOWN_ID)
+
+        # A sink only exists for a server the bot was allowed to join, so the
+        # alias is configured; the Discord name is a fallback for nothing in
+        # particular going wrong.
+        alias = file_cfg.alias_for(self._guild_id) or getattr(
+            guild, "name", UNKNOWN_NAME
+        )
+
         self._source = Source(
-            guild_id=getattr(guild, "id", UNKNOWN_ID),
-            guild=getattr(guild, "name", UNKNOWN_NAME),
+            guild_id=self._guild_id,
+            guild_alias=alias,
             channel_id=getattr(channel, "id", UNKNOWN_ID),
             channel=getattr(channel, "name", UNKNOWN_NAME),
         )
 
         logger.info(
             "STTAudioSink listening on '%s/%s', writing to %s.",
-            self._source.guild,
+            alias,
             self._source.channel,
             self._source.relative_directory,
         )
@@ -69,7 +78,7 @@ class STTAudioSink(AudioSink):
             resampled = self._resampler.resample(data.pcm)
             self._processor.submit(
                 user.id,
-                file_cfg.name_for(user.id, user.display_name),
+                file_cfg.name_for(self._guild_id, user.id, user.display_name),
                 self._source,
                 resampled,
             )

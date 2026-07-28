@@ -11,7 +11,7 @@ from transcript.writer import Source, TranscriptWriter
 TIMEZONE = "America/Los_Angeles"
 KEEP_FOREVER = -1
 SOURCE = Source(
-    guild_id=987654321, guild="ste.haus", channel_id=456, channel="general-voice"
+    guild_id=987654321, guild_alias="first-server", channel_id=456, channel="general-voice"
 )
 
 ALICE = (101, "alice")

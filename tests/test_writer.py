@@ -13,13 +13,13 @@ USER_ID = 1234567890
 USER = "someone"
 
 SOURCE = Source(
-    guild_id=987654321, guild="ste.haus", channel_id=456123, channel="general-voice"
+    guild_id=987654321, guild_alias="first-server", channel_id=456123, channel="general-voice"
 )
 OTHER_CHANNEL = Source(
-    guild_id=987654321, guild="ste.haus", channel_id=999888, channel="side-room"
+    guild_id=987654321, guild_alias="first-server", channel_id=999888, channel="side-room"
 )
 OTHER_GUILD = Source(
-    guild_id=111222333, guild="somewhere else", channel_id=456123, channel="general-voice"
+    guild_id=111222333, guild_alias="somewhere-else", channel_id=456123, channel="general-voice"
 )
 
 
@@ -93,7 +93,7 @@ def test_origin_lives_in_the_path_not_the_line(tmp_path, frozen_clock):
     assert "channel_id" not in line
 
     assert path.relative_to(tmp_path).parts == (
-        "987654321-ste-haus",
+        "987654321-first-server",
         "456123-general-voice",
         "2026-07-26.jsonl",
     )
@@ -132,7 +132,7 @@ def test_channels_and_guilds_are_kept_apart(tmp_path, frozen_clock):
 @pytest.mark.parametrize(
     ("name", "expected"),
     [
-        ("ste.haus", "ste-haus"),
+        ("example.net", "example-net"),
         ("general-voice", "general-voice"),
         ("Someone's Server", "someone-s-server"),
         ("🎮 Gaming / Chat", "gaming-chat"),
@@ -153,7 +153,7 @@ def test_slug_cannot_escape_the_root(tmp_path, frozen_clock):
     writer = _writer(tmp_path)
 
     hostile = Source(
-        guild_id=13, guild="../../etc", channel_id=14, channel="../../passwd"
+        guild_id=13, guild_alias="../../etc", channel_id=14, channel="../../passwd"
     )
     path = writer.write(hostile, USER_ID, USER, "nice try")
 

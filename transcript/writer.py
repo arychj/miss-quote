@@ -47,7 +47,7 @@ class Source:
     """The guild and channel an utterance came from."""
 
     guild_id: int
-    guild: str
+    guild_alias: str
     channel_id: int
     channel: str
 
@@ -56,11 +56,14 @@ class Source:
         """
         Directory this source's transcripts live in, relative to the root.
 
-        The ID leads so a renamed guild or channel stays greppable by identity;
-        the slug follows so the tree is readable without looking anything up.
+        The ID leads so a directory stays greppable by identity; the name
+        follows so the tree is readable without looking anything up. The guild
+        uses its configured alias rather than its Discord name, so renaming the
+        server on Discord does not start a new directory. Channel names have no
+        alias and still can, which the shared ID prefix keeps findable.
         """
         return Path(
-            f"{self.guild_id}-{slugify(self.guild)}",
+            f"{self.guild_id}-{slugify(self.guild_alias)}",
             f"{self.channel_id}-{slugify(self.channel)}",
         )
 
