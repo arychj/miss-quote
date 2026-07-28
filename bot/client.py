@@ -15,7 +15,7 @@ from discord.ext import commands
 from bot.audio_sink import STTAudioSink
 from config import discord_cfg, file_cfg
 from stt.processor import STTProcessor
-from transcript.writer import TranscriptWriter
+from transcript.writer import TranscriptWriter, slugify
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -274,6 +274,8 @@ class STTBot:
             )
             return
 
+        self._warn_on_colliding_channel(channel, guild)
+
         try:
             voice_client = await channel.connect(
                 cls=discord.ext.voice_recv.VoiceRecvClient,
@@ -282,6 +284,31 @@ class STTBot:
             logger.info("Joined voice channel: %s", channel)
         except Exception as exc:
             logger.error("Could not join %s: %s", channel, exc)
+
+    @staticmethod
+    def _warn_on_colliding_channel(channel: Any, guild: Any) -> None:
+        """
+        Warn when two voice channels would share a transcript directory.
+
+        Paths carry no channel ID, so two channels whose names reduce to the
+        same slug write to the same files. Discord permits that; nothing about
+        the path can catch it.
+        """
+        slug = slugify(getattr(channel, "name", ""))
+        clashing = [
+            sibling.name
+            for sibling in getattr(guild, "voice_channels", None) or []
+            if sibling.id != channel.id and slugify(sibling.name) == slug
+        ]
+
+        if clashing:
+            logger.error(
+                "Voice channel '%s' shares the directory '%s' with: %s. "
+                "Their transcripts will be interleaved.",
+                channel,
+                slug,
+                ", ".join(clashing),
+            )
 
     async def _disconnect(self, voice_client: discord.VoiceClient | None) -> None:
         if voice_client is None:

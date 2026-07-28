@@ -79,16 +79,16 @@ Transcripts are filed one directory per guild, one per voice channel inside it, 
 ```
 TRANSCRIPT_DIR/
 └── first-server/
-    ├── 456123456789012345-general-voice/
+    ├── general-voice/
     │   ├── 2026-07-26.jsonl
     │   └── 2026-07-27.jsonl
-    └── 999888777666555444-side-room/
+    └── side-room/
         └── 2026-07-27.jsonl
 ```
 
-The server directory is its **alias from `known_servers`**. The alias is fixed in configuration rather than read from Discord, so it cannot change underneath the tree and needs no ID to stay identifiable. Two servers given the same alias would therefore share a directory; the bot logs an error at startup if that happens, since nothing about the path can prevent it.
+The server directory is its **alias from `known_servers`**, fixed in configuration rather than read from Discord, so it cannot change underneath the tree. Channels use their Discord name.
 
-Channels have no alias and can be renamed, so they keep an `<id>-<name>` prefix: a rename starts a new directory, and the shared ID is what makes the two findable as the same channel.
+Neither carries an ID, which has two consequences worth knowing. **Renaming a channel starts a new directory** with nothing tying it to the old one; that is accepted rather than worked around, since the alternative is an ID in every path to serve a rare event. And **two names that reduce to the same slug share a directory** — two servers given one alias, or two voice channels named `General` and `general`. Nothing about the path can catch either, so the bot logs an error instead: duplicate aliases at startup, colliding channels when it joins one.
 
 Names are lowercased and reduced to `a-z0-9_-`, which drops dots and separators rather than escaping them, so no name can express a path traversal wherever it appears in the string.
 

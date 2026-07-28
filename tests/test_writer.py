@@ -94,7 +94,7 @@ def test_origin_lives_in_the_path_not_the_line(tmp_path, frozen_clock):
 
     assert path.relative_to(tmp_path).parts == (
         "first-server",
-        "456123-general-voice",
+        "general-voice",
         "2026-07-26.jsonl",
     )
 
@@ -160,7 +160,7 @@ def test_slug_cannot_escape_the_root(tmp_path, frozen_clock):
     assert tmp_path in path.parents
     assert path.relative_to(tmp_path).parts == (
         "etc",
-        "14-passwd",
+        "passwd",
         "2026-07-26.jsonl",
     )
 
@@ -181,10 +181,11 @@ def test_slug_yields_no_dots_or_separators(hostile: str) -> None:
 
 def test_two_servers_sharing_an_alias_share_a_directory(tmp_path, frozen_clock):
     """
-    Without the ID prefix, the alias is the only thing separating servers.
+    Names are all that separate directories now, for servers and channels both.
 
-    Nothing here can prevent that; the bot warns at startup instead. This pins
-    the consequence so the warning cannot quietly stop mattering.
+    Nothing here can prevent a collision; the bot warns instead, at startup for
+    aliases and on join for channels. These pin the consequence so the warnings
+    cannot quietly stop mattering.
     """
     frozen_clock(datetime(2026, 7, 26, 10, 0, 0, tzinfo=ZoneInfo(TIMEZONE)))
     writer = _writer(tmp_path)
@@ -198,4 +199,29 @@ def test_two_servers_sharing_an_alias_share_a_directory(tmp_path, frozen_clock):
 
     assert writer.write(one, USER_ID, USER, "first") == writer.write(
         two, USER_ID, USER, "second"
+    )
+
+
+def test_two_channels_slugging_alike_share_a_directory(tmp_path, frozen_clock):
+    frozen_clock(datetime(2026, 7, 26, 10, 0, 0, tzinfo=ZoneInfo(TIMEZONE)))
+    writer = _writer(tmp_path)
+
+    one = Source(guild_id=111, guild_alias="a", channel_id=1, channel="General")
+    two = Source(guild_id=111, guild_alias="a", channel_id=2, channel="general")
+
+    assert writer.write(one, USER_ID, USER, "first") == writer.write(
+        two, USER_ID, USER, "second"
+    )
+
+
+def test_a_renamed_channel_starts_a_new_directory(tmp_path, frozen_clock):
+    """Accepted: paths carry no channel ID, so a rename has nothing to follow."""
+    frozen_clock(datetime(2026, 7, 26, 10, 0, 0, tzinfo=ZoneInfo(TIMEZONE)))
+    writer = _writer(tmp_path)
+
+    before = Source(guild_id=111, guild_alias="a", channel_id=1, channel="general")
+    after = Source(guild_id=111, guild_alias="a", channel_id=1, channel="lounge")
+
+    assert writer.write(before, USER_ID, USER, "first") != writer.write(
+        after, USER_ID, USER, "second"
     )

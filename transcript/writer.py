@@ -60,14 +60,11 @@ class Source:
         configuration rather than read from Discord, so it cannot change
         underneath the tree and needs no ID to stay identifiable.
 
-        Channels have no alias and can be renamed, so they keep the ID prefix:
-        a rename starts a new directory, and the shared prefix is what makes the
-        two findable as the same channel.
+        Channels are named the same way, without their ID. Renaming one starts a
+        new directory with nothing tying it to the old, which is accepted: the
+        alternative puts an ID in every path to serve a rare event.
         """
-        return Path(
-            slugify(self.guild_alias),
-            f"{self.channel_id}-{slugify(self.channel)}",
-        )
+        return Path(slugify(self.guild_alias), slugify(self.channel))
 
 
 class TranscriptWriter:
