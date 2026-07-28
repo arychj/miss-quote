@@ -7,7 +7,9 @@ Groups settings into logical dataclasses with environment variable loading and v
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Mapping
 
+import yaml
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -194,6 +196,68 @@ class LogConfig:
 
 
 # ──────────────────────────────────────────────
+# Mounted file
+# ──────────────────────────────────────────────
+CONFIG_FILE_ENV = "CONFIG_FILE"
+DEFAULT_CONFIG_FILE = "/config/config.yaml"
+ALLOWED_SERVERS_KEY = "allowed_servers"
+USER_NAMES_KEY = "user_names"
+
+
+@dataclass(frozen=True)
+class FileConfig:
+    """
+    Settings that come from a mounted file rather than the environment.
+
+    These are lists and mappings, which do not survive being flattened into
+    environment variables. Read once at startup, so changing the file means
+    restarting the pod.
+    """
+
+    path: Path
+    allowed_servers: frozenset[int]
+    user_names: Mapping[int, str]
+    found: bool
+
+    @classmethod
+    def load(cls) -> "FileConfig":
+        path = Path(_env_str(CONFIG_FILE_ENV, DEFAULT_CONFIG_FILE))
+
+        if not path.is_file():
+            return cls(
+                path=path, allowed_servers=frozenset(), user_names={}, found=False
+            )
+
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+
+        return cls(
+            path=path,
+            allowed_servers=frozenset(
+                int(server) for server in raw.get(ALLOWED_SERVERS_KEY) or []
+            ),
+            user_names={
+                int(user): str(name)
+                for user, name in (raw.get(USER_NAMES_KEY) or {}).items()
+            },
+            found=True,
+        )
+
+    def allows(self, server_id: int) -> bool:
+        """
+        Whether the bot may join a server.
+
+        A server absent from the allowlist is never joined, so an empty or
+        missing file means the bot joins nothing. Recording the wrong server is
+        not recoverable; joining none is.
+        """
+        return server_id in self.allowed_servers
+
+    def name_for(self, user_id: int, reported: str) -> str:
+        """The configured name for a speaker, or what Discord reported."""
+        return self.user_names.get(user_id, reported)
+
+
+# ──────────────────────────────────────────────
 # Singleton instances (import these directly)
 # ──────────────────────────────────────────────
 discord_cfg = DiscordConfig()
@@ -203,3 +267,4 @@ stt_cfg = STTConfig()
 transcript_cfg = TranscriptConfig()
 process_cfg = ProcessConfig()
 log_cfg = LogConfig()
+file_cfg = FileConfig.load()

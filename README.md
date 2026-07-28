@@ -102,6 +102,21 @@ Files roll over on the local calendar date, resolved through `TZ`, and timestamp
 
 ## Configuration
 
+Lists and mappings do not flatten into environment variables, so they live in `config.yaml`, mounted at `/config/config.yaml` from a ConfigMap. Point `CONFIG_FILE` elsewhere to override the location. The file is read once at startup, so editing it means restarting the pod. The IDs shipped in the repo copy are placeholders.
+
+```yaml
+allowed_servers:
+  - 123456789012345678
+
+user_names:
+  234567890123456789: Speaker One
+```
+
+`allowed_servers` is a hard gate on joining. A server that is not listed is never joined, by autojoin or by an explicit `!join`, and an empty list or a missing file means the bot joins nothing at all. That direction is deliberate: joining no server is something you notice and fix, while recording a server the bot should not have been in is not something you can take back. The startup log always says which servers are allowed, and warns when the answer is none.
+
+`user_names` replaces the display name Discord reports for a speaker. Discord nicknames are freely editable and often not a name at all, which makes them poor labels in a transcript that a summarizer will later read. IDs may be quoted or bare; both are read as integers.
+
+
 Every setting is read from the environment; `.env` is loaded if present. Nothing about a particular deployment is baked into the image, so the same image runs anywhere the variables below point it at.
 
 ### Discord

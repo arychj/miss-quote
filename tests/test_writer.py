@@ -134,7 +134,7 @@ def test_channels_and_guilds_are_kept_apart(tmp_path, frozen_clock):
     [
         ("ste.haus", "ste-haus"),
         ("general-voice", "general-voice"),
-        ("Erik's Server", "erik-s-server"),
+        ("Someone's Server", "someone-s-server"),
         ("🎮 Gaming / Chat", "gaming-chat"),
         ("...hidden", "hidden"),
         ("../../escape", "escape"),
