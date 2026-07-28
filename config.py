@@ -7,7 +7,7 @@ Groups settings into logical dataclasses with environment variable loading and v
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping
+from typing import Mapping, Optional
 
 import yaml
 from dotenv import load_dotenv
@@ -200,7 +200,7 @@ class LogConfig:
 # ──────────────────────────────────────────────
 CONFIG_FILE_ENV = "CONFIG_FILE"
 DEFAULT_CONFIG_FILE = "/config/config.yaml"
-ALLOWED_SERVERS_KEY = "allowed_servers"
+KNOWN_SERVERS_KEY = "known_servers"
 USER_NAMES_KEY = "user_names"
 
 
@@ -209,14 +209,19 @@ class FileConfig:
     """
     Settings that come from a mounted file rather than the environment.
 
-    These are lists and mappings, which do not survive being flattened into
-    environment variables. Read once at startup, so changing the file means
-    restarting the pod.
+    These are mappings, which do not survive being flattened into environment
+    variables. Read once at startup, so changing the file means restarting the
+    pod.
+
+    Servers are identified by ID once, in `known_servers`, and by a stable alias
+    everywhere else. The alias is what the rest of the file keys against and
+    what appears in transcript paths, so renaming a server on Discord changes
+    nothing here.
     """
 
     path: Path
-    allowed_servers: frozenset[int]
-    user_names: Mapping[int, str]
+    known_servers: Mapping[int, str]
+    user_names: Mapping[str, Mapping[int, str]]
     found: bool
 
     @classmethod
@@ -224,37 +229,49 @@ class FileConfig:
         path = Path(_env_str(CONFIG_FILE_ENV, DEFAULT_CONFIG_FILE))
 
         if not path.is_file():
-            return cls(
-                path=path, allowed_servers=frozenset(), user_names={}, found=False
-            )
+            return cls(path=path, known_servers={}, user_names={}, found=False)
 
         raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
 
         return cls(
             path=path,
-            allowed_servers=frozenset(
-                int(server) for server in raw.get(ALLOWED_SERVERS_KEY) or []
-            ),
+            known_servers={
+                int(server): str(alias)
+                for server, alias in (raw.get(KNOWN_SERVERS_KEY) or {}).items()
+            },
             user_names={
-                int(user): str(name)
-                for user, name in (raw.get(USER_NAMES_KEY) or {}).items()
+                str(alias): {int(user): str(name) for user, name in (names or {}).items()}
+                for alias, names in (raw.get(USER_NAMES_KEY) or {}).items()
             },
             found=True,
         )
 
-    def allows(self, server_id: int) -> bool:
+    def knows(self, server_id: int) -> bool:
         """
         Whether the bot may join a server.
 
-        A server absent from the allowlist is never joined, so an empty or
+        A server absent from `known_servers` is never joined, so an empty or
         missing file means the bot joins nothing. Recording the wrong server is
         not recoverable; joining none is.
         """
-        return server_id in self.allowed_servers
+        return server_id in self.known_servers
 
-    def name_for(self, user_id: int, reported: str) -> str:
-        """The configured name for a speaker, or what Discord reported."""
-        return self.user_names.get(user_id, reported)
+    def alias_for(self, server_id: int) -> Optional[str]:
+        """The configured alias for a server, or None if it is not known."""
+        return self.known_servers.get(server_id)
+
+    def name_for(self, server_id: int, user_id: int, reported: str) -> str:
+        """
+        The configured name for a speaker, or what Discord reported.
+
+        Names are per server: the same person can be known differently in two
+        places, and one server's roster should not label another's.
+        """
+        alias = self.alias_for(server_id)
+        if alias is None:
+            return reported
+
+        return self.user_names.get(alias, {}).get(user_id, reported)
 
 
 # ──────────────────────────────────────────────

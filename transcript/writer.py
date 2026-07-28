@@ -47,7 +47,7 @@ class Source:
     """The guild and channel an utterance came from."""
 
     guild_id: int
-    guild: str
+    guild_alias: str
     channel_id: int
     channel: str
 
@@ -56,13 +56,15 @@ class Source:
         """
         Directory this source's transcripts live in, relative to the root.
 
-        The ID leads so a renamed guild or channel stays greppable by identity;
-        the slug follows so the tree is readable without looking anything up.
+        The guild is named by its configured alias alone. The alias is fixed in
+        configuration rather than read from Discord, so it cannot change
+        underneath the tree and needs no ID to stay identifiable.
+
+        Channels are named the same way, without their ID. Renaming one starts a
+        new directory with nothing tying it to the old, which is accepted: the
+        alternative puts an ID in every path to serve a rare event.
         """
-        return Path(
-            f"{self.guild_id}-{slugify(self.guild)}",
-            f"{self.channel_id}-{slugify(self.channel)}",
-        )
+        return Path(slugify(self.guild_alias), slugify(self.channel))
 
 
 class TranscriptWriter:

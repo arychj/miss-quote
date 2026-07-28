@@ -11,10 +11,10 @@ DISABLED_BY_ZERO = 0
 KEEP_A_WEEK = 7
 
 SOURCE = Source(
-    guild_id=987654321, guild="ste.haus", channel_id=456123, channel="general-voice"
+    guild_id=987654321, guild_alias="first-server", channel_id=456123, channel="general-voice"
 )
 OTHER_CHANNEL = Source(
-    guild_id=987654321, guild="ste.haus", channel_id=999888, channel="side-room"
+    guild_id=987654321, guild_alias="first-server", channel_id=999888, channel="side-room"
 )
 
 

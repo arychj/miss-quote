@@ -13,13 +13,13 @@ USER_ID = 1234567890
 USER = "someone"
 
 SOURCE = Source(
-    guild_id=987654321, guild="ste.haus", channel_id=456123, channel="general-voice"
+    guild_id=987654321, guild_alias="first-server", channel_id=456123, channel="general-voice"
 )
 OTHER_CHANNEL = Source(
-    guild_id=987654321, guild="ste.haus", channel_id=999888, channel="side-room"
+    guild_id=987654321, guild_alias="first-server", channel_id=999888, channel="side-room"
 )
 OTHER_GUILD = Source(
-    guild_id=111222333, guild="somewhere else", channel_id=456123, channel="general-voice"
+    guild_id=111222333, guild_alias="somewhere-else", channel_id=456123, channel="general-voice"
 )
 
 
@@ -93,8 +93,8 @@ def test_origin_lives_in_the_path_not_the_line(tmp_path, frozen_clock):
     assert "channel_id" not in line
 
     assert path.relative_to(tmp_path).parts == (
-        "987654321-ste-haus",
-        "456123-general-voice",
+        "first-server",
+        "general-voice",
         "2026-07-26.jsonl",
     )
 
@@ -132,7 +132,7 @@ def test_channels_and_guilds_are_kept_apart(tmp_path, frozen_clock):
 @pytest.mark.parametrize(
     ("name", "expected"),
     [
-        ("ste.haus", "ste-haus"),
+        ("example.net", "example-net"),
         ("general-voice", "general-voice"),
         ("Someone's Server", "someone-s-server"),
         ("🎮 Gaming / Chat", "gaming-chat"),
@@ -153,14 +153,14 @@ def test_slug_cannot_escape_the_root(tmp_path, frozen_clock):
     writer = _writer(tmp_path)
 
     hostile = Source(
-        guild_id=13, guild="../../etc", channel_id=14, channel="../../passwd"
+        guild_id=13, guild_alias="../../etc", channel_id=14, channel="../../passwd"
     )
     path = writer.write(hostile, USER_ID, USER, "nice try")
 
     assert tmp_path in path.parents
     assert path.relative_to(tmp_path).parts == (
-        "13-etc",
-        "14-passwd",
+        "etc",
+        "passwd",
         "2026-07-26.jsonl",
     )
 
@@ -177,3 +177,51 @@ def test_slug_yields_no_dots_or_separators(hostile: str) -> None:
     assert "/" not in slug
     assert "\\" not in slug
     assert slug not in {"..", "."}
+
+
+def test_two_servers_sharing_an_alias_share_a_directory(tmp_path, frozen_clock):
+    """
+    Names are all that separate directories now, for servers and channels both.
+
+    Nothing here can prevent a collision; the bot warns instead, at startup for
+    aliases and on join for channels. These pin the consequence so the warnings
+    cannot quietly stop mattering.
+    """
+    frozen_clock(datetime(2026, 7, 26, 10, 0, 0, tzinfo=ZoneInfo(TIMEZONE)))
+    writer = _writer(tmp_path)
+
+    one = Source(
+        guild_id=111, guild_alias="shared", channel_id=1, channel="general-voice"
+    )
+    two = Source(
+        guild_id=222, guild_alias="shared", channel_id=1, channel="general-voice"
+    )
+
+    assert writer.write(one, USER_ID, USER, "first") == writer.write(
+        two, USER_ID, USER, "second"
+    )
+
+
+def test_two_channels_slugging_alike_share_a_directory(tmp_path, frozen_clock):
+    frozen_clock(datetime(2026, 7, 26, 10, 0, 0, tzinfo=ZoneInfo(TIMEZONE)))
+    writer = _writer(tmp_path)
+
+    one = Source(guild_id=111, guild_alias="a", channel_id=1, channel="General")
+    two = Source(guild_id=111, guild_alias="a", channel_id=2, channel="general")
+
+    assert writer.write(one, USER_ID, USER, "first") == writer.write(
+        two, USER_ID, USER, "second"
+    )
+
+
+def test_a_renamed_channel_starts_a_new_directory(tmp_path, frozen_clock):
+    """Accepted: paths carry no channel ID, so a rename has nothing to follow."""
+    frozen_clock(datetime(2026, 7, 26, 10, 0, 0, tzinfo=ZoneInfo(TIMEZONE)))
+    writer = _writer(tmp_path)
+
+    before = Source(guild_id=111, guild_alias="a", channel_id=1, channel="general")
+    after = Source(guild_id=111, guild_alias="a", channel_id=1, channel="lounge")
+
+    assert writer.write(before, USER_ID, USER, "first") != writer.write(
+        after, USER_ID, USER, "second"
+    )

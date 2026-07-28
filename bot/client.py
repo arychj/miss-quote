@@ -15,7 +15,7 @@ from discord.ext import commands
 from bot.audio_sink import STTAudioSink
 from config import discord_cfg, file_cfg
 from stt.processor import STTProcessor
-from transcript.writer import TranscriptWriter
+from transcript.writer import TranscriptWriter, slugify
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -123,7 +123,7 @@ class STTBot:
         @bot.event
         async def on_ready() -> None:
             logger.info("Logged in as %s (ID: %s)", bot.user, bot.user.id)
-            self._report_allowlist()
+            self._report_known_servers()
             self._processor.start(asyncio.get_running_loop())
             self._start_listen_watchdog()
             if discord_cfg.autojoin:
@@ -155,27 +155,65 @@ class STTBot:
                 logger.info("Channel '%s' is empty; leaving.", channel)
                 await self._disconnect(guild_voice)
 
-    def _report_allowlist(self) -> None:
+    def _report_known_servers(self) -> None:
         """
-        Say which servers the bot will join, loudly if the answer is none.
+        Reconcile the configured servers against the ones the bot is actually in.
 
-        A missing or empty allowlist is a silent no-op otherwise, and silence is
-        the hardest failure to diagnose in this bot.
+        Three things can be wrong and none of them raise: nothing is configured,
+        a server is configured but the bot was never invited, or the bot is in a
+        server nobody configured. Each is reported so none of them has to be
+        discovered by noticing an empty transcript directory.
         """
-        if not file_cfg.allowed_servers:
+        if not file_cfg.known_servers:
             logger.warning(
-                "No servers are allowed (%s %s); the bot will not join any voice channel.",
+                "No servers are configured (%s %s); the bot will not join any voice channel.",
                 file_cfg.path,
-                "is empty" if file_cfg.found else "not found",
+                "is empty" if file_cfg.found else "was not found",
             )
             return
 
-        allowed = ", ".join(
-            f"{guild.name} ({guild.id})"
-            for guild in self._bot.guilds
-            if file_cfg.allows(guild.id)
+        joined = {guild.id for guild in self._bot.guilds}
+
+        logger.info(
+            "Known servers: %s",
+            ", ".join(
+                f"{alias} ({'joined' if server_id in joined else 'not joined'})"
+                for server_id, alias in sorted(
+                    file_cfg.known_servers.items(), key=lambda item: item[1]
+                )
+            ),
         )
-        logger.info("Allowed servers: %s", allowed or "none of the servers joined")
+
+        missing = [
+            alias
+            for server_id, alias in file_cfg.known_servers.items()
+            if server_id not in joined
+        ]
+        if missing:
+            logger.warning(
+                "Configured but not joined: %s. The bot needs an invite to each.",
+                ", ".join(sorted(missing)),
+            )
+
+        duplicates = sorted(
+            alias
+            for alias in set(file_cfg.known_servers.values())
+            if list(file_cfg.known_servers.values()).count(alias) > 1
+        )
+        if duplicates:
+            logger.error(
+                "Alias reused by more than one server: %s. "
+                "Transcripts from those servers will be written to the same directory.",
+                ", ".join(duplicates),
+            )
+
+        unknown = [guild for guild in self._bot.guilds if not file_cfg.knows(guild.id)]
+        if unknown:
+            logger.warning(
+                "In %d server(s) that are not configured, and will not join voice there: %s",
+                len(unknown),
+                ", ".join(f"{guild.name} ({guild.id})" for guild in unknown),
+            )
 
     def _start_listen_watchdog(self) -> None:
         if self._watchdog is not None and not self._watchdog.done():
@@ -216,7 +254,7 @@ class STTBot:
     async def _join_active_channels(self) -> None:
         """Pick up channels that already had people in them when the bot started."""
         for guild in self._bot.guilds:
-            if guild.voice_client is not None or not file_cfg.allows(guild.id):
+            if guild.voice_client is not None or not file_cfg.knows(guild.id):
                 continue
             for channel in guild.voice_channels:
                 if humans_in(channel) > 0:
@@ -228,13 +266,15 @@ class STTBot:
     async def _connect(self, channel: discord.abc.Connectable) -> None:
         guild = getattr(channel, "guild", None)
 
-        if guild is None or not file_cfg.allows(guild.id):
+        if guild is None or not file_cfg.knows(guild.id):
             logger.warning(
-                "Refusing to join '%s': server %s is not in the allowlist.",
+                "Refusing to join '%s': server %s is not a known server.",
                 channel,
                 getattr(guild, "id", "unknown"),
             )
             return
+
+        self._warn_on_colliding_channel(channel, guild)
 
         try:
             voice_client = await channel.connect(
@@ -244,6 +284,31 @@ class STTBot:
             logger.info("Joined voice channel: %s", channel)
         except Exception as exc:
             logger.error("Could not join %s: %s", channel, exc)
+
+    @staticmethod
+    def _warn_on_colliding_channel(channel: Any, guild: Any) -> None:
+        """
+        Warn when two voice channels would share a transcript directory.
+
+        Paths carry no channel ID, so two channels whose names reduce to the
+        same slug write to the same files. Discord permits that; nothing about
+        the path can catch it.
+        """
+        slug = slugify(getattr(channel, "name", ""))
+        clashing = [
+            sibling.name
+            for sibling in getattr(guild, "voice_channels", None) or []
+            if sibling.id != channel.id and slugify(sibling.name) == slug
+        ]
+
+        if clashing:
+            logger.error(
+                "Voice channel '%s' shares the directory '%s' with: %s. "
+                "Their transcripts will be interleaved.",
+                channel,
+                slug,
+                ", ".join(clashing),
+            )
 
     async def _disconnect(self, voice_client: discord.VoiceClient | None) -> None:
         if voice_client is None:
