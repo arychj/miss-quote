@@ -93,7 +93,7 @@ def test_origin_lives_in_the_path_not_the_line(tmp_path, frozen_clock):
     assert "channel_id" not in line
 
     assert path.relative_to(tmp_path).parts == (
-        "987654321-first-server",
+        "first-server",
         "456123-general-voice",
         "2026-07-26.jsonl",
     )
@@ -159,7 +159,7 @@ def test_slug_cannot_escape_the_root(tmp_path, frozen_clock):
 
     assert tmp_path in path.parents
     assert path.relative_to(tmp_path).parts == (
-        "13-etc",
+        "etc",
         "14-passwd",
         "2026-07-26.jsonl",
     )
@@ -177,3 +177,25 @@ def test_slug_yields_no_dots_or_separators(hostile: str) -> None:
     assert "/" not in slug
     assert "\\" not in slug
     assert slug not in {"..", "."}
+
+
+def test_two_servers_sharing_an_alias_share_a_directory(tmp_path, frozen_clock):
+    """
+    Without the ID prefix, the alias is the only thing separating servers.
+
+    Nothing here can prevent that; the bot warns at startup instead. This pins
+    the consequence so the warning cannot quietly stop mattering.
+    """
+    frozen_clock(datetime(2026, 7, 26, 10, 0, 0, tzinfo=ZoneInfo(TIMEZONE)))
+    writer = _writer(tmp_path)
+
+    one = Source(
+        guild_id=111, guild_alias="shared", channel_id=1, channel="general-voice"
+    )
+    two = Source(
+        guild_id=222, guild_alias="shared", channel_id=1, channel="general-voice"
+    )
+
+    assert writer.write(one, USER_ID, USER, "first") == writer.write(
+        two, USER_ID, USER, "second"
+    )

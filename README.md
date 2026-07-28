@@ -78,7 +78,7 @@ Transcripts are filed one directory per guild, one per voice channel inside it, 
 
 ```
 TRANSCRIPT_DIR/
-└── 123456789012345678-first-server/
+└── first-server/
     ├── 456123456789012345-general-voice/
     │   ├── 2026-07-26.jsonl
     │   └── 2026-07-27.jsonl
@@ -86,9 +86,9 @@ TRANSCRIPT_DIR/
         └── 2026-07-27.jsonl
 ```
 
-Each directory is named `<id>-<name>`. The ID leads because it is stable; the name follows so the tree is readable without looking anything up.
+The server directory is its **alias from `known_servers`**. The alias is fixed in configuration rather than read from Discord, so it cannot change underneath the tree and needs no ID to stay identifiable. Two servers given the same alias would therefore share a directory; the bot logs an error at startup if that happens, since nothing about the path can prevent it.
 
-The guild uses its **alias from `known_servers`**, not its Discord name, so renaming the server changes nothing about where its transcripts land. Channels have no alias and still can be renamed, which starts a new directory; the shared channel ID prefix keeps both findable.
+Channels have no alias and can be renamed, so they keep an `<id>-<name>` prefix: a rename starts a new directory, and the shared ID is what makes the two findable as the same channel.
 
 Names are lowercased and reduced to `a-z0-9_-`, which drops dots and separators rather than escaping them, so no name can express a path traversal wherever it appears in the string.
 

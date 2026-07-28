@@ -56,14 +56,16 @@ class Source:
         """
         Directory this source's transcripts live in, relative to the root.
 
-        The ID leads so a directory stays greppable by identity; the name
-        follows so the tree is readable without looking anything up. The guild
-        uses its configured alias rather than its Discord name, so renaming the
-        server on Discord does not start a new directory. Channel names have no
-        alias and still can, which the shared ID prefix keeps findable.
+        The guild is named by its configured alias alone. The alias is fixed in
+        configuration rather than read from Discord, so it cannot change
+        underneath the tree and needs no ID to stay identifiable.
+
+        Channels have no alias and can be renamed, so they keep the ID prefix:
+        a rename starts a new directory, and the shared prefix is what makes the
+        two findable as the same channel.
         """
         return Path(
-            f"{self.guild_id}-{slugify(self.guild_alias)}",
+            slugify(self.guild_alias),
             f"{self.channel_id}-{slugify(self.channel)}",
         )
 

@@ -195,6 +195,18 @@ class STTBot:
                 ", ".join(sorted(missing)),
             )
 
+        duplicates = sorted(
+            alias
+            for alias in set(file_cfg.known_servers.values())
+            if list(file_cfg.known_servers.values()).count(alias) > 1
+        )
+        if duplicates:
+            logger.error(
+                "Alias reused by more than one server: %s. "
+                "Transcripts from those servers will be written to the same directory.",
+                ", ".join(duplicates),
+            )
+
         unknown = [guild for guild in self._bot.guilds if not file_cfg.knows(guild.id)]
         if unknown:
             logger.warning(

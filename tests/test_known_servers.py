@@ -117,9 +117,7 @@ def test_transcript_path_uses_the_alias_not_the_discord_name(monkeypatch):
     sink = sink_module.STTAudioSink(processor=object(), channel=channel)
 
     assert sink._source.guild_alias == "first-server"
-    assert str(sink._source.relative_directory).startswith(
-        f"{KNOWN_SERVER}-first-server/"
-    )
+    assert str(sink._source.relative_directory).startswith("first-server/")
 
 
 def test_speaker_names_come_from_the_servers_own_roster(monkeypatch):
