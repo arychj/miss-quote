@@ -42,7 +42,7 @@ graph TD
     REMOTE -->|"Transcribe / AudioStart / AudioChunk* / AudioStop"| I
 
     I["Wyoming ASR server<br/><i>WYOMING_HOST:WYOMING_PORT</i>"] -->|"Transcript, ~70 ms"| J["TranscriptWriter"]
-    J --> K["TRANSCRIPT_DIR/YYYY-MM-DD.jsonl"]
+    J --> K["TRANSCRIPT_DIR/guild/channel/YYYY-MM-DD.jsonl"]
 ```
 
 Everything runs on one event loop in one process. The split that matters is between the two halves of the pipeline: **audio handling is local and serial, transcription is remote and parallel.**
@@ -74,13 +74,29 @@ Upstream got this backwards: it called `transcribe()` inline in the per-frame lo
 
 ## Transcript format
 
+Transcripts are filed one directory per guild, one per voice channel inside it, and one file per local calendar day:
+
+```
+TRANSCRIPT_DIR/
+└── 987654321-ste-haus/
+    ├── 456123-general-voice/
+    │   ├── 2026-07-26.jsonl
+    │   └── 2026-07-27.jsonl
+    └── 999888-side-room/
+        └── 2026-07-27.jsonl
+```
+
+Each directory is named `<id>-<slug>`. The ID leads because it is stable; the slug follows so the tree is readable without looking anything up. Names are lowercased and reduced to `a-z0-9_-`, which drops dots and separators rather than escaping them, so no guild or channel name can express a path traversal wherever it appears in the string. Renaming a guild or channel starts a new directory rather than moving the old one, and both remain findable by their shared ID prefix.
+
 JSON Lines, one object per utterance, appended and flushed as produced:
 
 ```json
-{"ts":"2026-07-26T21:14:03.412-07:00","user_id":1234567890,"user":"someone","channel":"general-voice","text":"that should work"}
+{"ts":"2026-07-26T21:14:03.412-07:00","user_id":1234567890,"user":"someone","text":"that should work"}
 ```
 
-Files roll over on the local calendar date, resolved through `TZ`, and timestamps carry an explicit UTC offset. A session spanning midnight writes into two files. `user_id` is recorded alongside the display name because display names change.
+Guild and channel are not repeated in the line because the path already carries them. `user_id` is recorded alongside the display name because display names change and the path does not encode the speaker.
+
+Files roll over on the local calendar date, resolved through `TZ`, and timestamps carry an explicit UTC offset. A session spanning midnight writes into two files.
 
 ---
 
