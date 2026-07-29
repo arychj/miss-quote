@@ -22,6 +22,11 @@ FORBIDDEN = "fiddlesticks"
 ALSO_FORBIDDEN = "poppycock"
 WORDS = [FORBIDDEN, ALSO_FORBIDDEN]
 
+# A stem whose endings all attach without the spelling changing, so a test about
+# what the tool hears is not also a test of `utils.stems`.
+STEM = ALSO_FORBIDDEN
+ENDINGS = ("s", "ed", "ing", "er", "ers")
+
 
 class RecordingSpeaker:
     """A speaker that keeps what it was asked to say instead of playing it."""
@@ -187,6 +192,43 @@ async def test_several_violations_in_one_utterance_earn_one_announcement(speech,
     assert len(speaker.played) == 1
 
 
+# ── stems ─────────────────────────────────────────
+
+
+async def test_a_configured_word_is_a_stem(speech, speaker):
+    """A server objects to a word in every tense it has, not just the infinitive."""
+    tool = _tool(speaker, {"words": [STEM]})
+
+    await _hear(tool, f"he {STEM}ed it up")
+
+    assert len(speaker.played) == 1
+
+
+async def test_every_common_ending_is_heard(speech, speaker):
+    tool = _tool(speaker, {"words": [STEM]})
+
+    for ending in ENDINGS:
+        await _hear(tool, f"absolute {STEM}{ending}")
+
+    assert len(speaker.played) == len(ENDINGS)
+
+
+async def test_a_grown_form_costs_one_credit_like_any_other(speech, speaker):
+    await _hear(_tool(speaker), f"{FORBIDDEN}ing {FORBIDDEN}er")
+
+    assert "fined 2 credits for" in speech.asked[0]
+
+
+async def test_a_stem_inside_a_longer_innocent_word_is_still_not_a_violation(
+    speech, speaker
+):
+    tool = _tool(speaker, {"words": ["cuss"]})
+
+    await _hear(tool, "we discussed the discussion at length")
+
+    assert speaker.played == []
+
+
 # ── the fine ──────────────────────────────────────
 
 
@@ -234,6 +276,35 @@ async def test_the_name_comes_from_the_utterance(speech, speaker):
     await _hear(_tool(speaker), FORBIDDEN, user="Someone Else")
 
     assert speech.asked[0].startswith("Someone Else,")
+
+
+async def test_one_violation_is_announced_in_the_singular(speech, speaker):
+    await _hear(_tool(speaker), FORBIDDEN)
+
+    assert "for a violation of" in speech.asked[0]
+
+
+async def test_several_violations_are_announced_in_the_plural(speech, speaker):
+    await _hear(_tool(speaker), f"{FORBIDDEN} and {ALSO_FORBIDDEN}")
+
+    assert "for multiple violations of" in speech.asked[0]
+
+
+async def test_the_plural_does_not_repeat_the_count(speech, speaker):
+    """The number is already in the fine; twice makes it sound like an invoice."""
+    await _hear(_tool(speaker), f"{FORBIDDEN} {FORBIDDEN} {FORBIDDEN}")
+
+    assert speech.asked[0].count("3") == 1
+
+
+async def test_the_violations_are_available_to_a_custom_announcement(speech, speaker):
+    tool = _tool(
+        speaker, {"words": WORDS, "announcement": "{user} is guilty of {violations}"}
+    )
+
+    await _hear(tool, f"{FORBIDDEN} {ALSO_FORBIDDEN}")
+
+    assert speech.asked == [f"{SPEAKER} is guilty of multiple violations"]
 
 
 async def test_the_announcement_can_be_overridden(speech, speaker):

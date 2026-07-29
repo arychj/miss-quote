@@ -1,7 +1,10 @@
 """Rendering a phrase once and keeping it."""
 
+import os
+import time
 import wave
 from dataclasses import replace
+from datetime import timedelta
 
 import numpy as np
 import pytest
@@ -409,3 +412,117 @@ async def test_an_absolute_clip_path_is_refused(tmp_path, caplog):
 
     assert playback == b""
     assert "resolves outside" in caplog.text
+
+
+# ── retention ─────────────────────────────────────
+
+
+RETAIN_DAYS = 90
+ONE_DAY_PAST_IT = RETAIN_DAYS + 1
+LONG_ENOUGH_AGO = timedelta(days=ONE_DAY_PAST_IT).total_seconds()
+RETENTION_OFF = 0
+
+
+def _age(path, seconds: float = LONG_ENOUGH_AGO) -> None:
+    """Backdate a file, as the passage of ninety days would."""
+    aged = time.time() - seconds
+    os.utime(path, (aged, aged))
+
+
+async def test_playing_a_clip_keeps_it_alive(synthesizer, tmp_path):
+    """
+    A phrase said every day should not be reaped for having been rendered once.
+
+    The point of the touch: the second ask is served out of memory and never
+    opens the file, so nothing else would say the clip is still wanted.
+    """
+    cache = SpeechCache(directory=tmp_path, retention_days=RETENTION_OFF)
+    await _collect(cache)
+
+    stored = _cached_files(tmp_path)[0]
+    _age(stored)
+    await _collect(cache)
+
+    SpeechCache(directory=tmp_path, retention_days=RETAIN_DAYS)
+
+    assert stored.is_file()
+
+
+async def test_a_clip_read_off_disk_is_kept_alive(synthesizer, tmp_path):
+    await _collect(SpeechCache(directory=tmp_path, retention_days=RETENTION_OFF))
+    stored = _cached_files(tmp_path)[0]
+    _age(stored)
+
+    await _collect(SpeechCache(directory=tmp_path, retention_days=RETENTION_OFF))
+    SpeechCache(directory=tmp_path, retention_days=RETAIN_DAYS)
+
+    assert stored.is_file()
+
+
+async def test_a_clip_nobody_has_played_is_reaped_at_startup(synthesizer, tmp_path):
+    await _collect(SpeechCache(directory=tmp_path, retention_days=RETAIN_DAYS))
+    _age(_cached_files(tmp_path)[0])
+
+    SpeechCache(directory=tmp_path, retention_days=RETAIN_DAYS)
+
+    assert _cached_files(tmp_path) == []
+
+
+async def test_a_clip_inside_the_window_is_left_alone(synthesizer, tmp_path):
+    await _collect(SpeechCache(directory=tmp_path, retention_days=RETAIN_DAYS))
+
+    SpeechCache(directory=tmp_path, retention_days=RETAIN_DAYS)
+
+    assert len(_cached_files(tmp_path)) == 1
+
+
+async def test_a_clip_kept_by_hand_is_never_reaped(synthesizer, tmp_path):
+    """A chime was put there deliberately, and nothing here rendered it."""
+    _write_clip(tmp_path / CLIP_NAME)
+    _age(tmp_path / CLIP_NAME)
+
+    SpeechCache(directory=tmp_path, retention_days=RETAIN_DAYS)
+
+    assert (tmp_path / CLIP_NAME).is_file()
+
+
+async def test_a_clip_in_a_subdirectory_is_never_reaped(synthesizer, tmp_path):
+    held = tmp_path / "chimes" / CLIP_NAME
+    _write_clip(held)
+    _age(held)
+
+    SpeechCache(directory=tmp_path, retention_days=RETAIN_DAYS)
+
+    assert held.is_file()
+
+
+async def test_retention_below_a_day_reaps_nothing(synthesizer, tmp_path):
+    """So a mis-set variable cannot empty the cache."""
+    await _collect(SpeechCache(directory=tmp_path, retention_days=RETENTION_OFF))
+    _age(_cached_files(tmp_path)[0])
+
+    SpeechCache(directory=tmp_path, retention_days=RETENTION_OFF)
+
+    assert len(_cached_files(tmp_path)) == 1
+
+
+async def test_a_reaped_clip_is_synthesized_again(synthesizer, tmp_path):
+    await _collect(SpeechCache(directory=tmp_path, retention_days=RETAIN_DAYS))
+    _age(_cached_files(tmp_path)[0])
+
+    await _collect(SpeechCache(directory=tmp_path, retention_days=RETAIN_DAYS))
+
+    assert synthesizer.calls == [PHRASE, PHRASE]
+
+
+async def test_touching_a_clip_that_was_never_stored_creates_nothing(
+    synthesizer, tmp_path
+):
+    """`touch` would leave an empty WAV behind for a later read to trip over."""
+    cache = SpeechCache(directory=tmp_path)
+    await _collect(cache)
+
+    _cached_files(tmp_path)[0].unlink()
+    await _collect(cache)
+
+    assert _cached_files(tmp_path) == []

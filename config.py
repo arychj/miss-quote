@@ -211,6 +211,14 @@ class TTSConfig:
     # include a speaker's Discord display name, and those are not a closed set.
     cache_entries: int = field(default_factory=lambda: _env_int("TTS_CACHE_ENTRIES", 256))
 
+    # How long a rendered clip survives on disk without being played. Aged by
+    # mtime, which the cache refreshes on every hit, so a phrase still in use
+    # stays whatever its age. Any value below 1 disables the reaper. Clips left
+    # in the directory by hand are never reaped, whatever this says.
+    cache_retention_days: int = field(
+        default_factory=lambda: _env_int("TTS_CACHE_RETENTION_DAYS", 90)
+    )
+
     @property
     def caching_enabled(self) -> bool:
         return self.cache_entries >= 1

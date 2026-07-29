@@ -1,0 +1,154 @@
+"""
+Stems, and the words they grow into.
+
+A list of words a server objects to is written as stems: `fuck` is meant to
+catch `fucking` and `fuckers` without the file having to say so, because a list
+that has to be exhaustive is a list that will be incomplete the first time
+somebody conjugates.
+
+The rules here are English spelling rather than a dictionary. A final consonant
+doubles after a short vowel, so `shit` grows a `shitter` and not a `shiter`; a
+silent `e` drops before a vowel; a `y` after a consonant becomes `i`. Nothing
+checks whether the result is a word anyone says, and it does not matter: `fucky`
+costs a few bytes in an alternation, while a missing `shitting` costs the tool
+the thing it exists to catch.
+
+Expansion happens once, when a tool is built.
+"""
+
+from __future__ import annotations
+
+VOWELS = frozenset("aeiou")
+
+# Counting syllables, `y` is doing a vowel's job: "bloody" is two, not one.
+SYLLABLE_VOWELS = VOWELS | {"y"}
+
+# It is "boxed" and "flowed", never "boxxed" or "flowwed".
+NEVER_DOUBLED = frozenset("wxy")
+
+PLURAL = "s"
+SIBILANT_PLURAL = "es"
+SIBILANT_ENDINGS = ("s", "x", "z", "ch", "sh")
+Y_PLURAL = "ies"
+
+PAST = "ed"
+GERUND = "ing"
+AGENT = "er"
+ADJECTIVE = "y"
+
+# The gerund as it is said rather than written: "fuckin", not "fucking". Word
+# boundaries make the apostrophe somebody may have typed after it irrelevant.
+DROPPED_G = "g"
+
+SILENT_E = "e"
+Y = "y"
+I = "i"
+
+# Below this there is no consonant-vowel-consonant tail to double.
+SHORTEST_DOUBLE = 3
+ONE_SYLLABLE = 1
+
+
+def expand(stem: str) -> list[str]:
+    """
+    Every form of a stem worth listening for, the stem itself included.
+
+    The suffixes are the ones that turn a swear into another swear: a plural, a
+    past tense, a gerund, someone who does it, and something that is like it.
+    Comparatives and superlatives are left out — nobody is fined for being the
+    shittiest.
+    """
+    gerund = _suffixed(stem, GERUND)
+    agent = _suffixed(stem, AGENT)
+
+    forms = [
+        stem,
+        _plural(stem),
+        _suffixed(stem, PAST),
+        gerund,
+        gerund.removesuffix(DROPPED_G),
+        agent,
+        _plural(agent),
+    ]
+
+    # A stem that already ends in `y` is one: "bloody" needs no "bloodyy".
+    if not stem.endswith(Y):
+        forms.append(_suffixed(stem, ADJECTIVE))
+
+    return sorted(set(forms))
+
+
+def _suffixed(stem: str, suffix: str) -> str:
+    """
+    A stem and a vowel-initial suffix, joined the way the word is spelled.
+
+    Every suffix this is asked for begins with a vowel, which is what makes the
+    three adjustments below apply at all: none of them happen before a plural
+    `s`, and `_plural` handles that ending itself.
+    """
+    if len(stem) > 1 and stem.endswith(SILENT_E):
+        return stem[:-1] + suffix
+
+    if len(stem) > 1 and stem.endswith(Y) and not _vowel(stem[-2]):
+        # "bloodied" and "bloodier", but "bloodying": the `y` survives the one
+        # suffix that would otherwise put two `i`s together.
+        return stem + suffix if suffix.startswith(I) else stem[:-1] + I + suffix
+
+    if _doubles(stem):
+        return stem + stem[-1] + suffix
+
+    return stem + suffix
+
+
+def _plural(word: str) -> str:
+    if word.endswith(SIBILANT_ENDINGS):
+        return word + SIBILANT_PLURAL
+
+    if len(word) > 1 and word.endswith(Y) and not _vowel(word[-2]):
+        return word[:-1] + Y_PLURAL
+
+    return word + PLURAL
+
+
+def _doubles(stem: str) -> bool:
+    """
+    Whether a final consonant doubles before a vowel-initial suffix.
+
+    A short one-syllable stem doubles — that is the difference between
+    "shitting" and "shiting" — and a longer one does not, which is the
+    difference between "buggered" and "buggerred". English asks where the stress
+    falls rather than how many syllables there are; nothing here knows, and the
+    syllable count stands in for it, which is right for the single-syllable
+    words this is mostly pointed at.
+    """
+    if len(stem) < SHORTEST_DOUBLE or _syllables(stem) != ONE_SYLLABLE:
+        return False
+
+    last, vowel, before = stem[-1], stem[-2], stem[-3]
+
+    return (
+        not _vowel(last)
+        and last not in NEVER_DOUBLED
+        and _vowel(vowel)
+        and not _vowel(before)
+    )
+
+
+def _syllables(word: str) -> int:
+    """Runs of vowels, which is as close to a syllable as this needs to get."""
+    syllables = 0
+    inside = False
+
+    for letter in word:
+        if letter in SYLLABLE_VOWELS:
+            if not inside:
+                syllables += 1
+            inside = True
+        else:
+            inside = False
+
+    return syllables
+
+
+def _vowel(letter: str) -> bool:
+    return letter in VOWELS

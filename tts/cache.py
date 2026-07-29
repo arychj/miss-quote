@@ -15,14 +15,20 @@ The same directory also holds clips nobody synthesized — a chime a tool plays
 ahead of what it has to say — which `clip` serves by name. WAV only, and
 deliberately: playing audio without ffmpeg is the reason this path exists, and
 nothing in the image can decode anything else.
+
+Rendered speech is reaped at startup once it has gone unplayed for long enough;
+a clip somebody put there by hand never is. See `_reap`.
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
+import re
 import wave
 from collections.abc import AsyncIterator
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from audio.resampler import PlaybackResampler, to_mono
@@ -42,6 +48,14 @@ NOTHING = b""
 WAVE_READ = "rb"
 WAVE_WRITE = "wb"
 
+# What a rendered clip is named, and so what the reaper is allowed to delete.
+KEY_LENGTH = len(hashlib.sha256().hexdigest())
+KEY_PATTERN = re.compile(rf"[0-9a-f]{{{KEY_LENGTH}}}")
+
+# Below this the reaper does nothing, so a mis-set variable cannot empty the
+# cache and 0 is a no-op rather than "delete everything".
+MINIMUM_RETENTION_DAYS = 1
+
 
 class SpeechCache:
     """
@@ -51,13 +65,23 @@ class SpeechCache:
     words in the same voice are the same audio wherever they were asked for.
     """
 
-    def __init__(self, directory: Path | None = None, entries: int | None = None) -> None:
+    def __init__(
+        self,
+        directory: Path | None = None,
+        entries: int | None = None,
+        retention_days: int | None = None,
+    ) -> None:
         self._entries = tts_cfg.cache_entries if entries is None else entries
+        self._retention_days = (
+            tts_cfg.cache_retention_days if retention_days is None else retention_days
+        )
         self._memory: dict[str, bytes] = {}
         self._clips: dict[str, bytes] = {}
         self._directory = self._prepare(
             Path(tts_cfg.cache_directory if directory is None else directory)
         )
+
+        self._reap()
 
     async def stream(self, text: str) -> AsyncIterator[bytes]:
         """
@@ -73,11 +97,13 @@ class SpeechCache:
 
         remembered = self._memory.get(key)
         if remembered is not None:
+            await self._touch(key)
             yield remembered
             return
 
         stored = await self._read(key)
         if stored is not None:
+            await self._touch(key)
             playback = self._to_playback(*stored)
             self._remember(key, playback)
             yield playback
@@ -248,6 +274,75 @@ class SpeechCache:
 
     def _path(self, key: str) -> Path | None:
         return None if self._directory is None else self._directory / f"{key}{CACHE_SUFFIX}"
+
+    async def _touch(self, key: str) -> None:
+        """
+        Say that a stored clip is still in use.
+
+        The reaper ages clips by mtime, and a hit in memory never opens the
+        file, so without this the phrase the bot says most often is the one that
+        looks least used: written once, read once after the restart that
+        followed, and untouched for the ninety days after.
+
+        A clip with no file behind it — never written, or written to a directory
+        that turned out to be unusable — is not created here. `os.utime` is what
+        does that rather than `touch`, which would leave an empty WAV for a
+        later read to trip over.
+        """
+        path = self._path(key)
+        if path is None:
+            return
+
+        try:
+            await asyncio.to_thread(os.utime, path, None)
+        except OSError as exc:
+            logger.debug("Could not touch %s: %s", path, exc)
+
+    def _reap(self) -> list[Path]:
+        """
+        Delete rendered speech nothing has played in a long while.
+
+        The cache is a directory that only grows: a display name goes into the
+        key, so every person who has ever been announced leaves a file behind
+        and none of them are ever asked for again once they leave the server.
+
+        Only rendered speech is reaped, and it is identified by name — a clip
+        this cache wrote is a hex digest, which nothing an operator would type
+        looks like. A chime is safe because it is called `chime.wav`, and safe
+        again because the scan does not descend into subdirectories.
+
+        Age is the mtime, where a transcript is aged by its filename: what
+        matters here is when a clip was last wanted rather than when it was
+        first rendered, and `_touch` keeps that current.
+        """
+        if self._directory is None or self._retention_days < MINIMUM_RETENTION_DAYS:
+            return []
+
+        cutoff = datetime.now() - timedelta(days=self._retention_days)
+        reaped: list[Path] = []
+
+        for path in self._directory.glob(f"*{CACHE_SUFFIX}"):
+            if not KEY_PATTERN.fullmatch(path.stem):
+                continue
+
+            try:
+                if datetime.fromtimestamp(path.stat().st_mtime) >= cutoff:
+                    continue
+                path.unlink()
+            except OSError as exc:
+                logger.error("Could not reap %s: %s", path, exc)
+                continue
+
+            reaped.append(path)
+
+        if reaped:
+            logger.info(
+                "Reaped %d cached clips nothing has played in %d days.",
+                len(reaped),
+                self._retention_days,
+            )
+
+        return reaped
 
     async def _read(self, key: str) -> tuple[int, bytes] | None:
         path = self._path(key)
