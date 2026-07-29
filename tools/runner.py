@@ -13,7 +13,7 @@ import asyncio
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 
 from config import ServerConfig, file_cfg
-from tools.base import FinishedHandler, Tool, UtteranceHandler
+from tools.base import FinishedHandler, SilentSpeaker, Speaker, Tool, UtteranceHandler
 from tools.registry import TOOLS
 from transcript.writer import Transcript, TranscriptSession, Utterance
 from utils.logging import get_logger
@@ -31,10 +31,12 @@ class ToolRunner:
         self,
         servers: Mapping[int, ServerConfig] | None = None,
         registry: Mapping[str, type[Tool]] | None = None,
+        speaker: Speaker | None = None,
     ) -> None:
         servers = file_cfg.servers if servers is None else servers
         registry = TOOLS if registry is None else registry
 
+        self._speaker = SilentSpeaker() if speaker is None else speaker
         self._on_utterance: dict[int, list[Tool]] = {}
         self._on_finished: dict[int, list[Tool]] = {}
         self._enabled: dict[str, list[str]] = {}
@@ -63,7 +65,11 @@ class ToolRunner:
                 continue
 
             try:
-                tool = tool_class(server=server.alias, config=settings.config)
+                tool = tool_class(
+                    server=server.alias,
+                    config=settings.config,
+                    speaker=self._speaker,
+                )
             except Exception as exc:
                 self.problems.append(
                     f"Server '{server.alias}': tool '{name}' would not start: {exc}"

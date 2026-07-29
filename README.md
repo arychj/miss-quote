@@ -45,7 +45,13 @@ graph TD
     J --> K["TRANSCRIPT_DIR/guild/channel/YYYY-MM-DDTHH-MM-SS.jsonl"]
     J -->|"handle_utterance"| L["Tools for this server"]
     K -.->|"handle_finished, on disconnect"| L
+
+    L -.->|"speaker.play"| M["Speech cache<br/><i>memory, then TTS_CACHE_DIR</i>"]
+    M -.->|"on a miss"| N["Wyoming TTS<br/><i>TTS_HOST:TTS_PORT</i>"]
+    M -.->|"48 kHz stereo PCM, streamed"| A
 ```
+
+The dotted half is optional and only exists for tools that answer out loud; a deployment with none never opens a TTS connection.
 
 Everything runs on one event loop in one process. The split that matters is between the two halves of the pipeline: **audio handling is local and serial, transcription is remote and parallel.**
 
@@ -121,10 +127,10 @@ servers:
     users:
       234567890123456789: Speaker One
     tools:
-      example-tool:
+      verbal-morality:
         enabled: true
         config:
-          some-setting: a value
+          words: [fiddlesticks, poppycock]
 
   876543210987654321:
     alias: second-server
@@ -161,6 +167,8 @@ class Example(Tool):
         """Called once the session is sealed."""
 ```
 
+A tool is also handed a `speaker`, which is how it answers out loud — see **Speech** below.
+
 Neither method exists on the base class, so their absence is meaningful: the runner inspects each instance once at startup and files it under the moments it handles. A tool that defines neither is reported as configured-but-inert rather than silently doing nothing.
 
 - **`handle_utterance`** is dispatched after the line is on disk, so a tool that reads the file sees the same thing it was handed. It is not called for an empty transcription.
@@ -171,6 +179,52 @@ Both are coroutines running on the bot's event loop; anything blocking is the to
 Failures are contained. A tool that raises is logged and otherwise invisible: it cannot cost an utterance, delay a disconnect, or stop another tool from running. A tool that will not construct is reported at startup and skipped.
 
 A tool is only reachable from configuration once it is registered in `tools/registry.py`, which keeps the set of names a config file can switch on a closed list rather than whatever happens to be importable. A name nothing answers to is reported at startup and skipped.
+
+### verbal-morality
+
+The Verbal Morality Bot, after *Demolition Man*. It listens for words the server has decided against and, on hearing one, announces the fine out loud in the channel it was said in. The credits are imaginary and no tally is kept — the point is being caught, not the accounting.
+
+```yaml
+verbal-morality:
+  enabled: true
+  config:
+    words: [fiddlesticks, poppycock]
+    announcement: "{user}, you are fined one credit for a violation of the verbal morality statute."
+```
+
+| Setting | Required | Purpose |
+|---|---|---|
+| `words` | yes | What the server objects to. A lone word may be written unquoted rather than as a list |
+| `announcement` | no | What gets said. `{user}` is the only placeholder |
+
+`announcement` defaults to the line above, which the tool carries, so a server that wants the default can leave it out. A template with a placeholder nothing fills is rejected at startup rather than at the moment someone swears.
+
+The name is the one the transcript uses — the roster name from `users` where a server has set one, the Discord display name otherwise — so nothing has to be configured twice.
+
+Matching is **whole words, case-insensitive**. A substring match fines the innocent, and the canonical example, Scunthorpe, is a place people live. An utterance containing three violations earns one announcement: a speaker who strings them together earns three credits in spirit, but three announcements over the top of each other is a denial of service on the channel. Two people swearing at once are fined one after the other.
+
+A server electing in with no `words` is enabled and listening for nothing, which is reported at startup rather than left to be discovered by swearing at it.
+
+## Speech
+
+Tools answer out loud through a `Speaker`, which the bot implements against the voice channel an utterance came from. Nothing in `tools/` imports discord: a speaker is somewhere to play audio, and it happens to be a voice channel.
+
+Synthesis is a second Wyoming server (`TTS_HOST`, `TTS_PORT`) — recognition and synthesis are both Wyoming, but they are two servers and only one of them wants a GPU. The voice is process-wide: a bot that answers in two voices is a bot nobody can tell is one bot.
+
+**Audio streams.** The client yields chunks as the synthesizer produces them, and playback starts on the first one rather than waiting for the last. Discord's player is a thread that asks for exactly one 20 ms frame at a time and treats anything short of one as the end of the clip, so `bot/speaker.py` buffers between the two: filled from the event loop, drained a frame at a time, with the tail padded to a whole frame so the last few milliseconds of a word survive. A synthesizer that stalls mid-clip costs the rest of that clip after `TTS_STALL_SECONDS`, not a thread and a voice connection.
+
+**No ffmpeg.** It is the usual way to play audio through discord.py, but only because it is the usual way to decode a file first. Synthesized speech is already raw PCM, so `soxr` converts it to the 48 kHz stereo Discord wants and the Opus encoder already present for receiving handles the rest.
+
+**Clips are cached**, so a phrase is only ever synthesized once, in two layers holding the form that suits each:
+
+| Layer | Holds | Why |
+|---|---|---|
+| Memory | Playback-ready 48 kHz stereo PCM | A hit costs a dictionary lookup |
+| Disk (`TTS_CACHE_DIR`) | The synthesizer's own mono WAV | A quarter the size, and playable, so you can hear what the bot actually said |
+
+The first hit after a restart pays one resample and nothing else. Mount a volume at `TTS_CACHE_DIR` to keep clips across restarts; an unwritable or absent directory costs the persistence, not the feature. Writes go through a temporary file and a rename, because a process killed mid-write would otherwise cache a truncated clip forever, and a clip is only stored once the synthesizer says it is whole — a failure partway through plays what arrived and stores nothing.
+
+The memory layer is bounded (`TTS_CACHE_ENTRIES`) because what gets synthesized can include a Discord display name, and those are not a closed set.
 
 ## Environment
 
@@ -192,6 +246,20 @@ Every setting is read from the environment; `.env` is loaded if present. Nothing
 | `WYOMING_PORT` | `10300` | Wyoming's conventional port |
 | `STT_LANGUAGE` | `en` | Sent as `Transcribe.language` |
 | `MAX_CONCURRENT_TRANSCRIPTIONS` | `4` | Ceiling on in-flight utterances, so a busy channel cannot open unbounded connections against a shared ASR |
+
+### TTS
+
+Only used by tools that answer out loud. A deployment with no such tool enabled never opens a connection.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TTS_HOST` | `localhost` | Hostname or service name of the Wyoming TTS server |
+| `TTS_PORT` | `10200` | Wyoming's conventional TTS port |
+| `TTS_VOICE` | — | Voice to ask for. Empty takes whatever the synthesizer considers its default, so a server with one voice loaded needs no setting |
+| `TTS_TIMEOUT_SECONDS` | `30.0` | Budget for a **single** wait on the synthesizer, not for a whole clip — a long phrase arriving steadily is not cut off for taking a long time |
+| `TTS_STALL_SECONDS` | `10.0` | How long the player waits mid-clip for audio that never comes before ending it |
+| `TTS_CACHE_DIR` | `/cache/tts` | Rendered speech. Mount a volume here to keep it across restarts |
+| `TTS_CACHE_ENTRIES` | `256` | Clips held in memory before the oldest is retired |
 
 ### Transcripts
 
@@ -242,7 +310,7 @@ Removed outright: the multiprocessing layer and its queues, the STT health-check
 
 Kept intact because they are the non-obvious part: `stt/user_state.py`'s per-user VAD state machine with stale-speech flushing, and `audio/ring_buffer.py`'s pre-roll buffer, which is what stops the first syllable being clipped.
 
-Added: `AUTOJOIN`, `RETENTION_DAYS`, `TRANSCRIPT_DIR`, `TZ`, `SESSION_RESUME_SECONDS`, `WYOMING_HOST`, `WYOMING_PORT`, `MAX_CONCURRENT_TRANSCRIPTIONS`.
+Added: `AUTOJOIN`, `RETENTION_DAYS`, `TRANSCRIPT_DIR`, `TZ`, `SESSION_RESUME_SECONDS`, `WYOMING_HOST`, `WYOMING_PORT`, `MAX_CONCURRENT_TRANSCRIPTIONS`, and every `TTS_*`.
 
 > **Note on the vendored VAD model.** Silero v5's ONNX graph scores the current frame *together with* the trailing 64 samples of the previous one. Fed a bare 512-sample frame it does not error — it silently returns near-zero probability on unmistakable speech, and the bot transcribes nothing. `stt/vad.py` carries that context between calls, and `tests/test_vad.py` guards it with real speech; silence-based tests pass either way and will not catch a regression.
 
@@ -256,9 +324,10 @@ miss-quote/
 ├── config.py                  # Grouped configuration (dataclasses)
 ├── bot/
 │   ├── client.py              # Bot setup, voice lifecycle, auto-join policy
-│   └── audio_sink.py          # AudioSink + resampling bridge
+│   ├── audio_sink.py          # AudioSink + resampling bridge
+│   └── speaker.py             # Playback into a voice channel, fed while it plays
 ├── audio/
-│   ├── resampler.py           # soxr 48 kHz stereo to 16 kHz mono
+│   ├── resampler.py           # soxr, both directions
 │   └── ring_buffer.py         # Pre-speech context buffer
 ├── stt/
 │   ├── vad.py                 # Silero VAD via onnxruntime
@@ -268,11 +337,15 @@ miss-quote/
 │   └── models/
 │       └── silero_vad.onnx    # Vendored (~2 MB)
 ├── tools/
-│   ├── base.py                # What a tool is: the two optional handlers
+│   ├── base.py                # What a tool is: the two optional handlers, and a speaker
 │   ├── registry.py            # Tool names a config file can switch on
-│   └── runner.py              # Per-server instances, dispatch, failure isolation
+│   ├── runner.py              # Per-server instances, dispatch, failure isolation
+│   └── verbal_morality.py     # Fines a speaker, out loud, for saying the wrong thing
 ├── transcript/
 │   └── writer.py              # Per-session JSONL appender + retention
+├── tts/
+│   ├── client.py              # Streaming Wyoming synthesis
+│   └── cache.py               # Render a phrase once, keep it in memory and on disk
 └── utils/
     └── logging.py
 ```

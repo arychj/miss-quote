@@ -14,14 +14,48 @@ neither is configured but inert, which the runner reports.
 Both are coroutines. Anything blocking — a model call, a large read, a database
 round trip — is the tool's own business to push onto a thread; the handlers run
 on the bot's event loop, and one that blocks stops audio being received.
+
+A tool is also handed a `Speaker`, which is how it answers out loud. Nothing in
+this package imports discord: a speaker is somewhere to play audio, and the bot
+supplies one that happens to be a voice channel.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from typing import Any, Protocol, runtime_checkable
 
-from transcript.writer import Transcript, TranscriptSession, Utterance
+from transcript.writer import Source, Transcript, TranscriptSession, Utterance
+from utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+@runtime_checkable
+class Speaker(Protocol):
+    """Somewhere a tool can play audio."""
+
+    async def play(self, source: Source, audio: AsyncIterator[bytes]) -> None:
+        """
+        Play one clip of 48 kHz stereo PCM back where it came from.
+
+        Returns once the clip has finished, so a tool that plays two in a row
+        gets them in that order rather than on top of each other.
+        """
+        ...
+
+
+class SilentSpeaker:
+    """
+    A speaker with nowhere to play.
+
+    The runner's default, so a tool always has one and never has to check. The
+    audio is left unconsumed rather than drained: on a cache miss, draining it
+    would pay a synthesizer to render something nobody can hear.
+    """
+
+    async def play(self, source: Source, audio: AsyncIterator[bytes]) -> None:
+        logger.debug("Nothing to play through for %s; dropping a clip.", source.channel)
 
 
 class Tool:
@@ -36,9 +70,10 @@ class Tool:
 
     name: str = ""
 
-    def __init__(self, server: str, config: Mapping[str, Any]) -> None:
+    def __init__(self, server: str, config: Mapping[str, Any], speaker: Speaker) -> None:
         self.server = server
         self.config = config
+        self.speaker = speaker
 
     def __repr__(self) -> str:
         return f"<{type(self).__name__} {self.name!r} for {self.server!r}>"

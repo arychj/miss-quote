@@ -30,8 +30,8 @@ class Recorder(Tool):
 
     name = TOOL_NAME
 
-    def __init__(self, server, config):
-        super().__init__(server, config)
+    def __init__(self, server, config, speaker):
+        super().__init__(server, config, speaker)
         self.utterances = []
         self.transcripts = []
 
@@ -45,8 +45,8 @@ class Recorder(Tool):
 class UtteranceOnly(Tool):
     name = "utterance-only"
 
-    def __init__(self, server, config):
-        super().__init__(server, config)
+    def __init__(self, server, config, speaker):
+        super().__init__(server, config, speaker)
         self.calls = 0
 
     async def handle_utterance(self, utterance, session) -> None:
@@ -56,8 +56,8 @@ class UtteranceOnly(Tool):
 class FinishedOnly(Tool):
     name = "finished-only"
 
-    def __init__(self, server, config):
-        super().__init__(server, config)
+    def __init__(self, server, config, speaker):
+        super().__init__(server, config, speaker)
         self.calls = 0
 
     async def handle_finished(self, transcript) -> None:
@@ -83,7 +83,7 @@ class Exploding(Tool):
 class Unbuildable(Tool):
     name = "unbuildable"
 
-    def __init__(self, server, config):
+    def __init__(self, server, config, speaker):
         raise ValueError("missing something it needed")
 
 
