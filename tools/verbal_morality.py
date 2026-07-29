@@ -5,6 +5,10 @@ Listens for words the server has decided against and, on hearing one, announces
 the fine out loud in the channel it was said in. The credits are imaginary and
 no tally is kept: the point is being caught, not the accounting.
 
+What the server writes down are stems. Each is expanded at startup into the
+endings it is said with, so a list stays a list of words rather than a list of
+conjugations; `utils.stems` does the growing.
+
 The name in the announcement is the one the transcript uses, which is the roster
 name from `users` where a server has set one and the Discord display name
 otherwise. Nothing has to be configured twice.
@@ -20,6 +24,7 @@ from tools.base import Speaker, Tool
 from transcript.writer import TranscriptSession, Utterance
 from tts.cache import shared_cache
 from utils.logging import get_logger
+from utils.stems import expand
 
 logger = get_logger(__name__)
 
@@ -30,11 +35,14 @@ CHIME_KEY = "chime"
 # The default lives here rather than in the config file so a server electing
 # into the tool only has to say which words it objects to.
 DEFAULT_ANNOUNCEMENT = (
-    "{user}, you are fined {credits} for a violation of the verbal morality statute."
+    "{user}, you are fined {credits} for {violations} of the verbal morality statute."
 )
 
 USER_FIELD = "user"
 CREDITS_FIELD = "credits"
+VIOLATIONS_FIELD = "violations"
+
+FIELD_SEPARATOR = ", "
 
 # Matching on whole words only. A substring match fines the innocent, and the
 # canonical example — Scunthorpe — is a place people live.
@@ -45,12 +53,17 @@ SINGLE_CREDIT = 1
 CREDIT_NOUN = "credit"
 CREDITS_NOUN = "credits"
 
+SINGLE_OFFENCE = 1
+SINGLE_VIOLATION = "a violation"
+MULTIPLE_VIOLATIONS = "multiple violations"
+
 OFFENCE_SEPARATOR = ", "
 
 # Stand in for a speaker and their fine while the announcement is checked at
 # startup.
 PROBE_NAME = "someone"
 PROBE_CREDITS = f"{SINGLE_CREDIT} {CREDIT_NOUN}"
+PROBE_VIOLATIONS = SINGLE_VIOLATION
 
 
 class VerbalMorality(Tool):
@@ -61,10 +74,18 @@ class VerbalMorality(Tool):
     def __init__(self, server: str, config: Mapping[str, Any], speaker: Speaker) -> None:
         super().__init__(server, config, speaker)
 
-        self._forbidden = _pattern(config.get(WORDS_KEY))
+        self._vocabulary = _vocabulary(config.get(WORDS_KEY))
+        self._forbidden = _pattern(self._vocabulary)
         self._announcement = _checked(config.get(ANNOUNCEMENT_KEY) or DEFAULT_ANNOUNCEMENT)
         self._speech = shared_cache()
         self._chime = self._located(config.get(CHIME_KEY))
+
+        logger.debug(
+            "[%s] Listening for %d words: %s",
+            self.server,
+            len(self._vocabulary),
+            OFFENCE_SEPARATOR.join(self._vocabulary),
+        )
 
     def _located(self, chime: Any) -> str | None:
         """
@@ -118,7 +139,11 @@ class VerbalMorality(Tool):
         )
 
         announcement = self._announcement.format(
-            **{USER_FIELD: utterance.user, CREDITS_FIELD: fine}
+            **{
+                USER_FIELD: utterance.user,
+                CREDITS_FIELD: fine,
+                VIOLATIONS_FIELD: _violations(len(offences)),
+            }
         )
         await self.speaker.play(session.source, self._announce(announcement))
 
@@ -139,13 +164,18 @@ class VerbalMorality(Tool):
             yield chunk
 
 
-def _pattern(words: Any) -> re.Pattern[str]:
+def _vocabulary(words: Any) -> tuple[str, ...]:
     """
-    One expression matching any forbidden word.
+    Every form of every word a server objects to.
 
-    Compiled once here rather than per utterance, and raised on rather than
-    tolerated when empty: a tool listening for nothing is configured, enabled,
-    and useless, which is worth a line at startup instead of silence forever.
+    What the config file lists are stems, not the whole conjugation: a server
+    that objects to a word objects to it in the past tense as well, and a list
+    that has to spell out every ending is one somebody will get around a week
+    after writing it.
+
+    Raised on rather than tolerated when empty: a tool listening for nothing is
+    configured, enabled, and useless, which is worth a line at startup instead
+    of silence forever.
     """
     if isinstance(words, str):
         words = [words]
@@ -153,11 +183,24 @@ def _pattern(words: Any) -> re.Pattern[str]:
     if not isinstance(words, Sequence):
         raise ValueError(f"'{WORDS_KEY}' must be a list of words to listen for.")
 
-    unique = sorted({str(word).strip().casefold() for word in words if str(word).strip()})
-    if not unique:
+    stems = {str(word).strip().casefold() for word in words if str(word).strip()}
+    if not stems:
         raise ValueError(f"'{WORDS_KEY}' is empty, so there is nothing to listen for.")
 
-    alternatives = ALTERNATION.join(re.escape(word) for word in unique)
+    return tuple(sorted({form for stem in stems for form in expand(stem)}))
+
+
+def _pattern(vocabulary: Sequence[str]) -> re.Pattern[str]:
+    """
+    One expression matching any forbidden word.
+
+    Compiled once at startup rather than per utterance. The order of the
+    alternatives does not matter despite the leftmost-first match: the trailing
+    boundary rejects a short form that has landed inside a longer one, so
+    "fucking" is not matched as "fuck" with a tail left over.
+    """
+    alternatives = ALTERNATION.join(re.escape(word) for word in vocabulary)
+
     return re.compile(
         f"{WORD_BOUNDARY}(?:{alternatives}){WORD_BOUNDARY}", re.IGNORECASE
     )
@@ -176,6 +219,16 @@ def _fine(offences: int) -> str:
     return f"{offences} {noun}"
 
 
+def _violations(offences: int) -> str:
+    """
+    What the announcement calls the offence, in the plural where it earned one.
+
+    A phrase rather than a count: the number is already in the fine, and saying
+    it twice makes the announcement sound like an invoice.
+    """
+    return SINGLE_VIOLATION if offences == SINGLE_OFFENCE else MULTIPLE_VIOLATIONS
+
+
 def _checked(announcement: str) -> str:
     """
     An announcement template that will interpolate.
@@ -187,11 +240,20 @@ def _checked(announcement: str) -> str:
     announcement = str(announcement)
 
     try:
-        announcement.format(**{USER_FIELD: PROBE_NAME, CREDITS_FIELD: PROBE_CREDITS})
+        announcement.format(
+            **{
+                USER_FIELD: PROBE_NAME,
+                CREDITS_FIELD: PROBE_CREDITS,
+                VIOLATIONS_FIELD: PROBE_VIOLATIONS,
+            }
+        )
     except (IndexError, KeyError, ValueError) as exc:
+        available = FIELD_SEPARATOR.join(
+            f"'{{{field}}}'" for field in (USER_FIELD, CREDITS_FIELD, VIOLATIONS_FIELD)
+        )
         raise ValueError(
             f"'{ANNOUNCEMENT_KEY}' has a placeholder nothing fills: {exc}. "
-            f"Only '{{{USER_FIELD}}}' and '{{{CREDITS_FIELD}}}' are available."
+            f"Only {available} are available."
         ) from exc
 
     return announcement

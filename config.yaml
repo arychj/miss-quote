@@ -44,8 +44,12 @@ servers:
       verbal-morality:
         enabled: false
         config:
+          # Stems, not whole words: each is expanded at startup into the
+          # endings it is said with, so `fiddlestick` also catches
+          # `fiddlesticked`, `fiddlesticking`, and `fiddlesticker`. List the
+          # root and leave the conjugating to the tool.
           words:
-            - fiddlesticks
+            - fiddlestick
             - poppycock
 
           # Optional. The tool carries the line from the film, so a server that
@@ -54,8 +58,9 @@ servers:
           # `{user}` is the speaker's name from `users` where one is set.
           # `{credits}` is the fine, already pluralized: one credit per
           # forbidden word in the utterance, so "1 credit" or "3 credits".
+          # `{violations}` is "a violation" or "multiple violations", to match.
           #
-          # announcement: "{user}, you are fined {credits} for a violation of the verbal morality statute."
+          # announcement: "{user}, you are fined {credits} for {violations} of the verbal morality statute."
 
           # Optional. A 16-bit WAV played ahead of the announcement, named
           # relative to TTS_CACHE_DIR — put the file in the same volume the

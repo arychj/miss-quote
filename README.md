@@ -188,24 +188,28 @@ The Verbal Morality Bot, after *Demolition Man*. It listens for words the server
 verbal-morality:
   enabled: true
   config:
-    words: [fiddlesticks, poppycock]
-    announcement: "{user}, you are fined {credits} for a violation of the verbal morality statute."
+    words: [fiddlestick, poppycock]
+    announcement: "{user}, you are fined {credits} for {violations} of the verbal morality statute."
     chime: chime.wav
 ```
 
 | Setting | Required | Purpose |
 |---|---|---|
-| `words` | yes | What the server objects to. A lone word may be written unquoted rather than as a list |
-| `announcement` | no | What gets said. `{user}` and `{credits}` are the placeholders |
+| `words` | yes | Stems of what the server objects to. A lone one may be written unquoted rather than as a list |
+| `announcement` | no | What gets said. `{user}`, `{credits}`, and `{violations}` are the placeholders |
 | `chime` | no | A WAV in the speech cache directory, played ahead of the announcement |
 
 `announcement` defaults to the line above, which the tool carries, so a server that wants the default can leave it out. A template with a placeholder nothing fills is rejected at startup rather than at the moment someone swears.
 
 The name is the one the transcript uses — the roster name from `users` where a server has set one, the Discord display name otherwise — so nothing has to be configured twice.
 
+**`words` are stems.** Each is expanded once at startup into the endings it is said with — a plural, a past tense, a gerund with and without its `g`, someone who does it, and something that is like it — so `fiddlestick` also catches `fiddlesticks`, `fiddlesticked`, `fiddlesticking`, `fiddlestickin`, `fiddlesticker`, `fiddlestickers`, and `fiddlesticky`. A list that has to spell out every ending is a list somebody gets around a week after writing it.
+
+Expansion is English spelling rather than a dictionary: a final consonant doubles after a short vowel (`shit` grows a `shitter`, not a `shiter`), a silent `e` drops before a vowel, a `y` after a consonant becomes an `i`, and a sibilant takes `es`. Nothing checks whether the result is a word anybody says, and it does not need to — a form nobody utters costs a few bytes in an alternation, while a missing one costs the tool the thing it exists to catch. Note that expansion can reach a word that is innocent on its own; a stem whose endings collide with ordinary speech is worth checking before it goes in the list.
+
 Matching is **whole words, case-insensitive**. A substring match fines the innocent, and the canonical example, Scunthorpe, is a place people live.
 
-**The fine scales with the utterance**: one credit per forbidden word in it, so three of them is `3 credits` and one is `1 credit`. The count is filled into `{credits}` already pluralized, as a numeral — every synthesizer worth pointing this at reads `3` as a number, and `1 credits` is wrong in a way a listener hears. What does not scale is the number of announcements: three violations earn one, because three announcements over the top of each other is a denial of service on the channel. Two people swearing at once are fined one after the other.
+**The fine scales with the utterance**: one credit per forbidden word in it, so three of them is `3 credits` and one is `1 credit`. The count is filled into `{credits}` already pluralized, as a numeral — every synthesizer worth pointing this at reads `3` as a number, and `1 credits` is wrong in a way a listener hears. `{violations}` agrees with it, reading `a violation` for one and `multiple violations` for more, so the sentence is not left saying "fined 3 credits for a violation". It is a phrase rather than a second count: the number is already in the fine, and saying it twice makes the announcement sound like an invoice. What does not scale is the number of announcements: three violations earn one, because three announcements over the top of each other is a denial of service on the channel. Two people swearing at once are fined one after the other.
 
 `chime` is resolved **inside** `TTS_CACHE_DIR` — a bare name, or a path below it; anything that climbs out is refused at startup. It must be a **16-bit WAV**, at any sample rate and in mono or stereo, both of which are converted on the way in. WAV rather than MP3 because playing audio without ffmpeg is the point of this path, and nothing in the image can decode anything else. The clip is read once, kept for the life of the process, and never evicted to make room for a phrase. A chime that is missing or will not parse is reported and costs the chime, not the announcement.
 
@@ -231,6 +235,10 @@ Synthesis is a second Wyoming server (`TTS_HOST`, `TTS_PORT`) — recognition an
 The first hit after a restart pays one resample and nothing else. Mount a volume at `TTS_CACHE_DIR` to keep clips across restarts; an unwritable or absent directory costs the persistence, not the feature. Writes go through a temporary file and a rename, because a process killed mid-write would otherwise cache a truncated clip forever, and a clip is only stored once the synthesizer says it is whole — a failure partway through plays what arrived and stores nothing.
 
 The memory layer is bounded (`TTS_CACHE_ENTRIES`) because what gets synthesized can include a Discord display name, and those are not a closed set.
+
+**The disk layer is reaped at startup** (`TTS_CACHE_RETENTION_DAYS`, 90 by default). The directory otherwise only grows: a display name goes into the key, so everyone who has ever been announced leaves a file behind, and none of them is ever asked for again once they leave the server. Age is the **mtime**, not the filename, and every hit touches the file — including one served out of memory, which never opens it — so what is still in use stays however old it is and only what nothing plays ages out. A reaped phrase costs one synthesis the next time it is said.
+
+Only rendered speech is reaped, identified by name: a clip the cache wrote is a SHA-256 digest, which nothing anybody would type by hand looks like, and the scan does not descend into subdirectories. A chime is safe on both counts. Any value below `1` disables the reaper entirely, so `0` is a no-op rather than "delete everything".
 
 The same directory also holds **clips nobody synthesized** — a chime a tool plays ahead of what it has to say. Drop a 16-bit WAV in and name it from the tool's config; it is read once, converted to playback PCM, and held apart from rendered speech so it is never evicted for a phrase somebody said once. Names are resolved against the directory rather than taken at their word: a setting cannot be pointed at an arbitrary file on the host.
 
@@ -268,6 +276,7 @@ Only used by tools that answer out loud. A deployment with no such tool enabled 
 | `TTS_STALL_SECONDS` | `10.0` | How long the player waits mid-clip for audio that never comes before ending it |
 | `TTS_CACHE_DIR` | `/cache/tts` | Rendered speech. Mount a volume here to keep it across restarts |
 | `TTS_CACHE_ENTRIES` | `256` | Clips held in memory before the oldest is retired |
+| `TTS_CACHE_RETENTION_DAYS` | `90` | Days a rendered clip survives on disk without being played, counted from the last time it was. Any value below `1` keeps them forever; clips left there by hand are never reaped |
 
 ### Transcripts
 
@@ -355,7 +364,8 @@ miss-quote/
 │   ├── client.py              # Streaming Wyoming synthesis
 │   └── cache.py               # Render a phrase once, keep it in memory and on disk
 └── utils/
-    └── logging.py
+    ├── logging.py
+    └── stems.py               # A stem and the endings it is said with
 ```
 
 The Silero model is vendored rather than installed, because the `silero-vad` package declares `torch` even in ONNX mode.
