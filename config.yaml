@@ -49,11 +49,19 @@ servers:
             - poppycock
 
           # Optional. The tool carries the line from the film, so a server that
-          # only wants the default can leave this out entirely. `{user}` is the
-          # only placeholder, and is filled with the speaker's name from `users`
-          # where one is set.
+          # only wants the default can leave this out entirely.
           #
-          # announcement: "{user}, you are fined one credit for a violation of the verbal morality statute."
+          # `{user}` is the speaker's name from `users` where one is set.
+          # `{credits}` is the fine, already pluralized: one credit per
+          # forbidden word in the utterance, so "1 credit" or "3 credits".
+          #
+          # announcement: "{user}, you are fined {credits} for a violation of the verbal morality statute."
+
+          # Optional. A 16-bit WAV played ahead of the announcement, named
+          # relative to TTS_CACHE_DIR — put the file in the same volume the
+          # rendered speech is kept in. Mono or stereo, any sample rate.
+          #
+          # chime: chime.wav
 
   876543210987654321:
     alias: second-server

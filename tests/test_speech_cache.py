@@ -267,3 +267,145 @@ async def test_nothing_happens_until_the_stream_is_drained(synthesizer, tmp_path
 
     assert b"".join([chunk async for chunk in queued]) != b""
     assert synthesizer.calls == [PHRASE]
+
+
+# ── clips kept by hand ────────────────────────────
+
+
+CLIP_NAME = "chime.wav"
+STEREO_CHANNELS = 2
+EIGHT_BIT_WIDTH = 1
+PLAYBACK_BYTES_PER_FRAME = audio_cfg.playback_channels * audio_cfg.sample_width
+
+
+def _write_clip(
+    path,
+    rate: int = SOURCE_RATE,
+    channels: int = 1,
+    width: int = audio_cfg.sample_width,
+) -> bytes:
+    """A WAV in the cache directory, as an operator would leave one."""
+    mono = _tone()
+    frames = (
+        np.repeat(np.frombuffer(mono, dtype=np.int16), channels).tobytes()
+        if channels > 1
+        else mono
+    )
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(channels)
+        handle.setsampwidth(width)
+        handle.setframerate(rate)
+        handle.writeframes(frames)
+
+    return mono
+
+
+async def test_a_clip_is_read_and_made_playable(tmp_path):
+    _write_clip(tmp_path / CLIP_NAME)
+    cache = SpeechCache(directory=tmp_path)
+
+    playback = await cache.clip(CLIP_NAME)
+
+    expected = SOURCE_SAMPLES * audio_cfg.playback_sample_rate // SOURCE_RATE
+    assert len(playback) // PLAYBACK_BYTES_PER_FRAME == pytest.approx(expected, abs=2)
+
+
+async def test_a_clip_is_read_off_disk_only_once(tmp_path):
+    path = tmp_path / CLIP_NAME
+    _write_clip(path)
+    cache = SpeechCache(directory=tmp_path)
+
+    first = await cache.clip(CLIP_NAME)
+    path.unlink()
+    second = await cache.clip(CLIP_NAME)
+
+    assert first == second
+
+
+async def test_a_clip_is_not_evicted_to_make_room_for_speech(synthesizer, tmp_path):
+    """A clip was put there deliberately; a phrase was said once."""
+    _write_clip(tmp_path / CLIP_NAME)
+    cache = SpeechCache(directory=tmp_path, entries=1)
+
+    held = await cache.clip(CLIP_NAME)
+    await _collect(cache, PHRASE)
+    await _collect(cache, OTHER_PHRASE)
+
+    assert await cache.clip(CLIP_NAME) == held
+
+
+async def test_a_stereo_clip_is_folded_down(tmp_path):
+    """Discord wants stereo, but the playback path widens mono to get there."""
+    _write_clip(tmp_path / CLIP_NAME)
+    mono = await SpeechCache(directory=tmp_path).clip(CLIP_NAME)
+
+    _write_clip(tmp_path / CLIP_NAME, channels=STEREO_CHANNELS)
+    stereo = await SpeechCache(directory=tmp_path).clip(CLIP_NAME)
+
+    assert _largest_difference(mono, stereo) <= FILTER_TOLERANCE
+
+
+async def test_a_clip_already_at_the_playback_rate_is_not_resampled(tmp_path):
+    source = _write_clip(tmp_path / CLIP_NAME, rate=audio_cfg.playback_sample_rate)
+
+    playback = await SpeechCache(directory=tmp_path).clip(CLIP_NAME)
+
+    assert len(playback) == len(source) * audio_cfg.playback_channels
+
+
+async def test_a_missing_clip_plays_nothing(tmp_path, caplog):
+    playback = await SpeechCache(directory=tmp_path).clip(CLIP_NAME)
+
+    assert playback == b""
+    assert "No clip" in caplog.text
+
+
+async def test_a_clip_that_is_not_a_wav_plays_nothing(tmp_path, caplog):
+    (tmp_path / CLIP_NAME).write_bytes(b"ID3\x04\x00not actually a wav")
+
+    playback = await SpeechCache(directory=tmp_path).clip(CLIP_NAME)
+
+    assert playback == b""
+    assert "unplayable" in caplog.text
+
+
+async def test_a_clip_that_is_not_16_bit_plays_nothing(tmp_path, caplog):
+    _write_clip(tmp_path / CLIP_NAME, width=EIGHT_BIT_WIDTH)
+
+    playback = await SpeechCache(directory=tmp_path).clip(CLIP_NAME)
+
+    assert playback == b""
+    assert "8-bit" in caplog.text
+
+
+async def test_a_clip_may_live_in_a_subdirectory(tmp_path):
+    _write_clip(tmp_path / "chimes" / CLIP_NAME)
+
+    playback = await SpeechCache(directory=tmp_path).clip(f"chimes/{CLIP_NAME}")
+
+    assert playback != b""
+
+
+async def test_a_clip_above_the_cache_directory_is_refused(tmp_path, caplog):
+    """A name from configuration is not a licence to read the host."""
+    elsewhere = tmp_path / "elsewhere"
+    _write_clip(elsewhere / CLIP_NAME)
+    cache = SpeechCache(directory=tmp_path / "cache")
+
+    playback = await cache.clip(f"../elsewhere/{CLIP_NAME}")
+
+    assert playback == b""
+    assert "resolves outside" in caplog.text
+
+
+async def test_an_absolute_clip_path_is_refused(tmp_path, caplog):
+    elsewhere = tmp_path / "elsewhere"
+    _write_clip(elsewhere / CLIP_NAME)
+    cache = SpeechCache(directory=tmp_path / "cache")
+
+    playback = await cache.clip(str(elsewhere / CLIP_NAME))
+
+    assert playback == b""
+    assert "resolves outside" in caplog.text

@@ -1,6 +1,7 @@
 """What the Verbal Morality Bot hears, and what it says about it."""
 
 from datetime import datetime
+from pathlib import Path
 
 import pytest
 
@@ -9,6 +10,9 @@ from transcript.writer import Source, Utterance
 
 SERVER_ALIAS = "first-server"
 SPEAKER = "Speaker One"
+
+CHIME_NAME = "chime.wav"
+CHIME_AUDIO = "♪"
 
 SOURCE = Source(
     guild_id=1, guild_alias=SERVER_ALIAS, channel_id=2, channel="general-voice"
@@ -31,14 +35,30 @@ class RecordingSpeaker:
 
 
 class FakeSpeech:
-    """Stands in for the cache, handing back the text it was asked to render."""
+    """
+    Stands in for the cache, handing back the text it was asked to render.
 
-    def __init__(self) -> None:
+    Clips are strings here too, so what a speaker collects is one readable
+    string rather than a mixture nothing can join.
+    """
+
+    def __init__(self, directory: Path) -> None:
+        self.directory = directory
         self.asked: list[str] = []
+        self.clips_asked: list[str] = []
 
     async def stream(self, text: str):
         self.asked.append(text)
         yield text
+
+    def clip_path(self, name: str) -> Path:
+        return self.directory / name
+
+    async def clip(self, name: str) -> str:
+        self.clips_asked.append(name)
+        path = self.clip_path(name)
+
+        return path.read_text(encoding="utf-8") if path.is_file() else ""
 
 
 class FakeSession:
@@ -47,11 +67,18 @@ class FakeSession:
 
 
 @pytest.fixture
-def speech(monkeypatch):
+def speech(monkeypatch, tmp_path):
     """Replace the process-wide cache so nothing reaches a synthesizer."""
-    fake = FakeSpeech()
+    fake = FakeSpeech(tmp_path)
     monkeypatch.setattr("tools.verbal_morality.shared_cache", lambda: fake)
     return fake
+
+
+@pytest.fixture
+def chime(speech) -> str:
+    """A clip sitting in the cache directory, as an operator would leave one."""
+    (speech.directory / CHIME_NAME).write_text(CHIME_AUDIO, encoding="utf-8")
+    return CHIME_NAME
 
 
 @pytest.fixture
@@ -101,7 +128,7 @@ def test_a_single_word_need_not_be_a_list(speech, speaker):
 
 def test_an_announcement_with_an_unfillable_placeholder_will_not_start(speech, speaker):
     with pytest.raises(ValueError, match="placeholder"):
-        _tool(speaker, {"words": WORDS, "announcement": "{user} owes {credits}"})
+        _tool(speaker, {"words": WORDS, "announcement": "{user} owes {tally}"})
 
 
 def test_the_announcement_is_optional(speech, speaker):
@@ -160,6 +187,36 @@ async def test_several_violations_in_one_utterance_earn_one_announcement(speech,
     assert len(speaker.played) == 1
 
 
+# ── the fine ──────────────────────────────────────
+
+
+async def test_one_word_costs_one_credit(speech, speaker):
+    await _hear(_tool(speaker), f"oh {FORBIDDEN}")
+
+    assert "fined 1 credit for" in speech.asked[0]
+
+
+async def test_each_further_word_costs_another_credit(speech, speaker):
+    await _hear(_tool(speaker), f"{FORBIDDEN} and {ALSO_FORBIDDEN} and {FORBIDDEN}")
+
+    assert "fined 3 credits for" in speech.asked[0]
+
+
+async def test_the_same_word_twice_costs_twice(speech, speaker):
+    """Each utterance of a forbidden word is its own violation."""
+    await _hear(_tool(speaker), f"{FORBIDDEN}, {FORBIDDEN}")
+
+    assert "fined 2 credits for" in speech.asked[0]
+
+
+async def test_the_credits_are_available_to_a_custom_announcement(speech, speaker):
+    tool = _tool(speaker, {"words": WORDS, "announcement": "{user} owes {credits}"})
+
+    await _hear(tool, f"{FORBIDDEN} {ALSO_FORBIDDEN}")
+
+    assert speech.asked == [f"{SPEAKER} owes 2 credits"]
+
+
 # ── the announcement ──────────────────────────────
 
 
@@ -167,7 +224,7 @@ async def test_the_speaker_is_named_in_the_fine(speech, speaker):
     await _hear(_tool(speaker), FORBIDDEN)
 
     assert speech.asked == [
-        f"{SPEAKER}, you are fined one credit for a violation of "
+        f"{SPEAKER}, you are fined 1 credit for a violation of "
         "the verbal morality statute."
     ]
 
@@ -201,3 +258,49 @@ async def test_two_speakers_get_their_own_announcements(speech, speaker):
     await _hear(tool, FORBIDDEN, user="Second")
 
     assert [text.split(",")[0] for text in speech.asked] == ["First", "Second"]
+
+
+# ── the chime ─────────────────────────────────────
+
+
+async def test_no_chime_is_played_when_none_is_configured(speech, speaker):
+    await _hear(_tool(speaker), FORBIDDEN)
+
+    _, spoken = speaker.played[0]
+    assert speech.clips_asked == []
+    assert spoken.startswith(SPEAKER)
+
+
+async def test_a_configured_chime_leads_the_announcement(speech, speaker, chime):
+    tool = _tool(speaker, {"words": WORDS, "chime": chime})
+
+    await _hear(tool, FORBIDDEN)
+
+    _, spoken = speaker.played[0]
+    assert spoken == CHIME_AUDIO + speech.asked[0]
+
+
+async def test_the_chime_and_the_words_are_one_clip(speech, speaker, chime):
+    """Two calls to the speaker would put an audible gap between them."""
+    tool = _tool(speaker, {"words": WORDS, "chime": chime})
+
+    await _hear(tool, FORBIDDEN)
+
+    assert len(speaker.played) == 1
+
+
+async def test_a_missing_chime_still_announces_the_fine(speech, speaker):
+    tool = _tool(speaker, {"words": WORDS, "chime": "not-there.wav"})
+
+    await _hear(tool, FORBIDDEN)
+
+    _, spoken = speaker.played[0]
+    assert spoken == speech.asked[0]
+
+
+async def test_an_empty_chime_is_the_same_as_none(speech, speaker):
+    tool = _tool(speaker, {"words": WORDS, "chime": "  "})
+
+    await _hear(tool, FORBIDDEN)
+
+    assert speech.clips_asked == []
