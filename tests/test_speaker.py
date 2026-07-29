@@ -3,6 +3,7 @@
 import asyncio
 import threading
 
+import numpy as np
 import pytest
 
 from bot.speaker import PCMStream, DiscordSpeaker
@@ -21,6 +22,8 @@ FRAME_BYTES = audio_cfg.playback_frame_bytes
 LOUD = b"\x11" * FRAME_BYTES
 STALL_SECONDS = 0.2
 PATIENCE_SECONDS = 2.0
+HALF_VOLUME = 0.5
+SAMPLE_DTYPE = np.int16
 
 
 class FakeVoiceClient:
@@ -116,6 +119,17 @@ def test_a_stalled_synthesizer_ends_the_clip(caplog):
         assert stream.read() == b""
 
     assert any("ending the clip" in record.message for record in caplog.records)
+
+
+def test_a_clip_is_turned_down_on_the_way_in():
+    """Fed rather than read, so every part of a clip is scaled once."""
+    stream = PCMStream(STALL_SECONDS, HALF_VOLUME)
+    stream.feed(LOUD)
+    stream.finish()
+
+    frame = np.frombuffer(stream.read(), dtype=SAMPLE_DTYPE)
+
+    assert list(frame) == list(np.frombuffer(LOUD, dtype=SAMPLE_DTYPE) // 2)
 
 
 def test_audio_fed_in_pieces_is_reframed():

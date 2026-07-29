@@ -45,6 +45,26 @@ def test_no_head_start_waits_for_nothing(monkeypatch) -> None:
     assert importlib.reload(config).tts_cfg.lead_bytes == 0
 
 
+def test_the_playback_volume_is_read_as_a_scale(monkeypatch) -> None:
+    monkeypatch.setenv("PLAYBACK_VOLUME", "0.8")
+
+    import config
+
+    assert importlib.reload(config).audio_cfg.playback_volume == 0.8
+
+
+def test_a_negative_playback_volume_is_silence_rather_than_an_inversion(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("PLAYBACK_VOLUME", "-1")
+
+    import config
+
+    reloaded = importlib.reload(config)
+
+    assert reloaded.audio_cfg.playback_volume == reloaded.SILENT_VOLUME
+
+
 def test_invalid_integer_config_fails_fast(monkeypatch) -> None:
     import config
 

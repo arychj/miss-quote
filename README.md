@@ -231,6 +231,8 @@ Synthesis is a second Wyoming server (`TTS_HOST`, `TTS_PORT`) — recognition an
 
 **A clip waits for a head start** (`TTS_LEAD_MS`, 500 ms by default) before the first byte of it is handed to the player. Streaming is the contract, not a promise: a synthesizer is free to render a phrase whole before sending any of it, which makes the first chunk the slow one and every chunk after it instant. That is invisible for a clip that is only speech, and audible for one that opens with a chime — the flourish plays, and then the channel sits silent until the sentence it introduced arrives. Waiting for this much speech first moves the wait to before the chime, where nobody is listening yet. A phrase that ends inside the head start is not padded out to it, and `0` starts on the first chunk, which is what a synthesizer that streams as it renders wants.
 
+**Loudness is a deployment setting** (`PLAYBACK_VOLUME`, `1.0` by default), because how loud a synthesizer renders a sentence has nothing to do with how loud a channel wants to be interrupted. It scales every sample on its way to the player, so a chime is turned down with the words behind it, and it is applied at playback rather than folded into a rendered clip — changing it does not invalidate a cache full of phrases. Above `1.0` the result is clipped at full scale rather than allowed to wrap, since int16 wraps to the opposite extreme and that is a crack in the middle of a word rather than more of the same.
+
 **No ffmpeg.** It is the usual way to play audio through discord.py, but only because it is the usual way to decode a file first. Synthesized speech is already raw PCM, so `soxr` converts it to the 48 kHz stereo Discord wants and the Opus encoder already present for receiving handles the rest.
 
 **Clips are cached**, so a phrase is only ever synthesized once, in two layers holding the form that suits each:
@@ -285,6 +287,7 @@ Only used by tools that answer out loud. A deployment with no such tool enabled 
 | `TTS_TIMEOUT_SECONDS` | `30.0` | Budget for a **single** wait on the synthesizer, not for a whole clip — a long phrase arriving steadily is not cut off for taking a long time |
 | `TTS_STALL_SECONDS` | `10.0` | How long the player waits mid-clip for audio that never comes before ending it |
 | `TTS_LEAD_MS` | `500.0` | How much speech to have in hand before a clip starts playing, so a synthesizer that renders a phrase whole leaves no gap behind a chime. `0` starts on the first chunk |
+| `PLAYBACK_VOLUME` | `1.0` | Scales everything played into a channel, chime included. `1.0` is however loud the synthesizer rendered it, `0.8` is 20% quieter, `1.2` is 20% louder and clipped rather than wrapped. Any value below `0` is treated as silence |
 | `TTS_CACHE_DIR` | `/cache/tts` | Rendered speech. Mount a volume here to keep it across restarts |
 | `TTS_CACHE_ENTRIES` | `256` | Clips held in memory before the least recently used is retired |
 | `TTS_CACHE_RETENTION_DAYS` | `90` | Days a rendered clip survives on disk without being played, counted from the last time it was. Any value below `1` keeps them forever; clips left there by hand are never reaped |
@@ -338,7 +341,7 @@ Removed outright: the multiprocessing layer and its queues, the STT health-check
 
 Kept intact because they are the non-obvious part: `stt/user_state.py`'s per-user VAD state machine with stale-speech flushing, and `audio/ring_buffer.py`'s pre-roll buffer, which is what stops the first syllable being clipped.
 
-Added: `AUTOJOIN`, `RETENTION_DAYS`, `TRANSCRIPT_DIR`, `TZ`, `SESSION_RESUME_SECONDS`, `WYOMING_HOST`, `WYOMING_PORT`, `MAX_CONCURRENT_TRANSCRIPTIONS`, and every `TTS_*`.
+Added: `AUTOJOIN`, `RETENTION_DAYS`, `TRANSCRIPT_DIR`, `TZ`, `SESSION_RESUME_SECONDS`, `WYOMING_HOST`, `WYOMING_PORT`, `MAX_CONCURRENT_TRANSCRIPTIONS`, `PLAYBACK_VOLUME`, and every `TTS_*`.
 
 > **Note on the vendored VAD model.** Silero v5's ONNX graph scores the current frame *together with* the trailing 64 samples of the previous one. Fed a bare 512-sample frame it does not error — it silently returns near-zero probability on unmistakable speech, and the bot transcribes nothing. `stt/vad.py` carries that context between calls, and `tests/test_vad.py` guards it with real speech; silence-based tests pass either way and will not catch a regression.
 
@@ -356,6 +359,7 @@ miss-quote/
 │   └── speaker.py             # Playback into a voice channel, fed while it plays
 ├── audio/
 │   ├── resampler.py           # soxr, both directions
+│   ├── gain.py                # Playback loudness
 │   └── ring_buffer.py         # Pre-speech context buffer
 ├── stt/
 │   ├── vad.py                 # Silero VAD via onnxruntime
