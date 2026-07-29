@@ -18,6 +18,9 @@ nothing in the image can decode anything else.
 
 Rendered speech is reaped at startup once it has gone unplayed for long enough;
 a clip somebody put there by hand never is. See `_reap`.
+
+A caller that can work out in advance what it will have to say can render it
+before it is needed with `warm`, which costs nothing for a phrase already held.
 """
 
 from __future__ import annotations
@@ -95,7 +98,7 @@ class SpeechCache:
         """
         key = self._key(text)
 
-        remembered = self._memory.get(key)
+        remembered = self._recall(key)
         if remembered is not None:
             await self._touch(key)
             yield remembered
@@ -111,6 +114,32 @@ class SpeechCache:
 
         async for chunk in self._synthesize(key, text):
             yield chunk
+
+    async def warm(self, text: str) -> bool:
+        """
+        Render a phrase now so that nothing waits for it later.
+
+        Reports whether it had to be synthesized, for a caller counting how much
+        work warming turned out to be.
+
+        A phrase already held is left exactly as it was found: not touched on
+        disk, and not recalled in memory, so warming moves nothing to the back
+        of the queue. Warmed is not the same as wanted — a warm-up renders
+        whatever it can think of, in an order that means nothing — and a phrase
+        nobody ever earns should age out of both layers on the usual terms.
+        """
+        # Nowhere to keep it makes this a synthesis nobody will ever be served.
+        if not tts_cfg.caching_enabled and self._directory is None:
+            return False
+
+        key = self._key(text)
+        if key in self._memory or self._stored(key):
+            return False
+
+        async for _ in self._synthesize(key, text):
+            pass
+
+        return True
 
     # ── clips kept by hand ────────────────────────
 
@@ -239,14 +268,29 @@ class SpeechCache:
 
     # ── memory ────────────────────────────────────
 
-    def _remember(self, key: str, playback: bytes) -> None:
+    def _recall(self, key: str) -> bytes | None:
         """
-        Hold a clip, retiring the oldest once the cache is full.
+        A held clip, moved to the back of the queue for having been wanted.
 
-        Insertion order is eviction order. There is no recency to exploit here:
-        the entries are one phrase per speaker, and a speaker who has gone quiet
-        is not coming back sooner than one who has not.
+        Which is what makes the bound least-recently-used rather than
+        first-in-first-out, and it matters because the entries do not arrive one
+        at a time: a whole roster is rendered at startup, in no order that means
+        anything, and a cache evicting by arrival would retire whoever happened
+        to be warmed first however much they talk. Ordinary dictionary order
+        does the bookkeeping, so a hit costs one pop and one insert.
+
+        Aging the memory layer by use also puts it on the same footing as the
+        disk layer, which `_touch` ages by mtime for the same reason.
         """
+        playback = self._memory.pop(key, None)
+        if playback is None:
+            return None
+
+        self._memory[key] = playback
+        return playback
+
+    def _remember(self, key: str, playback: bytes) -> None:
+        """Hold a clip, retiring the least recently used once the cache is full."""
         if not tts_cfg.caching_enabled:
             return
 
@@ -274,6 +318,11 @@ class SpeechCache:
 
     def _path(self, key: str) -> Path | None:
         return None if self._directory is None else self._directory / f"{key}{CACHE_SUFFIX}"
+
+    def _stored(self, key: str) -> bool:
+        path = self._path(key)
+
+        return path is not None and path.is_file()
 
     async def _touch(self, key: str) -> None:
         """

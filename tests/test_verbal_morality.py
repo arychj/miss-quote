@@ -7,12 +7,21 @@ from pathlib import Path
 import pytest
 
 import tools.verbal_morality as verbal_morality
-from config import tts_cfg
+from config import ServerConfig, ToolSettings, tts_cfg
+from tools.runner import ToolRunner
 from tools.verbal_morality import DEFAULT_ANNOUNCEMENT, VerbalMorality, _lead
 from transcript.writer import Source, Utterance
 
 SERVER_ALIAS = "first-server"
 SPEAKER = "Speaker One"
+OTHER_SPEAKER = "Speaker Two"
+
+SPEAKER_ID = 234567890123456789
+OTHER_SPEAKER_ID = 345678901234567890
+ROSTER = {SPEAKER_ID: SPEAKER, OTHER_SPEAKER_ID: OTHER_SPEAKER}
+
+# Announcements the pre-warm renders per speaker: one violation, two, and three.
+WARMED_PER_SPEAKER = 3
 
 CHIME_NAME = "chime.wav"
 CHIME_AUDIO = "♪"
@@ -59,6 +68,8 @@ class FakeSpeech:
         self.asked: list[str] = []
         self.clips_asked: list[str] = []
         self.pulled: list[str] = []
+        self.warmed: list[str] = []
+        self.held: set[str] = set()
 
         # Set by a test that cares how a phrase is paced; a phrase arrives whole
         # otherwise, which is what a cache hit looks like.
@@ -70,6 +81,16 @@ class FakeSpeech:
         for chunk in (text,) if self.chunks is None else self.chunks:
             self.pulled.append(chunk)
             yield chunk
+
+    async def warm(self, text: str) -> bool:
+        """Render a phrase unless it is already held, as the real cache does."""
+        self.warmed.append(text)
+
+        if text in self.held:
+            return False
+
+        self.held.add(text)
+        return True
 
     def clip_path(self, name: str) -> Path:
         return self.directory / name
@@ -106,12 +127,13 @@ def speaker() -> RecordingSpeaker:
     return RecordingSpeaker()
 
 
-def _tool(speaker, config=None) -> VerbalMorality:
+def _tool(speaker, config=None, users=None) -> VerbalMorality:
     # `is None` rather than a falsy check: an empty config is a case under test.
     return VerbalMorality(
         server=SERVER_ALIAS,
         config={"words": WORDS} if config is None else config,
         speaker=speaker,
+        users=users,
     )
 
 
@@ -461,3 +483,114 @@ async def test_a_phrase_shorter_than_the_head_start_is_not_waited_on(speech):
     held = await _lead(words, len("".join(CHUNKS)) + 1)
 
     assert held == list(CHUNKS)
+
+
+# ── the pre-warm ──────────────────────────────────
+
+
+def _wording(user: str, credits: str, violations: str) -> str:
+    return DEFAULT_ANNOUNCEMENT.format(user=user, credits=credits, violations=violations)
+
+
+async def test_every_name_on_the_roster_is_warmed(speech, speaker):
+    tool = _tool(speaker, users=ROSTER)
+
+    await tool.prewarm()
+
+    assert len(speech.warmed) == len(ROSTER) * WARMED_PER_SPEAKER
+    assert {wording.split(",")[0] for wording in speech.warmed} == {
+        SPEAKER,
+        OTHER_SPEAKER,
+    }
+
+
+async def test_a_speaker_is_warmed_for_one_two_and_three_violations(speech, speaker):
+    """What a sentence usually holds; past that they can wait for the synthesizer."""
+    tool = _tool(speaker, users={SPEAKER_ID: SPEAKER})
+
+    await tool.prewarm()
+
+    assert speech.warmed == [
+        _wording(SPEAKER, "1 credit", "a violation"),
+        _wording(SPEAKER, "2 credits", "multiple violations"),
+        _wording(SPEAKER, "3 credits", "multiple violations"),
+    ]
+
+
+async def test_a_warmed_announcement_is_exactly_what_gets_said(speech, speaker):
+    """A phrase differing by a space is one that gets synthesized twice."""
+    tool = _tool(speaker, users={SPEAKER_ID: SPEAKER})
+    await tool.prewarm()
+
+    await _hear(tool, f"{FORBIDDEN} and {ALSO_FORBIDDEN}")
+
+    assert speech.asked[0] in speech.warmed
+
+
+async def test_a_custom_announcement_is_what_is_warmed(speech, speaker):
+    tool = _tool(
+        speaker,
+        {"words": WORDS, "announcement": "language, {user}"},
+        users={SPEAKER_ID: SPEAKER},
+    )
+
+    await tool.prewarm()
+
+    assert speech.warmed == [f"language, {SPEAKER}"] * WARMED_PER_SPEAKER
+
+
+async def test_a_speaker_who_is_not_on_the_roster_is_not_warmed(speech, speaker):
+    """Their Discord name is not knowable from here, and not a closed set."""
+    tool = _tool(speaker, users={SPEAKER_ID: SPEAKER})
+    await tool.prewarm()
+
+    await _hear(tool, FORBIDDEN, user="Someone Else")
+
+    assert speech.asked[0] not in speech.warmed
+
+
+async def test_an_empty_roster_warms_nothing(speech, speaker):
+    await _tool(speaker).prewarm()
+
+    assert speech.warmed == []
+
+
+async def test_one_name_under_two_ids_is_warmed_once(speech, speaker):
+    """Two IDs and one name is one phrase, however it got written down."""
+    tool = _tool(speaker, users={SPEAKER_ID: SPEAKER, OTHER_SPEAKER_ID: SPEAKER})
+
+    await tool.prewarm()
+
+    assert len(speech.warmed) == WARMED_PER_SPEAKER
+
+
+async def test_warming_plays_nothing(speech, speaker):
+    """It is preparation, not an announcement; nobody has earned one yet."""
+    await _tool(speaker, users=ROSTER).prewarm()
+
+    assert speaker.played == []
+    assert speech.asked == []
+
+
+async def test_the_runner_warms_a_configured_server(speech, speaker):
+    """
+    The seam the rest of these skip past.
+
+    A tool is handed the roster by the runner, from the server's own config
+    rather than the tool's, and warmed once the bot is up.
+    """
+    servers = {
+        SOURCE.guild_id: ServerConfig(
+            alias=SERVER_ALIAS,
+            users=ROSTER,
+            tools={
+                VerbalMorality.name: ToolSettings(enabled=True, config={"words": WORDS})
+            },
+        )
+    }
+    runner = ToolRunner(servers, {VerbalMorality.name: VerbalMorality}, speaker)
+
+    await runner.prewarm()
+
+    assert runner.problems == []
+    assert len(speech.warmed) == len(ROSTER) * WARMED_PER_SPEAKER

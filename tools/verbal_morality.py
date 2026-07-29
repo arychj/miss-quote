@@ -12,6 +12,10 @@ conjugations; `utils.stems` does the growing.
 The name in the announcement is the one the transcript uses, which is the roster
 name from `users` where a server has set one and the Discord display name
 otherwise. Nothing has to be configured twice.
+
+Because the roster is known before anybody speaks, and so is the shape of the
+sentence, most of what the tool will ever have to say can be rendered at startup
+rather than while the channel waits for it. See `prewarm`.
 """
 
 from __future__ import annotations
@@ -60,6 +64,11 @@ SINGLE_OFFENCE = 1
 SINGLE_VIOLATION = "a violation"
 MULTIPLE_VIOLATIONS = "multiple violations"
 
+# Violations in one utterance the pre-warm is prepared for. Three covers what a
+# sentence usually holds; past it a speaker has said something remarkable and can
+# wait for the synthesizer.
+FORESEEN_OFFENCES = 3
+
 OFFENCE_SEPARATOR = ", "
 
 # Stand in for a speaker and their fine while the announcement is checked at
@@ -74,8 +83,14 @@ class VerbalMorality(Tool):
 
     name = "verbal-morality"
 
-    def __init__(self, server: str, config: Mapping[str, Any], speaker: Speaker) -> None:
-        super().__init__(server, config, speaker)
+    def __init__(
+        self,
+        server: str,
+        config: Mapping[str, Any],
+        speaker: Speaker,
+        users: Mapping[int, str] | None = None,
+    ) -> None:
+        super().__init__(server, config, speaker, users)
 
         self._vocabulary = _vocabulary(config.get(WORDS_KEY))
         self._forbidden = _pattern(self._vocabulary)
@@ -117,6 +132,48 @@ class VerbalMorality(Tool):
 
         return name
 
+    async def prewarm(self) -> None:
+        """
+        Render the fines this server can already see coming.
+
+        Every name on the roster against the first few counts of violations,
+        which between them are most of what anybody earns. Synthesis is the slow
+        part of answering: paying for it at startup is what lets the fine land
+        while the offence is still what the channel is talking about.
+
+        Only the roster can be warmed. A speaker the server has not named is
+        announced under whatever Discord reports, which is not knowable from here
+        and not a closed set; they pay for their first fine, and nobody pays for
+        it again.
+
+        Serial, and unhurried. Nothing is waiting on this, and a synthesizer
+        asked for a hundred phrases at once is a synthesizer not answering
+        whoever is speaking right now.
+        """
+        names = sorted(set(self.users.values()))
+        if not names:
+            logger.debug(
+                "[%s] No roster, so there are no fines to render in advance.", self.server
+            )
+            return
+
+        offences = range(SINGLE_OFFENCE, FORESEEN_OFFENCES + 1)
+        rendered = 0
+
+        for name in names:
+            for count in offences:
+                if await self._speech.warm(self._wording(name, count)):
+                    rendered += 1
+
+        logger.info(
+            "[%s] Pre-warmed announcements for %d speaker(s): "
+            "%d rendered, %d already cached.",
+            self.server,
+            len(names),
+            rendered,
+            len(names) * len(offences) - rendered,
+        )
+
     async def handle_utterance(
         self, utterance: Utterance, session: TranscriptSession
     ) -> None:
@@ -141,14 +198,26 @@ class VerbalMorality(Tool):
             fine,
         )
 
-        announcement = self._announcement.format(
+        await self.speaker.play(
+            session.source, self._announce(self._wording(utterance.user, len(offences)))
+        )
+
+    def _wording(self, user: str, offences: int) -> str:
+        """
+        The announcement as it will be said, for one speaker and one count.
+
+        The pre-warm renders exactly this, so the two must agree down to the
+        character: a phrase that differs by a space is a phrase that was
+        synthesized at startup and then synthesized again on the way to being
+        played.
+        """
+        return self._announcement.format(
             **{
-                USER_FIELD: utterance.user,
-                CREDITS_FIELD: fine,
-                VIOLATIONS_FIELD: _violations(len(offences)),
+                USER_FIELD: user,
+                CREDITS_FIELD: _fine(offences),
+                VIOLATIONS_FIELD: _violations(offences),
             }
         )
-        await self.speaker.play(session.source, self._announce(announcement))
 
     async def _announce(self, announcement: str) -> AsyncIterator[bytes]:
         """

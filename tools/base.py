@@ -15,6 +15,16 @@ Both are coroutines. Anything blocking — a model call, a large read, a databas
 round trip — is the tool's own business to push onto a thread; the handlers run
 on the bot's event loop, and one that blocks stops audio being received.
 
+A tool may also define:
+
+    async def prewarm(self) -> None
+
+which the runner calls once, in the background, after the bot has connected. It
+is for work a tool can do before anybody asks anything of it, rendering what it
+already knows it will have to say being the one that exists. It is not one of the
+moments: a tool defining only this handles nothing, and is still reported as
+inert.
+
 A tool is also handed a `Speaker`, which is how it answers out loud. Nothing in
 this package imports discord: a speaker is somewhere to play audio, and the bot
 supplies one that happens to be a voice channel.
@@ -66,14 +76,27 @@ class Tool:
     state for the length of the process, but must expect its handlers to be
     entered concurrently: utterances are transcribed in parallel and dispatched
     as they land, not in the order they were spoken.
+
+    `users` is that server's roster, by ID, which is the same one the transcript
+    labels a speaker from. It is what a tool has that is knowable about who might
+    speak before anybody does; it is empty for a server that has not written one,
+    and it never covers everybody, since a speaker who is not on it is known by
+    whatever Discord reports.
     """
 
     name: str = ""
 
-    def __init__(self, server: str, config: Mapping[str, Any], speaker: Speaker) -> None:
+    def __init__(
+        self,
+        server: str,
+        config: Mapping[str, Any],
+        speaker: Speaker,
+        users: Mapping[int, str] | None = None,
+    ) -> None:
         self.server = server
         self.config = config
         self.speaker = speaker
+        self.users: Mapping[int, str] = {} if users is None else users
 
     def __repr__(self) -> str:
         return f"<{type(self).__name__} {self.name!r} for {self.server!r}>"
@@ -93,3 +116,10 @@ class FinishedHandler(Protocol):
     """A tool that wants the whole conversation once the bot has left."""
 
     async def handle_finished(self, transcript: Transcript) -> None: ...
+
+
+@runtime_checkable
+class Warmer(Protocol):
+    """A tool with something to prepare before anyone asks it for anything."""
+
+    async def prewarm(self) -> None: ...

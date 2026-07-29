@@ -167,7 +167,7 @@ class Example(Tool):
         """Called once the session is sealed."""
 ```
 
-A tool is also handed a `speaker`, which is how it answers out loud — see **Speech** below.
+A tool is also handed a `speaker`, which is how it answers out loud — see **Speech** below — and its server's `users` roster, which is the only thing knowable about who might speak before anybody does.
 
 Neither method exists on the base class, so their absence is meaningful: the runner inspects each instance once at startup and files it under the moments it handles. A tool that defines neither is reported as configured-but-inert rather than silently doing nothing.
 
@@ -175,6 +175,8 @@ Neither method exists on the base class, so their absence is meaningful: the run
 - **`handle_finished`** is dispatched once the resume window has passed without a reconnect, so a tool sees one whole conversation rather than a fragment per disconnect. On shutdown, open sessions are sealed immediately rather than waiting the window out.
 
 Both are coroutines running on the bot's event loop; anything blocking is the tool's own business to push onto a thread. A tool is constructed **once per server** that elects into it, so it may hold state, but its handlers can be entered concurrently — utterances are transcribed in parallel and dispatched as they land, not in the order they were spoken.
+
+A tool may also define **`async def prewarm(self)`**, which the runner calls once per process in the background, just after the bot connects. It is for work a tool can do before anybody asks anything of it; rendering what it already knows it will have to say is the use that exists. This is not a third moment: a tool defining only `prewarm` handles nothing and is still reported as inert, and nothing is prepared for a tool that can never run. Warming is **serial** across tools, unlike dispatch, because nothing is waiting on it and the tools with anything to warm are all talking to one synthesizer.
 
 Failures are contained. A tool that raises is logged and otherwise invisible: it cannot cost an utterance, delay a disconnect, or stop another tool from running. A tool that will not construct is reported at startup and skipped.
 
@@ -211,6 +213,10 @@ Matching is **whole words, case-insensitive**. A substring match fines the innoc
 
 **The fine scales with the utterance**: one credit per forbidden word in it, so three of them is `3 credits` and one is `1 credit`. The count is filled into `{credits}` already pluralized, as a numeral — every synthesizer worth pointing this at reads `3` as a number, and `1 credits` is wrong in a way a listener hears. `{violations}` agrees with it, reading `a violation` for one and `multiple violations` for more, so the sentence is not left saying "fined 3 credits for a violation". It is a phrase rather than a second count: the number is already in the fine, and saying it twice makes the announcement sound like an invoice. What does not scale is the number of announcements: three violations earn one, because three announcements over the top of each other is a denial of service on the channel. Two people swearing at once are fined one after the other.
 
+**The announcements are rendered at startup.** The roster is known before anybody speaks and so is the shape of the sentence, so on the way up the tool synthesizes every name in `users` against one, two, and three violations and leaves the results in the speech cache. Synthesis is the slow part of answering; paying for it before anyone is waiting is what lets the fine land while the offence is still what the channel is talking about. It happens in the background, one phrase at a time — the bot is in the channel and listening while it runs, and a synthesizer asked for a hundred phrases at once is one that is not answering whoever is speaking right now.
+
+Three violations because that is what a sentence usually holds; a fourth is remarkable enough to wait for the synthesizer. Anything already cached, from an earlier run or a real fine, is left alone rather than rendered again. What cannot be warmed is anyone **not** on the roster: they are announced under whatever Discord reports, which is not knowable at startup and not a closed set, so they pay for their first fine and nobody pays for it again. Warming also does not count as playing, so a pre-rendered announcement nobody ever earns ages out of the cache on the usual terms and is warmed again at the next startup.
+
 `chime` is resolved **inside** `TTS_CACHE_DIR` — a bare name, or a path below it; anything that climbs out is refused at startup. It must be a **16-bit WAV**, at any sample rate and in mono or stereo, both of which are converted on the way in. WAV rather than MP3 because playing audio without ffmpeg is the point of this path, and nothing in the image can decode anything else. The clip is read once, kept for the life of the process, and never evicted to make room for a phrase. A chime that is missing or will not parse is reported and costs the chime, not the announcement.
 
 A server electing in with no `words` is enabled and listening for nothing, which is reported at startup rather than left to be discovered by swearing at it.
@@ -236,7 +242,9 @@ Synthesis is a second Wyoming server (`TTS_HOST`, `TTS_PORT`) — recognition an
 
 The first hit after a restart pays one resample and nothing else. Mount a volume at `TTS_CACHE_DIR` to keep clips across restarts; an unwritable or absent directory costs the persistence, not the feature. Writes go through a temporary file and a rename, because a process killed mid-write would otherwise cache a truncated clip forever, and a clip is only stored once the synthesizer says it is whole — a failure partway through plays what arrived and stores nothing.
 
-The memory layer is bounded (`TTS_CACHE_ENTRIES`) because what gets synthesized can include a Discord display name, and those are not a closed set.
+The memory layer is bounded (`TTS_CACHE_ENTRIES`) because what gets synthesized can include a Discord display name, and those are not a closed set. What goes when it is full is the **least recently used** clip, not the oldest: entries do not arrive one at a time, since a whole roster is rendered at startup in no order that means anything, and evicting by arrival would retire whoever happened to be warmed first however much they talk. That puts the memory layer on the same footing as the disk layer, which ages by use for the same reason.
+
+**A phrase can be rendered before it is needed.** A tool that can work out at startup what it will have to say later warms the cache with it from `prewarm`, and a phrase already in either layer costs nothing to warm. A warmed clip is deliberately **not** treated as a played one: a phrase already held is left exactly as found, neither touched on disk nor moved to the back of the memory queue, so what nobody ever earns ages out of both layers like anything else nobody plays. With no memory layer and no usable directory there is nowhere to put the result, and warming does nothing rather than paying a synthesizer for audio nobody will ever be served.
 
 **The disk layer is reaped at startup** (`TTS_CACHE_RETENTION_DAYS`, 90 by default). The directory otherwise only grows: a display name goes into the key, so everyone who has ever been announced leaves a file behind, and none of them is ever asked for again once they leave the server. Age is the **mtime**, not the filename, and every hit touches the file — including one served out of memory, which never opens it — so what is still in use stays however old it is and only what nothing plays ages out. A reaped phrase costs one synthesis the next time it is said.
 
@@ -278,7 +286,7 @@ Only used by tools that answer out loud. A deployment with no such tool enabled 
 | `TTS_STALL_SECONDS` | `10.0` | How long the player waits mid-clip for audio that never comes before ending it |
 | `TTS_LEAD_MS` | `500.0` | How much speech to have in hand before a clip starts playing, so a synthesizer that renders a phrase whole leaves no gap behind a chime. `0` starts on the first chunk |
 | `TTS_CACHE_DIR` | `/cache/tts` | Rendered speech. Mount a volume here to keep it across restarts |
-| `TTS_CACHE_ENTRIES` | `256` | Clips held in memory before the oldest is retired |
+| `TTS_CACHE_ENTRIES` | `256` | Clips held in memory before the least recently used is retired |
 | `TTS_CACHE_RETENTION_DAYS` | `90` | Days a rendered clip survives on disk without being played, counted from the last time it was. Any value below `1` keeps them forever; clips left there by hand are never reaped |
 
 ### Transcripts

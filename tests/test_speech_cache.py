@@ -16,6 +16,7 @@ from tts.client import Speech, SynthesisError
 
 PHRASE = "you are fined one credit"
 OTHER_PHRASE = "and another one"
+THIRD_PHRASE = "and one more"
 
 SOURCE_RATE = 24_000
 SOURCE_SECONDS = 0.5
@@ -23,6 +24,7 @@ SOURCE_SAMPLES = int(SOURCE_RATE * SOURCE_SECONDS)
 
 CHUNKS = 4
 KEEP_TWO = 2
+CACHING_OFF = 0
 
 # Least-significant bits of a 16-bit sample. Chunked and one-pass filtering
 # round differently; at this magnitude the difference is around -78 dB, which is
@@ -133,7 +135,7 @@ async def test_a_different_phrase_is_synthesized(synthesizer, tmp_path):
     assert synthesizer.calls == [PHRASE, OTHER_PHRASE]
 
 
-async def test_the_oldest_clip_is_retired_when_memory_is_full(synthesizer, tmp_path):
+async def test_a_clip_is_retired_when_memory_is_full(synthesizer, tmp_path):
     """A display name is not a closed set, so the cache has to have a ceiling."""
     cache = SpeechCache(directory=tmp_path, entries=KEEP_TWO)
 
@@ -141,6 +143,32 @@ async def test_the_oldest_clip_is_retired_when_memory_is_full(synthesizer, tmp_p
         await _collect(cache, phrase)
 
     assert len(cache._memory) == KEEP_TWO
+
+
+async def test_the_least_recently_used_clip_is_retired(synthesizer, tmp_path):
+    """A phrase still being said should outlive one rendered after it."""
+    cache = SpeechCache(directory=tmp_path, entries=KEEP_TWO)
+
+    await _collect(cache, PHRASE)
+    await _collect(cache, OTHER_PHRASE)
+    await _collect(cache, PHRASE)
+    await _collect(cache, THIRD_PHRASE)
+
+    assert cache._key(PHRASE) in cache._memory
+    assert cache._key(OTHER_PHRASE) not in cache._memory
+
+
+async def test_a_clip_read_off_disk_is_held_as_the_newest(synthesizer, tmp_path):
+    """It was just asked for, whatever the last process left in what order."""
+    await _collect(SpeechCache(directory=tmp_path), PHRASE)
+    cache = SpeechCache(directory=tmp_path, entries=KEEP_TWO)
+
+    await _collect(cache, OTHER_PHRASE)
+    await _collect(cache, PHRASE)
+    await _collect(cache, THIRD_PHRASE)
+
+    assert cache._key(PHRASE) in cache._memory
+    assert cache._key(OTHER_PHRASE) not in cache._memory
 
 
 # ── disk ──────────────────────────────────────────
@@ -270,6 +298,81 @@ async def test_nothing_happens_until_the_stream_is_drained(synthesizer, tmp_path
 
     assert b"".join([chunk async for chunk in queued]) != b""
     assert synthesizer.calls == [PHRASE]
+
+
+# ── warming ───────────────────────────────────────
+
+
+async def test_warming_renders_a_phrase_nobody_has_said(synthesizer, tmp_path):
+    rendered = await SpeechCache(directory=tmp_path).warm(PHRASE)
+
+    assert rendered
+    assert synthesizer.calls == [PHRASE]
+    assert len(_cached_files(tmp_path)) == 1
+
+
+async def test_a_warmed_phrase_is_not_synthesized_when_it_is_said(synthesizer, tmp_path):
+    """The point of the exercise: the wait was paid before anyone was waiting."""
+    cache = SpeechCache(directory=tmp_path)
+    await cache.warm(PHRASE)
+
+    assert len(await _collect(cache)) > 0
+    assert synthesizer.calls == [PHRASE]
+
+
+async def test_warming_what_is_already_in_memory_synthesizes_nothing(
+    synthesizer, tmp_path
+):
+    cache = SpeechCache(directory=tmp_path)
+    await _collect(cache)
+
+    assert not await cache.warm(PHRASE)
+    assert synthesizer.calls == [PHRASE]
+
+
+async def test_warming_what_is_already_on_disk_synthesizes_nothing(
+    synthesizer, tmp_path
+):
+    """A restart should not re-render what the last process left behind."""
+    await SpeechCache(directory=tmp_path).warm(PHRASE)
+
+    assert not await SpeechCache(directory=tmp_path).warm(PHRASE)
+    assert synthesizer.calls == [PHRASE]
+
+
+async def test_warming_twice_synthesizes_once(synthesizer, tmp_path):
+    cache = SpeechCache(directory=tmp_path)
+
+    await cache.warm(PHRASE)
+    await cache.warm(PHRASE)
+
+    assert synthesizer.calls == [PHRASE]
+
+
+async def test_warming_does_not_promote_a_clip_it_finds_held(synthesizer, tmp_path):
+    """A warm-up renders the whole roster; which name came first means nothing."""
+    cache = SpeechCache(directory=tmp_path, entries=KEEP_TWO)
+    await _collect(cache, PHRASE)
+    await _collect(cache, OTHER_PHRASE)
+
+    await cache.warm(PHRASE)
+    await _collect(cache, THIRD_PHRASE)
+
+    assert cache._key(PHRASE) not in cache._memory
+
+
+async def test_warming_with_nowhere_to_keep_it_synthesizes_nothing(
+    synthesizer, tmp_path, monkeypatch
+):
+    """No memory and no directory makes it a synthesis nobody is ever served."""
+    monkeypatch.setattr(
+        cache_module, "tts_cfg", replace(tts_cfg, cache_entries=CACHING_OFF)
+    )
+    blocked = tmp_path / "file-not-a-directory"
+    blocked.write_text("")
+
+    assert not await SpeechCache(directory=blocked / "cache").warm(PHRASE)
+    assert synthesizer.calls == []
 
 
 # ── clips kept by hand ────────────────────────────
@@ -513,6 +616,16 @@ async def test_a_reaped_clip_is_synthesized_again(synthesizer, tmp_path):
     await _collect(SpeechCache(directory=tmp_path, retention_days=RETAIN_DAYS))
 
     assert synthesizer.calls == [PHRASE, PHRASE]
+
+
+async def test_a_warmed_clip_nobody_plays_is_still_reaped(synthesizer, tmp_path):
+    """Warmed is not the same as wanted, and the reaper is right to take it."""
+    await SpeechCache(directory=tmp_path, retention_days=RETAIN_DAYS).warm(PHRASE)
+    _age(_cached_files(tmp_path)[0])
+
+    SpeechCache(directory=tmp_path, retention_days=RETAIN_DAYS)
+
+    assert _cached_files(tmp_path) == []
 
 
 async def test_touching_a_clip_that_was_never_stored_creates_nothing(
