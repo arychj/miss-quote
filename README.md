@@ -9,7 +9,7 @@
 ![Wyoming](https://img.shields.io/badge/Wyoming-ASR-success?style=for-the-badge)
 ![Silero VAD](https://img.shields.io/badge/Silero%20VAD-ONNX-orange?style=for-the-badge)
 
-> Transcribes Discord voice channels to a daily, per-speaker JSONL transcript.
+> Transcribes Discord voice channels to a per-session, per-speaker JSONL transcript, and hands the result to tools.
 
 Transcription is delegated to a [Wyoming](https://github.com/rhasspy/wyoming) ASR server rather than run in-process, so the bot is a CPU-only workload with no GPU, no model weights, and no cache volume. It is a hard fork of [Leehyunbin0131/Discord-Realtime-STT-Bot](https://github.com/Leehyunbin0131/Discord-Realtime-STT-Bot), which ran `faster-whisper` on a local GPU.
 
@@ -41,8 +41,10 @@ graph TD
 
     REMOTE -->|"Transcribe / AudioStart / AudioChunk* / AudioStop"| I
 
-    I["Wyoming ASR server<br/><i>WYOMING_HOST:WYOMING_PORT</i>"] -->|"Transcript, ~70 ms"| J["TranscriptWriter"]
-    J --> K["TRANSCRIPT_DIR/guild/channel/YYYY-MM-DD.jsonl"]
+    I["Wyoming ASR server<br/><i>WYOMING_HOST:WYOMING_PORT</i>"] -->|"Transcript, ~70 ms"| J["TranscriptSession"]
+    J --> K["TRANSCRIPT_DIR/guild/channel/YYYY-MM-DDTHH-MM-SS.jsonl"]
+    J -->|"handle_utterance"| L["Tools for this server"]
+    K -.->|"handle_finished, on disconnect"| L
 ```
 
 Everything runs on one event loop in one process. The split that matters is between the two halves of the pipeline: **audio handling is local and serial, transcription is remote and parallel.**
@@ -74,21 +76,25 @@ Upstream got this backwards: it called `transcribe()` inline in the per-frame lo
 
 ## Transcript format
 
-Transcripts are filed one directory per guild, one per voice channel inside it, and one file per local calendar day:
+Transcripts are filed one directory per guild, one per voice channel inside it, and **one file per session** — one visit by the bot to one voice channel:
 
 ```
 TRANSCRIPT_DIR/
 └── first-server/
     ├── general-voice/
-    │   ├── 2026-07-26.jsonl
-    │   └── 2026-07-27.jsonl
+    │   ├── 2026-07-26T20-14-03.jsonl
+    │   └── 2026-07-27T09-31-55.jsonl
     └── side-room/
-        └── 2026-07-27.jsonl
+        └── 2026-07-27T21-02-40.jsonl
 ```
 
-The server directory is its **alias from `known_servers`**, fixed in configuration rather than read from Discord, so it cannot change underneath the tree. Channels use their Discord name.
+A session opens when the bot joins and closes when it leaves — because the channel emptied, because someone disconnected it, or because the pod terminated. The file is named for the moment it opened and keeps that name until it closes, so **a conversation spanning midnight stays in one file** and **rejoining starts a new one**. A session that opens in the same second as another in the same channel gets a `-2` on the end rather than appending to it.
 
-Neither carries an ID, which has two consequences worth knowing. **Renaming a channel starts a new directory** with nothing tying it to the old one; that is accepted rather than worked around, since the alternative is an ID in every path to serve a rare event. And **two names that reduce to the same slug share a directory** — two servers given one alias, or two voice channels named `General` and `general`. Nothing about the path can catch either, so the bot logs an error instead: duplicate aliases at startup, colliding channels when it joins one.
+Rejoining is qualified by the **resume window** (`SESSION_RESUME_SECONDS`, 5 s). A channel that empties and refills inside it is treated as one conversation with a gap in it — someone's client dropped, or the last person stepped away — so the transcript is held open and appended to rather than sealed and replaced.
+
+The server directory is its **alias from `servers`**, fixed in configuration rather than read from Discord, so it cannot change underneath the tree. Channels use their Discord name.
+
+Neither carries an ID, which has two consequences worth knowing. **Renaming a channel starts a new directory** with nothing tying it to the old one; that is accepted rather than worked around, since the alternative is an ID in every path to serve a rare event. And **two names that reduce to the same slug share a directory** — two servers given one alias, or two voice channels named `General` and `general`. Their sessions stay in separate files, but nothing in the tree says which file came from where. Nothing about the path can catch either, so the bot logs an error instead: duplicate aliases at startup, colliding channels when it joins one.
 
 Names are lowercased and reduced to `a-z0-9_-`, which drops dots and separators rather than escaping them, so no name can express a path traversal wherever it appears in the string.
 
@@ -100,7 +106,7 @@ JSON Lines, one object per utterance, appended and flushed as produced:
 
 Guild and channel are not repeated in the line because the path already carries them. `user_id` is recorded alongside the display name because display names change and the path does not encode the speaker.
 
-Files roll over on the local calendar date, resolved through `TZ`, and timestamps carry an explicit UTC offset. A session spanning midnight writes into two files.
+Timestamps carry an explicit UTC offset, resolved through `TZ`.
 
 ---
 
@@ -109,24 +115,62 @@ Files roll over on the local calendar date, resolved through `TZ`, and timestamp
 Mappings do not flatten into environment variables, so they live in `config.yaml`, mounted at `/config/config.yaml` from a ConfigMap. Point `CONFIG_FILE` elsewhere to override the location. The file is read once at startup, so editing it means restarting the pod. The IDs in the repo copy are placeholders.
 
 ```yaml
-known_servers:
-  123456789012345678: first-server
-  876543210987654321: second-server
+servers:
+  123456789012345678:
+    alias: first-server
+    users:
+      234567890123456789: Speaker One
+    tools:
+      example-tool:
+        enabled: true
+        config:
+          some-setting: a value
 
-user_names:
-  first-server:
-    234567890123456789: Speaker One
-  second-server:
-    234567890123456789: Someone Else
+  876543210987654321:
+    alias: second-server
+    users:
+      234567890123456789: Someone Else
 ```
 
-`known_servers` maps each server's ID to an alias, and it is the only place an ID appears. Everything else keys off the alias, including transcript directories, so renaming a server on Discord changes nothing about where its transcripts land or which roster applies to it.
+Everything about a server lives under its ID, and the ID appears there and nowhere else. The `alias` names the transcript directory, so renaming a server on Discord changes nothing about where its transcripts land.
 
-It is also a hard gate on joining. A server that is not listed is never joined, by autojoin or by an explicit `!join`, and an empty mapping or a missing file means the bot joins nothing at all. That direction is deliberate: joining no server is something you notice and fix, while recording a server the bot should not have been in is not something you can take back.
+`servers` is also a hard gate on joining. A server that is not listed is never joined, by autojoin or by an explicit `!join`, and an empty mapping or a missing file means the bot joins nothing at all. That direction is deliberate: joining no server is something you notice and fix, while recording a server the bot should not have been in is not something you can take back.
 
-On startup the bot reconciles the file against the servers it is actually in, and says so. Three things can be wrong and none of them raise on their own: nothing is configured, a server is configured but the bot was never invited, or the bot is in a server nobody configured. Each is logged, so none has to be discovered by noticing an empty transcript directory.
+Parsing **reports rather than raises**. A server whose block is malformed — no `alias`, or not a mapping at all — is dropped and logged at startup; the bot joins one fewer server instead of crash-looping over a typo. The same goes for a name filed under something that is not a user ID, and a tool whose settings will not parse.
 
-`user_names` replaces the display name Discord reports for a speaker, per server. Discord nicknames are freely editable and often not a name at all, which makes them poor labels in a transcript that a summarizer will later read. The roster is per server because the same person can be known differently in two places. IDs may be quoted or bare; both are read as integers.
+On startup the bot reconciles the file against the servers it is actually in, and says so. Four things can be wrong and none of them raise: an entry would not parse, nothing is configured, a server is configured but the bot was never invited, or the bot is in a server nobody configured. Each is logged, so none has to be discovered by noticing an empty transcript directory.
+
+`users` replaces the display name Discord reports for a speaker. Discord nicknames are freely editable and often not a name at all, which makes them poor labels in a transcript that a summarizer will later read. The roster is per server because the same person can be known differently in two places. IDs may be quoted or bare; both are read as integers.
+
+`tools` elects the server into the tools listed under it — see below.
+
+---
+
+## Tools
+
+A tool reads a server's transcripts and does something with them. Configuration decides only **which servers a tool applies to** and **what settings it is handed**; the tool itself decides when it runs, by defining either handler or both:
+
+```python
+class Example(Tool):
+    name = "example-tool"
+
+    async def handle_utterance(self, utterance, session) -> None:
+        """Called as each line is written."""
+
+    async def handle_finished(self, transcript) -> None:
+        """Called once the session is sealed."""
+```
+
+Neither method exists on the base class, so their absence is meaningful: the runner inspects each instance once at startup and files it under the moments it handles. A tool that defines neither is reported as configured-but-inert rather than silently doing nothing.
+
+- **`handle_utterance`** is dispatched after the line is on disk, so a tool that reads the file sees the same thing it was handed. It is not called for an empty transcription.
+- **`handle_finished`** is dispatched once the resume window has passed without a reconnect, so a tool sees one whole conversation rather than a fragment per disconnect. On shutdown, open sessions are sealed immediately rather than waiting the window out.
+
+Both are coroutines running on the bot's event loop; anything blocking is the tool's own business to push onto a thread. A tool is constructed **once per server** that elects into it, so it may hold state, but its handlers can be entered concurrently — utterances are transcribed in parallel and dispatched as they land, not in the order they were spoken.
+
+Failures are contained. A tool that raises is logged and otherwise invisible: it cannot cost an utterance, delay a disconnect, or stop another tool from running. A tool that will not construct is reported at startup and skipped.
+
+A tool is only reachable from configuration once it is registered in `tools/registry.py`, which keeps the set of names a config file can switch on a closed list rather than whatever happens to be importable. A name nothing answers to is reported at startup and skipped.
 
 ## Environment
 
@@ -153,9 +197,10 @@ Every setting is read from the environment; `.env` is loaded if present. Nothing
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `TRANSCRIPT_DIR` | `/transcripts` | Directory the daily files are written to |
-| `TZ` | `America/Los_Angeles` | Rollover boundary and the offset stamped on each line |
+| `TRANSCRIPT_DIR` | `/transcripts` | Directory the session files are written to |
+| `TZ` | `America/Los_Angeles` | Timezone for session filenames and the offset stamped on each line |
 | `RETENTION_DAYS` | `-1` | Days to keep. `-1`, or any value below `1`, keeps forever |
+| `SESSION_RESUME_SECONDS` | `5.0` | How long a transcript is held open for a reconnect to the same channel. `0` seals it on disconnect |
 
 ### Speech segmentation
 
@@ -169,7 +214,7 @@ VAD thresholds, the pre-roll depth, and the Wyoming chunk size are deliberately 
 
 ### Retention
 
-Pruning is **off by default**. Any value below `1` disables it entirely, so `0` is a no-op rather than "delete everything" and a mis-set variable cannot destroy the archive. When set to a positive `N`, files older than `N` days are deleted, aged by the **filename date** rather than mtime — the filename is the authoritative record of the day covered, while mtime misjudges a file appended to late or restored from backup. Pruning runs at startup and on each date rollover.
+Pruning is **off by default**. Any value below `1` disables it entirely, so `0` is a no-op rather than "delete everything" and a mis-set variable cannot destroy the archive. When set to a positive `N`, files older than `N` days are deleted, aged by the **date at the front of the filename** rather than mtime — the filename is the authoritative record of when a transcript was taken, while mtime misjudges a file appended to late or restored from backup. Pruning runs at startup and whenever a session opens.
 
 ### Auto-join
 
@@ -190,14 +235,14 @@ Upstream ran `faster-whisper` in-process on a GPU. Moving transcription to a net
 | Dispatch | Transcription called inline in the per-frame loop, serializing every speaker behind one utterance until the audio queue overflowed and dropped frames | Per-utterance tasks bounded by a semaphore, so speakers overlap |
 | Resampling | `torchaudio` | `soxr` |
 | VAD | Silero via `torch.hub` | Silero via `onnxruntime`, model vendored in-repo |
-| Output | Logged and printed; never persisted | Per-day JSONL file, flushed per utterance |
+| Output | Logged and printed; never persisted | Per-session JSONL file, flushed per utterance |
 | Deployment | systemd unit | Container image |
 
 Removed outright: the multiprocessing layer and its queues, the STT health-check thread and its supervisor, `torch` / `torchaudio` / `faster-whisper`, the model and fallback-model settings (`STT_MODEL_ID`, `STT_DEVICE`, `STT_COMPUTE_TYPE`, `STT_BEAM_SIZE`, every `STT_FALLBACK_*`), all `*_QUEUE_MAXSIZE` tuning, `RESULT_POLL_INTERVAL`, `STT_HEALTH_CHECK_INTERVAL`, `SHUTDOWN_TIMEOUT_SECONDS`, and the systemd deployment.
 
 Kept intact because they are the non-obvious part: `stt/user_state.py`'s per-user VAD state machine with stale-speech flushing, and `audio/ring_buffer.py`'s pre-roll buffer, which is what stops the first syllable being clipped.
 
-Added: `AUTOJOIN`, `RETENTION_DAYS`, `TRANSCRIPT_DIR`, `TZ`, `WYOMING_HOST`, `WYOMING_PORT`, `MAX_CONCURRENT_TRANSCRIPTIONS`.
+Added: `AUTOJOIN`, `RETENTION_DAYS`, `TRANSCRIPT_DIR`, `TZ`, `SESSION_RESUME_SECONDS`, `WYOMING_HOST`, `WYOMING_PORT`, `MAX_CONCURRENT_TRANSCRIPTIONS`.
 
 > **Note on the vendored VAD model.** Silero v5's ONNX graph scores the current frame *together with* the trailing 64 samples of the previous one. Fed a bare 512-sample frame it does not error — it silently returns near-zero probability on unmistakable speech, and the bot transcribes nothing. `stt/vad.py` carries that context between calls, and `tests/test_vad.py` guards it with real speech; silence-based tests pass either way and will not catch a regression.
 
@@ -222,8 +267,12 @@ miss-quote/
 │   ├── wyoming_client.py      # Per-utterance Wyoming round-trip
 │   └── models/
 │       └── silero_vad.onnx    # Vendored (~2 MB)
+├── tools/
+│   ├── base.py                # What a tool is: the two optional handlers
+│   ├── registry.py            # Tool names a config file can switch on
+│   └── runner.py              # Per-server instances, dispatch, failure isolation
 ├── transcript/
-│   └── writer.py              # Daily-rollover JSONL appender + retention
+│   └── writer.py              # Per-session JSONL appender + retention
 └── utils/
     └── logging.py
 ```

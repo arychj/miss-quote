@@ -4,27 +4,46 @@
 # location with CONFIG_FILE. Read once at startup, so editing it means
 # restarting the pod. The values below are placeholders.
 
-# Servers the bot may join, by ID, each mapped to an alias.
+# Servers the bot may join, by ID. Everything about a server lives under its ID.
 #
-# The ID appears here and nowhere else: everything below keys off the alias, and
-# so do transcript directories, so renaming a server on Discord changes nothing.
-# A server that is not listed is never joined, by autojoin or by an explicit
-# !join, and an empty mapping means the bot joins nothing: recording a server it
-# should not have is not something you can take back.
-known_servers:
-  123456789012345678: first-server
-  876543210987654321: second-server
-
-# Names to record instead of the one Discord reports, per server, by user ID.
+# The ID appears here and nowhere else: transcript directories are named for the
+# alias, so renaming a server on Discord changes nothing. A server that is not
+# listed is never joined, by autojoin or by an explicit !join, and an empty
+# mapping means the bot joins nothing: recording a server it should not have is
+# not something you can take back.
 #
-# Discord nicknames are freely editable and frequently not a name at all, which
-# makes them poor labels for a transcript a summarizer will later read. The
-# mapping is per server because the same person can be known differently in two
-# places, and one server's roster should not label another's.
-user_names:
-  first-server:
-    234567890123456789: Speaker One
-    345678901234567890: Speaker Two
+# A server whose block is malformed — no alias, or not a mapping at all — is
+# dropped and reported at startup rather than crashing the pod.
+servers:
+  123456789012345678:
+    # Names the server's transcript directory. Required.
+    alias: first-server
 
-  second-server:
-    234567890123456789: Someone Else
+    # Names to record instead of the one Discord reports, by user ID.
+    #
+    # Discord nicknames are freely editable and frequently not a name at all,
+    # which makes them poor labels for a transcript a summarizer will later
+    # read. The roster is per server because the same person can be known
+    # differently in two places.
+    users:
+      234567890123456789: Speaker One
+      345678901234567890: Speaker Two
+
+    # Tools this server is elected into, by tool name.
+    #
+    # Each tool decides for itself when it runs — on every utterance, once the
+    # bot leaves the channel, or both. All this says is whether the server is
+    # opted in, and what settings the tool is handed. A tool listed without
+    # `enabled: true` is off, and a name no tool answers to is reported at
+    # startup and skipped, which is why the example below is commented out.
+    #
+    # tools:
+    #   example-tool:
+    #     enabled: true
+    #     config:
+    #       some-setting: a value
+
+  876543210987654321:
+    alias: second-server
+    users:
+      234567890123456789: Someone Else

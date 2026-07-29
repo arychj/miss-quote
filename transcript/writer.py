@@ -1,10 +1,10 @@
 """
-Daily-rollover JSONL transcript writer.
+Per-session JSONL transcript writer.
 
-One file per local calendar day per voice channel, one JSON object per
-utterance, appended and flushed as produced. The current date is re-derived per
-utterance rather than cached, so a long-running pod rolls over at midnight
-without a restart.
+One file per connection to a voice channel, one JSON object per utterance,
+appended and flushed as produced. The file is named for the moment the bot
+joined and keeps that name until it leaves, so a session spanning midnight stays
+in one file and a reconnect starts a new one.
 
 Files are filed under `<guild>/<channel>/`, so the path carries the origin of
 every utterance and the lines themselves do not have to repeat it.
@@ -27,6 +27,15 @@ logger = get_logger(__name__)
 SLUG_DISALLOWED = re.compile(r"[^a-z0-9_-]+")
 SLUG_EDGE_CHARACTERS = "-"
 SLUG_FALLBACK = "unnamed"
+
+# Distinguishes sessions that opened in the same second; the first needs none.
+SESSION_ORDINAL_SEPARATOR = "-"
+FIRST_REPEATED_SESSION = 2
+
+TIMESTAMP_FIELD = "ts"
+USER_ID_FIELD = "user_id"
+USER_FIELD = "user"
+TEXT_FIELD = "text"
 
 
 def slugify(name: str) -> str:
@@ -67,8 +76,168 @@ class Source:
         return Path(slugify(self.guild_alias), slugify(self.channel))
 
 
+@dataclass(frozen=True)
+class Utterance:
+    """One transcribed line, as written and as handed to a tool."""
+
+    timestamp: datetime
+    user_id: int
+    user: str
+    text: str
+
+    def as_line(self) -> str:
+        return json.dumps(
+            {
+                TIMESTAMP_FIELD: self.timestamp.isoformat(),
+                USER_ID_FIELD: self.user_id,
+                USER_FIELD: self.user,
+                TEXT_FIELD: self.text,
+            },
+            ensure_ascii=False,
+        )
+
+    @classmethod
+    def from_line(cls, line: str) -> "Utterance":
+        parsed = json.loads(line)
+        return cls(
+            timestamp=datetime.fromisoformat(parsed[TIMESTAMP_FIELD]),
+            user_id=int(parsed[USER_ID_FIELD]),
+            user=str(parsed[USER_FIELD]),
+            text=str(parsed[TEXT_FIELD]),
+        )
+
+
+@dataclass(frozen=True)
+class Transcript:
+    """
+    A closed session: the file it produced, and what that file covers.
+
+    Handed to tools that want a whole conversation rather than a running
+    commentary. The lines are not carried in memory — `read` parses them back
+    off disk, so a tool sees what was actually written.
+    """
+
+    path: Path
+    source: Source
+    opened: datetime
+    closed: datetime
+    utterances: int
+
+    @property
+    def duration(self) -> timedelta:
+        return self.closed - self.opened
+
+    def read(self) -> list[Utterance]:
+        """
+        Every utterance in the file, in the order it was spoken.
+
+        A line that will not parse is skipped rather than raised on: one bad
+        line should cost one utterance, not the whole transcript.
+        """
+        if not self.path.is_file():
+            return []
+
+        utterances: list[Utterance] = []
+        with self.path.open(encoding="utf-8") as handle:
+            for number, line in enumerate(handle, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    utterances.append(Utterance.from_line(line))
+                except (ValueError, KeyError, TypeError) as exc:
+                    logger.error("Skipping %s line %d: %s", self.path, number, exc)
+
+        return utterances
+
+
+class TranscriptSession:
+    """
+    One connection to one voice channel, and the file it appends to.
+
+    The file is created when the session opens rather than on the first
+    utterance, so the tree records that the bot was present even in a channel
+    where nobody spoke, and a tool never has to handle a path that is not there.
+    """
+
+    def __init__(self, path: Path, source: Source, opened: datetime, zone: ZoneInfo) -> None:
+        self._path = path
+        self._source = source
+        self._opened = opened
+        self._zone = zone
+        self._utterances = 0
+        self._suspended: datetime | None = None
+        self._closed: datetime | None = None
+
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._path.touch()
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    @property
+    def source(self) -> Source:
+        return self._source
+
+    @property
+    def opened(self) -> datetime:
+        return self._opened
+
+    @property
+    def utterances(self) -> int:
+        return self._utterances
+
+    def write(self, user_id: int, user: str, text: str) -> Utterance:
+        """Append one utterance and return it."""
+        utterance = Utterance(
+            timestamp=datetime.now(self._zone),
+            user_id=user_id,
+            user=user,
+            text=text,
+        )
+
+        with self._path.open("a", encoding="utf-8") as handle:
+            handle.write(utterance.as_line() + "\n")
+            handle.flush()
+
+        self._utterances += 1
+        return utterance
+
+    def suspend(self) -> None:
+        """
+        Note that the connection ended, without sealing the transcript.
+
+        A suspended session may still be resumed, and if it is not, it ended
+        when the connection did rather than whenever that was noticed.
+        """
+        self._suspended = datetime.now(self._zone)
+
+    def resume(self) -> None:
+        """Take a suspended session back off the clock."""
+        self._suspended = None
+
+    def close(self) -> Transcript:
+        """
+        Seal the session and describe what it produced.
+
+        Idempotent, and the end time is fixed by the first call: a session can
+        be closed by the channel emptying, by the bot being disconnected, or by
+        the pod terminating, and more than one of those can land.
+        """
+        if self._closed is None:
+            self._closed = self._suspended or datetime.now(self._zone)
+
+        return Transcript(
+            path=self._path,
+            source=self._source,
+            opened=self._opened,
+            closed=self._closed,
+            utterances=self._utterances,
+        )
+
+
 class TranscriptWriter:
-    """Appends to `<root>/<guild>/<channel>/<YYYY-MM-DD>.jsonl`, pruning by age."""
+    """Opens sessions under `<root>/<guild>/<channel>/`, pruning by age."""
 
     def __init__(
         self,
@@ -81,7 +250,6 @@ class TranscriptWriter:
         self._retention_days = (
             transcript_cfg.retention_days if retention_days is None else retention_days
         )
-        self._current_date: date | None = None
 
         self._directory.mkdir(parents=True, exist_ok=True)
         self.prune()
@@ -90,36 +258,30 @@ class TranscriptWriter:
     def retention_enabled(self) -> bool:
         return self._retention_days >= 1
 
-    def write(self, source: Source, user_id: int, user: str, text: str) -> Path:
-        """Append one utterance and return the file it landed in."""
-        now = datetime.now(self._zone)
-        self._roll_over(now.date())
+    def open(self, source: Source) -> TranscriptSession:
+        """
+        Start a session for a channel the bot has just joined.
 
-        line = json.dumps(
-            {
-                "ts": now.isoformat(),
-                "user_id": user_id,
-                "user": user,
-                "text": text,
-            },
-            ensure_ascii=False,
+        Pruning runs here. Sessions are the only recurring event the writer sees
+        now that files no longer roll over on a date, and a bot that joins
+        nothing for a week has nothing worth pruning anyway.
+        """
+        self.prune()
+
+        opened = datetime.now(self._zone)
+        return TranscriptSession(
+            path=self._path_for(source, opened),
+            source=source,
+            opened=opened,
+            zone=self._zone,
         )
-
-        path = self._path_for(source, now.date())
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(line + "\n")
-            handle.flush()
-
-        return path
 
     def prune(self) -> list[Path]:
         """
         Delete transcripts older than the retention window.
 
-        Age comes from the filename date, not mtime: the filename is the
-        authoritative record of the day a transcript covers, while mtime
+        Age comes from the filename, not mtime: the filename is the
+        authoritative record of when a transcript was taken, while mtime
         misjudges a file appended to late or restored from backup.
         """
         if not self.retention_enabled:
@@ -148,32 +310,45 @@ class TranscriptWriter:
 
         return removed
 
-    def _roll_over(self, today: date) -> None:
-        if today == self._current_date:
-            return
+    def _path_for(self, source: Source, opened: datetime) -> Path:
+        """
+        A name for a session, distinct from every session already filed.
 
-        previous = self._current_date
-        self._current_date = today
+        Names have one-second resolution and say nothing about which channel
+        they came from, so two sessions can want the same one: two channels
+        whose names reduce to the same slug, or two servers sharing an alias,
+        opening within a second of each other. Without the ordinal the second
+        would append to the first, and a tool handed that transcript would read
+        an unrelated conversation as part of its own.
 
-        if previous is None:
-            return
+        Rejoining one channel does not reach here — an open session is reused by
+        channel, whether or not the connection to it dropped.
+        """
+        directory = self._directory / source.relative_directory
+        stem = opened.strftime(transcript_cfg.filename_timestamp_format)
 
-        logger.info("Transcript rolled over from %s to %s.", previous, today)
-        self.prune()
+        path = directory / f"{stem}{transcript_cfg.filename_suffix}"
+        ordinal = FIRST_REPEATED_SESSION
 
-    def _path_for(self, source: Source, day: date) -> Path:
-        name = day.strftime(transcript_cfg.filename_date_format)
-        return (
-            self._directory
-            / source.relative_directory
-            / f"{name}{transcript_cfg.filename_suffix}"
-        )
+        while path.exists():
+            name = f"{stem}{SESSION_ORDINAL_SEPARATOR}{ordinal}"
+            path = directory / f"{name}{transcript_cfg.filename_suffix}"
+            ordinal += 1
+
+        return path
 
     @staticmethod
     def _date_from_filename(path: Path) -> date | None:
+        """
+        The day a transcript was taken, from the front of its name.
+
+        Only the date prefix is parsed, so an ordinal on the end of a name does
+        not exempt that session from retention.
+        """
         try:
             return datetime.strptime(
-                path.stem, transcript_cfg.filename_date_format
+                path.stem[: transcript_cfg.filename_date_length],
+                transcript_cfg.filename_date_format,
             ).date()
         except ValueError:
             return None

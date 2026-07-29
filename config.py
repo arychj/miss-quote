@@ -5,9 +5,10 @@ Groups settings into logical dataclasses with environment variable loading and v
 """
 
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping, Optional
+from typing import Any
 
 import yaml
 from dotenv import load_dotenv
@@ -161,12 +162,29 @@ class TranscriptConfig:
     # so a mis-set variable cannot destroy the archive.
     retention_days: int = field(default_factory=lambda: _env_int("RETENTION_DAYS", -1))
 
-    filename_date_format: str = "%Y-%m-%d"
+    # How long a channel may sit empty before its transcript is sealed. A
+    # channel that refills inside the window is one conversation with a gap in
+    # it, not two. Zero seals on disconnect.
+    resume_window_seconds: float = field(
+        default_factory=lambda: _env_float("SESSION_RESUME_SECONDS", 5.0)
+    )
+
+    # One file per connection, named for the moment the bot joined. Colons are
+    # legal in the name on POSIX but travel badly, so the time is dash-separated.
+    filename_timestamp_format: str = "%Y-%m-%dT%H-%M-%S"
     filename_suffix: str = ".jsonl"
+
+    # Retention needs only the day, and reads it off the front of the name.
+    filename_date_format: str = "%Y-%m-%d"
+    filename_date_length: int = len("YYYY-MM-DD")
 
     @property
     def retention_enabled(self) -> bool:
         return self.retention_days >= 1
+
+    @property
+    def resume_enabled(self) -> bool:
+        return self.resume_window_seconds > 0
 
 
 # ──────────────────────────────────────────────
@@ -200,8 +218,127 @@ class LogConfig:
 # ──────────────────────────────────────────────
 CONFIG_FILE_ENV = "CONFIG_FILE"
 DEFAULT_CONFIG_FILE = "/config/config.yaml"
-KNOWN_SERVERS_KEY = "known_servers"
-USER_NAMES_KEY = "user_names"
+
+SERVERS_KEY = "servers"
+ALIAS_KEY = "alias"
+USERS_KEY = "users"
+TOOLS_KEY = "tools"
+TOOL_ENABLED_KEY = "enabled"
+TOOL_CONFIG_KEY = "config"
+
+# A tool listed without saying so is off. Enabling one is a decision, and it
+# should have to be written down.
+TOOL_ENABLED_BY_DEFAULT = False
+
+
+@dataclass(frozen=True)
+class ToolSettings:
+    """One server's election into one tool."""
+
+    enabled: bool
+    config: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class ServerConfig:
+    """Everything configured about one server, under its ID."""
+
+    alias: str
+    users: Mapping[int, str]
+    tools: Mapping[str, ToolSettings]
+
+
+def _parse_users(
+    server_id: int, raw: Any, problems: list[str]
+) -> Mapping[int, str]:
+    if not raw:
+        return {}
+
+    if not isinstance(raw, Mapping):
+        problems.append(f"Server {server_id}: '{USERS_KEY}' is not a mapping; ignoring it.")
+        return {}
+
+    users: dict[int, str] = {}
+    for user, name in raw.items():
+        try:
+            users[int(user)] = str(name)
+        except (TypeError, ValueError):
+            problems.append(
+                f"Server {server_id}: '{user}' is not a user ID; ignoring that name."
+            )
+
+    return users
+
+
+def _parse_tools(
+    server_id: int, raw: Any, problems: list[str]
+) -> Mapping[str, ToolSettings]:
+    if not raw:
+        return {}
+
+    if not isinstance(raw, Mapping):
+        problems.append(f"Server {server_id}: '{TOOLS_KEY}' is not a mapping; ignoring it.")
+        return {}
+
+    tools: dict[str, ToolSettings] = {}
+    for name, settings in raw.items():
+        if settings is None:
+            settings = {}
+
+        if not isinstance(settings, Mapping):
+            problems.append(
+                f"Server {server_id}: tool '{name}' is not a mapping; ignoring it."
+            )
+            continue
+
+        config = settings.get(TOOL_CONFIG_KEY) or {}
+        if not isinstance(config, Mapping):
+            problems.append(
+                f"Server {server_id}: tool '{name}' has a '{TOOL_CONFIG_KEY}' that is "
+                "not a mapping; treating it as empty."
+            )
+            config = {}
+
+        tools[str(name)] = ToolSettings(
+            enabled=bool(settings.get(TOOL_ENABLED_KEY, TOOL_ENABLED_BY_DEFAULT)),
+            config=dict(config),
+        )
+
+    return tools
+
+
+def _parse_server(
+    key: Any, settings: Any, problems: list[str]
+) -> tuple[int, ServerConfig] | None:
+    """
+    Read one server's block, or reject it.
+
+    A malformed entry is dropped rather than raised on: the bot then joins one
+    fewer server, which is visible in the startup report and recoverable. The
+    alternative is a crash-looping pod over a typo.
+    """
+    try:
+        server_id = int(key)
+    except (TypeError, ValueError):
+        problems.append(f"'{key}' is not a server ID; ignoring that entry.")
+        return None
+
+    if not isinstance(settings, Mapping):
+        problems.append(
+            f"Server {server_id}: expected a mapping with an '{ALIAS_KEY}'; not joining it."
+        )
+        return None
+
+    alias = settings.get(ALIAS_KEY)
+    if not isinstance(alias, str) or not alias.strip():
+        problems.append(f"Server {server_id}: no '{ALIAS_KEY}'; not joining it.")
+        return None
+
+    return server_id, ServerConfig(
+        alias=alias.strip(),
+        users=_parse_users(server_id, settings.get(USERS_KEY), problems),
+        tools=_parse_tools(server_id, settings.get(TOOLS_KEY), problems),
+    )
 
 
 @dataclass(frozen=True)
@@ -213,15 +350,18 @@ class FileConfig:
     variables. Read once at startup, so changing the file means restarting the
     pod.
 
-    Servers are identified by ID once, in `known_servers`, and by a stable alias
-    everywhere else. The alias is what the rest of the file keys against and
-    what appears in transcript paths, so renaming a server on Discord changes
-    nothing here.
+    Servers are identified by ID once, as the key in `servers`, and by a stable
+    alias everywhere else. The alias is what transcript paths are named for, so
+    renaming a server on Discord changes nothing here.
+
+    Parsing reports rather than raises: `utils.logging` imports this module, so
+    nothing here can log. Complaints accumulate in `problems` for the bot to
+    report once it has a logger.
     """
 
     path: Path
-    known_servers: Mapping[int, str]
-    user_names: Mapping[str, Mapping[int, str]]
+    servers: Mapping[int, ServerConfig]
+    problems: tuple[str, ...]
     found: bool
 
     @classmethod
@@ -229,20 +369,23 @@ class FileConfig:
         path = Path(_env_str(CONFIG_FILE_ENV, DEFAULT_CONFIG_FILE))
 
         if not path.is_file():
-            return cls(path=path, known_servers={}, user_names={}, found=False)
+            return cls(path=path, servers={}, problems=(), found=False)
 
         raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
 
+        servers: dict[int, ServerConfig] = {}
+        problems: list[str] = []
+
+        for key, settings in (raw.get(SERVERS_KEY) or {}).items():
+            parsed = _parse_server(key, settings, problems)
+            if parsed is not None:
+                server_id, server = parsed
+                servers[server_id] = server
+
         return cls(
             path=path,
-            known_servers={
-                int(server): str(alias)
-                for server, alias in (raw.get(KNOWN_SERVERS_KEY) or {}).items()
-            },
-            user_names={
-                str(alias): {int(user): str(name) for user, name in (names or {}).items()}
-                for alias, names in (raw.get(USER_NAMES_KEY) or {}).items()
-            },
+            servers=servers,
+            problems=tuple(problems),
             found=True,
         )
 
@@ -250,15 +393,16 @@ class FileConfig:
         """
         Whether the bot may join a server.
 
-        A server absent from `known_servers` is never joined, so an empty or
-        missing file means the bot joins nothing. Recording the wrong server is
-        not recoverable; joining none is.
+        A server absent from `servers` is never joined, so an empty or missing
+        file means the bot joins nothing. Recording the wrong server is not
+        recoverable; joining none is.
         """
-        return server_id in self.known_servers
+        return server_id in self.servers
 
-    def alias_for(self, server_id: int) -> Optional[str]:
+    def alias_for(self, server_id: int) -> str | None:
         """The configured alias for a server, or None if it is not known."""
-        return self.known_servers.get(server_id)
+        server = self.servers.get(server_id)
+        return None if server is None else server.alias
 
     def name_for(self, server_id: int, user_id: int, reported: str) -> str:
         """
@@ -267,11 +411,16 @@ class FileConfig:
         Names are per server: the same person can be known differently in two
         places, and one server's roster should not label another's.
         """
-        alias = self.alias_for(server_id)
-        if alias is None:
+        server = self.servers.get(server_id)
+        if server is None:
             return reported
 
-        return self.user_names.get(alias, {}).get(user_id, reported)
+        return server.users.get(user_id, reported)
+
+    def tools_for(self, server_id: int) -> Mapping[str, ToolSettings]:
+        """Every tool named for a server, enabled or not."""
+        server = self.servers.get(server_id)
+        return {} if server is None else server.tools
 
 
 # ──────────────────────────────────────────────

@@ -6,7 +6,8 @@ import pytest
 import stt.processor as processor_module
 from config import vad_cfg
 from stt.processor import STTProcessor
-from transcript.writer import Source, TranscriptWriter
+from tools.runner import ToolRunner
+from transcript.writer import Source, TranscriptSession, TranscriptWriter
 
 TIMEZONE = "America/Los_Angeles"
 KEEP_FOREVER = -1
@@ -72,14 +73,15 @@ async def build(monkeypatch, tmp_path, transcripts):
     monkeypatch.setattr(processor_module, "SileroVAD", ScriptedVAD)
     started: list[STTProcessor] = []
 
-    def _build() -> tuple[STTProcessor, TranscriptWriter]:
+    def _build(tools: ToolRunner | None = None) -> tuple[STTProcessor, TranscriptSession]:
         writer = TranscriptWriter(
             directory=tmp_path, timezone=TIMEZONE, retention_days=KEEP_FOREVER
         )
-        processor = STTProcessor(writer)
+        session = writer.open(SOURCE)
+        processor = STTProcessor(tools or ToolRunner({}, {}))
         processor.start(asyncio.get_running_loop())
         started.append(processor)
-        return processor, writer
+        return processor, session
 
     yield _build
 
@@ -87,9 +89,14 @@ async def build(monkeypatch, tmp_path, transcripts):
         await processor.stop()
 
 
-def _speak(processor: STTProcessor, speaker: tuple[int, str], frames: int) -> None:
+def _speak(
+    processor: STTProcessor,
+    session: TranscriptSession,
+    speaker: tuple[int, str],
+    frames: int,
+) -> None:
     user_id, name = speaker
-    processor._feed(user_id, name, SOURCE, b"\x00" * (vad_cfg.frame_bytes * frames))
+    processor._feed(user_id, name, session, b"\x00" * (vad_cfg.frame_bytes * frames))
 
 
 def _trigger(processor: STTProcessor, speaker: tuple[int, str], on: bool) -> None:
@@ -105,14 +112,14 @@ def _lines(tmp_path) -> list[dict]:
 
 
 async def test_utterance_reaches_the_transcript(build, tmp_path, transcripts):
-    processor, _ = build()
+    processor, session = build()
     calls, _ = transcripts
 
     _trigger(processor, ALICE, on=True)
-    _speak(processor, ALICE, frames=4)
+    _speak(processor, session, ALICE, frames=4)
 
     _trigger(processor, ALICE, on=False)
-    _speak(processor, ALICE, frames=1)
+    _speak(processor, session, ALICE, frames=1)
 
     await processor.drain()
 
@@ -133,17 +140,17 @@ async def test_utterance_reaches_the_transcript(build, tmp_path, transcripts):
 
 async def test_pre_roll_is_prepended_on_speech_onset(build, transcripts):
     """Silence frames buffered before onset must lead the utterance."""
-    processor, _ = build()
+    processor, session = build()
     calls, _ = transcripts
 
     _trigger(processor, ALICE, on=False)
-    _speak(processor, ALICE, frames=3)  # accumulates in the ring buffer
+    _speak(processor, session, ALICE, frames=3)  # accumulates in the ring buffer
 
     _trigger(processor, ALICE, on=True)
-    _speak(processor, ALICE, frames=2)
+    _speak(processor, session, ALICE, frames=2)
 
     _trigger(processor, ALICE, on=False)
-    _speak(processor, ALICE, frames=1)
+    _speak(processor, session, ALICE, frames=1)
 
     await processor.drain()
 
@@ -154,7 +161,7 @@ async def test_pre_roll_is_prepended_on_speech_onset(build, transcripts):
 
 async def test_speakers_do_not_block_one_another(build, tmp_path, monkeypatch):
     """Two utterances in flight must overlap rather than serialize."""
-    processor, _ = build()
+    processor, session = build()
     concurrent = 0
     peak = 0
 
@@ -170,9 +177,9 @@ async def test_speakers_do_not_block_one_another(build, tmp_path, monkeypatch):
 
     for speaker in (ALICE, BOB):
         _trigger(processor, speaker, on=True)
-        _speak(processor, speaker, frames=4)
+        _speak(processor, session, speaker, frames=4)
         _trigger(processor, speaker, on=False)
-        _speak(processor, speaker, frames=1)
+        _speak(processor, session, speaker, frames=1)
 
     await processor.drain()
 
@@ -181,7 +188,7 @@ async def test_speakers_do_not_block_one_another(build, tmp_path, monkeypatch):
 
 
 async def test_concurrency_is_bounded_by_the_semaphore(build, monkeypatch):
-    processor, _ = build()
+    processor, session = build()
     limit = processor._semaphore._value
     concurrent = 0
     peak = 0
@@ -199,9 +206,9 @@ async def test_concurrency_is_bounded_by_the_semaphore(build, monkeypatch):
     for index in range(limit * 3):
         speaker = (1000 + index, f"speaker{index}")
         _trigger(processor, speaker, on=True)
-        _speak(processor, speaker, frames=2)
+        _speak(processor, session, speaker, frames=2)
         _trigger(processor, speaker, on=False)
-        _speak(processor, speaker, frames=1)
+        _speak(processor, session, speaker, frames=1)
 
     await processor.drain()
 
@@ -209,14 +216,14 @@ async def test_concurrency_is_bounded_by_the_semaphore(build, monkeypatch):
 
 
 async def test_empty_transcript_writes_nothing(build, tmp_path, transcripts):
-    processor, _ = build()
+    processor, session = build()
     _, replies = transcripts
     replies["text"] = ""
 
     _trigger(processor, ALICE, on=True)
-    _speak(processor, ALICE, frames=4)
+    _speak(processor, session, ALICE, frames=4)
     _trigger(processor, ALICE, on=False)
-    _speak(processor, ALICE, frames=1)
+    _speak(processor, session, ALICE, frames=1)
 
     await processor.drain()
 
@@ -228,11 +235,11 @@ async def test_forced_flush_resets_the_vad(build, transcripts):
     A flush interrupts the VAD mid-utterance; leaving it triggered would make
     the next onset skip its pre-roll.
     """
-    processor, _ = build()
+    processor, session = build()
     calls, _ = transcripts
 
     _trigger(processor, ALICE, on=True)
-    _speak(processor, ALICE, frames=4)
+    _speak(processor, session, ALICE, frames=4)
 
     processor.flush_user(ALICE[0], "user left channel")
     await processor.drain()
@@ -241,11 +248,82 @@ async def test_forced_flush_resets_the_vad(build, transcripts):
     assert processor._users.active_count == 0
 
 
-async def test_stop_flushes_buffered_speech(build, tmp_path, transcripts):
-    processor, _ = build()
+async def test_a_written_utterance_reaches_the_tools(build, tmp_path, transcripts):
+    """A tool that reads the file rather than the utterance must see the same thing."""
+    from config import ServerConfig, ToolSettings
+    from tools.base import Tool
+
+    seen = []
+
+    class Watcher(Tool):
+        name = "watcher"
+
+        async def handle_utterance(self, utterance, session) -> None:
+            seen.append((utterance.text, session.path.read_text().count("\n")))
+
+    tools = ToolRunner(
+        {
+            SOURCE.guild_id: ServerConfig(
+                alias=SOURCE.guild_alias,
+                users={},
+                tools={"watcher": ToolSettings(enabled=True, config={})},
+            )
+        },
+        {"watcher": Watcher},
+    )
+    processor, session = build(tools)
 
     _trigger(processor, ALICE, on=True)
-    _speak(processor, ALICE, frames=4)
+    _speak(processor, session, ALICE, frames=4)
+    _trigger(processor, ALICE, on=False)
+    _speak(processor, session, ALICE, frames=1)
+
+    await processor.drain()
+
+    assert seen == [("hello there", 1)]
+
+
+async def test_an_empty_transcription_reaches_no_tool(build, tmp_path, transcripts):
+    from config import ServerConfig, ToolSettings
+    from tools.base import Tool
+
+    seen = []
+
+    class Watcher(Tool):
+        name = "watcher"
+
+        async def handle_utterance(self, utterance, session) -> None:
+            seen.append(utterance)
+
+    tools = ToolRunner(
+        {
+            SOURCE.guild_id: ServerConfig(
+                alias=SOURCE.guild_alias,
+                users={},
+                tools={"watcher": ToolSettings(enabled=True, config={})},
+            )
+        },
+        {"watcher": Watcher},
+    )
+    processor, session = build(tools)
+    _, replies = transcripts
+    replies["text"] = ""
+
+    _trigger(processor, ALICE, on=True)
+    _speak(processor, session, ALICE, frames=4)
+    _trigger(processor, ALICE, on=False)
+    _speak(processor, session, ALICE, frames=1)
+
+    await processor.drain()
+
+    assert seen == []
+
+
+async def test_stop_flushes_buffered_speech(build, tmp_path, transcripts):
+    processor, session = build()
+
+    _trigger(processor, ALICE, on=True)
+    _speak(processor, session, ALICE, frames=4)
 
     await processor.stop()
 
