@@ -22,7 +22,8 @@ from typing import Any
 
 import discord
 
-from config import audio_cfg, tts_cfg
+from audio.gain import scaled
+from config import UNITY_VOLUME, audio_cfg, tts_cfg
 from transcript.writer import Source
 from utils.logging import get_logger
 
@@ -40,10 +41,14 @@ class PCMStream(discord.AudioSource):
     of a frame, which is the point: returning early would be read as the end of
     the clip. The block is bounded, so a synthesizer that stalls costs the tail
     of one announcement rather than a thread and a voice connection.
+
+    Volume is applied as audio is fed rather than as it is read, so the buffer
+    holds what will be played and framing stays framing.
     """
 
-    def __init__(self, stall_seconds: float) -> None:
+    def __init__(self, stall_seconds: float, volume: float = UNITY_VOLUME) -> None:
         self._stall_seconds = stall_seconds
+        self._volume = volume
         self._buffer = bytearray()
         self._lock = threading.Lock()
         self._fed = threading.Event()
@@ -54,8 +59,10 @@ class PCMStream(discord.AudioSource):
         return False
 
     def feed(self, pcm: bytes) -> None:
+        quietened = scaled(pcm, self._volume)
+
         with self._lock:
-            self._buffer.extend(pcm)
+            self._buffer.extend(quietened)
         self._fed.set()
 
     def finish(self) -> None:
@@ -168,7 +175,7 @@ class DiscordSpeaker:
     async def _play(
         voice_client: discord.VoiceClient, audio: AsyncIterator[bytes]
     ) -> None:
-        stream = PCMStream(tts_cfg.stall_seconds)
+        stream = PCMStream(tts_cfg.stall_seconds, audio_cfg.playback_volume)
         finished = asyncio.Event()
         loop = asyncio.get_running_loop()
 

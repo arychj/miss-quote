@@ -21,6 +21,12 @@ FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 BYTES_PER_INT16_SAMPLE = 2
 MILLISECONDS_PER_SECOND = 1000
 
+# Playback at whatever loudness the audio was authored or synthesized at, and
+# the quietest a scale can ask for. Below silence a factor inverts the waveform
+# rather than lowering it, which is not what anybody setting a volume meant.
+UNITY_VOLUME = 1.0
+SILENT_VOLUME = 0.0
+
 
 def _env_str(name: str, default: str) -> str:
     value = os.getenv(name)
@@ -77,7 +83,7 @@ class DiscordConfig:
 # ──────────────────────────────────────────────
 @dataclass(frozen=True)
 class AudioConfig:
-    """Audio format constants for the Discord → ASR pipeline."""
+    """Audio format for the Discord → ASR pipeline, and back out again."""
     input_sample_rate: int = 48_000   # Discord Opus decoded PCM
     input_channels: int = 2           # Stereo
     output_sample_rate: int = 16_000  # Silero and Wyoming both expect this
@@ -87,6 +93,16 @@ class AudioConfig:
     # Discord's player reads one frame per tick and stops on anything short of a
     # full one, so playback is framed rather than streamed byte by byte.
     playback_frame_ms: int = 20
+
+    # What a clip is scaled by on its way to the player, where 1.0 is however
+    # loud the synthesizer rendered it: 0.8 is 20% quieter, 1.2 is 20% louder
+    # and clipped rather than wrapped. Floored at silence, since a negative
+    # factor inverts a waveform instead of quietening it.
+    playback_volume: float = field(
+        default_factory=lambda: max(
+            SILENT_VOLUME, _env_float("PLAYBACK_VOLUME", UNITY_VOLUME)
+        )
+    )
 
     @property
     def playback_sample_rate(self) -> int:
