@@ -19,6 +19,32 @@ def test_config_reads_environment_values(monkeypatch) -> None:
     assert reloaded.stt_cfg.host == "asr.internal"
 
 
+def test_the_head_start_is_measured_in_playback_bytes(monkeypatch) -> None:
+    """A duration is the only sane unit to configure; the player wants bytes."""
+    monkeypatch.setenv("TTS_LEAD_MS", "500")
+
+    import config
+
+    reloaded = importlib.reload(config)
+    playback = reloaded.audio_cfg
+    half_a_second = (
+        playback.playback_sample_rate
+        * playback.playback_channels
+        * playback.sample_width
+        // 2
+    )
+
+    assert reloaded.tts_cfg.lead_bytes == half_a_second
+
+
+def test_no_head_start_waits_for_nothing(monkeypatch) -> None:
+    monkeypatch.setenv("TTS_LEAD_MS", "0")
+
+    import config
+
+    assert importlib.reload(config).tts_cfg.lead_bytes == 0
+
+
 def test_invalid_integer_config_fails_fast(monkeypatch) -> None:
     import config
 

@@ -20,6 +20,7 @@ import re
 from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Any
 
+from config import tts_cfg
 from tools.base import Speaker, Tool
 from transcript.writer import TranscriptSession, Utterance
 from tts.cache import shared_cache
@@ -43,6 +44,8 @@ CREDITS_FIELD = "credits"
 VIOLATIONS_FIELD = "violations"
 
 FIELD_SEPARATOR = ", "
+
+NO_AUDIO = b""
 
 # Matching on whole words only. A substring match fines the innocent, and the
 # canonical example — Scunthorpe — is a place people live.
@@ -154,14 +157,48 @@ class VerbalMorality(Tool):
         Two calls to the speaker would play in order — it holds one lock per
         server — but each arms the player afresh, and the gap between them is
         audible. Chaining them puts the chime in front of the same stream.
-        """
-        if self._chime is not None:
-            chime = await self._speech.clip(self._chime)
-            if chime:
-                yield chime
 
-        async for chunk in self._speech.stream(announcement):
+        The words are given a head start before the chime is handed over. A
+        synthesizer is free to render a phrase whole before sending any of it,
+        and the chime is short; starting it the moment it is read would leave
+        the player waiting between the flourish and the sentence it introduces.
+        Waiting first spends that time before anything is playing.
+        """
+        chime = await self._speech.clip(self._chime) if self._chime else NO_AUDIO
+        words = self._speech.stream(announcement)
+        lead = await _lead(words, tts_cfg.lead_bytes)
+
+        if chime:
+            yield chime
+
+        for chunk in lead:
             yield chunk
+
+        async for chunk in words:
+            yield chunk
+
+
+async def _lead(speech: AsyncIterator[bytes], wanted: int) -> list[bytes]:
+    """
+    Pull from a stream until it has given up `wanted` bytes or run out.
+
+    The chunks are handed back rather than joined, so nothing is copied and a
+    short phrase that ends inside the head start is not padded out to it. The
+    stream is left where it stopped for the caller to finish draining.
+    """
+    if wanted <= 0:
+        return []
+
+    lead: list[bytes] = []
+    held = 0
+
+    async for chunk in speech:
+        lead.append(chunk)
+        held += len(chunk)
+        if held >= wanted:
+            break
+
+    return lead
 
 
 def _vocabulary(words: Any) -> tuple[str, ...]:
