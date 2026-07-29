@@ -16,6 +16,7 @@ from tts.client import Speech, SynthesisError
 
 PHRASE = "you are fined one credit"
 OTHER_PHRASE = "and another one"
+THIRD_PHRASE = "and one more"
 
 SOURCE_RATE = 24_000
 SOURCE_SECONDS = 0.5
@@ -134,7 +135,7 @@ async def test_a_different_phrase_is_synthesized(synthesizer, tmp_path):
     assert synthesizer.calls == [PHRASE, OTHER_PHRASE]
 
 
-async def test_the_oldest_clip_is_retired_when_memory_is_full(synthesizer, tmp_path):
+async def test_a_clip_is_retired_when_memory_is_full(synthesizer, tmp_path):
     """A display name is not a closed set, so the cache has to have a ceiling."""
     cache = SpeechCache(directory=tmp_path, entries=KEEP_TWO)
 
@@ -142,6 +143,32 @@ async def test_the_oldest_clip_is_retired_when_memory_is_full(synthesizer, tmp_p
         await _collect(cache, phrase)
 
     assert len(cache._memory) == KEEP_TWO
+
+
+async def test_the_least_recently_used_clip_is_retired(synthesizer, tmp_path):
+    """A phrase still being said should outlive one rendered after it."""
+    cache = SpeechCache(directory=tmp_path, entries=KEEP_TWO)
+
+    await _collect(cache, PHRASE)
+    await _collect(cache, OTHER_PHRASE)
+    await _collect(cache, PHRASE)
+    await _collect(cache, THIRD_PHRASE)
+
+    assert cache._key(PHRASE) in cache._memory
+    assert cache._key(OTHER_PHRASE) not in cache._memory
+
+
+async def test_a_clip_read_off_disk_is_held_as_the_newest(synthesizer, tmp_path):
+    """It was just asked for, whatever the last process left in what order."""
+    await _collect(SpeechCache(directory=tmp_path), PHRASE)
+    cache = SpeechCache(directory=tmp_path, entries=KEEP_TWO)
+
+    await _collect(cache, OTHER_PHRASE)
+    await _collect(cache, PHRASE)
+    await _collect(cache, THIRD_PHRASE)
+
+    assert cache._key(PHRASE) in cache._memory
+    assert cache._key(OTHER_PHRASE) not in cache._memory
 
 
 # ── disk ──────────────────────────────────────────
@@ -320,6 +347,18 @@ async def test_warming_twice_synthesizes_once(synthesizer, tmp_path):
     await cache.warm(PHRASE)
 
     assert synthesizer.calls == [PHRASE]
+
+
+async def test_warming_does_not_promote_a_clip_it_finds_held(synthesizer, tmp_path):
+    """A warm-up renders the whole roster; which name came first means nothing."""
+    cache = SpeechCache(directory=tmp_path, entries=KEEP_TWO)
+    await _collect(cache, PHRASE)
+    await _collect(cache, OTHER_PHRASE)
+
+    await cache.warm(PHRASE)
+    await _collect(cache, THIRD_PHRASE)
+
+    assert cache._key(PHRASE) not in cache._memory
 
 
 async def test_warming_with_nowhere_to_keep_it_synthesizes_nothing(

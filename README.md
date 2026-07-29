@@ -242,9 +242,9 @@ Synthesis is a second Wyoming server (`TTS_HOST`, `TTS_PORT`) — recognition an
 
 The first hit after a restart pays one resample and nothing else. Mount a volume at `TTS_CACHE_DIR` to keep clips across restarts; an unwritable or absent directory costs the persistence, not the feature. Writes go through a temporary file and a rename, because a process killed mid-write would otherwise cache a truncated clip forever, and a clip is only stored once the synthesizer says it is whole — a failure partway through plays what arrived and stores nothing.
 
-The memory layer is bounded (`TTS_CACHE_ENTRIES`) because what gets synthesized can include a Discord display name, and those are not a closed set.
+The memory layer is bounded (`TTS_CACHE_ENTRIES`) because what gets synthesized can include a Discord display name, and those are not a closed set. What goes when it is full is the **least recently used** clip, not the oldest: entries do not arrive one at a time, since a whole roster is rendered at startup in no order that means anything, and evicting by arrival would retire whoever happened to be warmed first however much they talk. That puts the memory layer on the same footing as the disk layer, which ages by use for the same reason.
 
-**A phrase can be rendered before it is needed.** A tool that can work out at startup what it will have to say later warms the cache with it from `prewarm`, and a phrase already in either layer costs nothing to warm. A warmed clip is deliberately **not** treated as a played one: it is not touched on the way past, so what nobody ever earns ages out of the directory like anything else nobody plays. With no memory layer and no usable directory there is nowhere to put the result, and warming does nothing rather than paying a synthesizer for audio nobody will ever be served.
+**A phrase can be rendered before it is needed.** A tool that can work out at startup what it will have to say later warms the cache with it from `prewarm`, and a phrase already in either layer costs nothing to warm. A warmed clip is deliberately **not** treated as a played one: a phrase already held is left exactly as found, neither touched on disk nor moved to the back of the memory queue, so what nobody ever earns ages out of both layers like anything else nobody plays. With no memory layer and no usable directory there is nowhere to put the result, and warming does nothing rather than paying a synthesizer for audio nobody will ever be served.
 
 **The disk layer is reaped at startup** (`TTS_CACHE_RETENTION_DAYS`, 90 by default). The directory otherwise only grows: a display name goes into the key, so everyone who has ever been announced leaves a file behind, and none of them is ever asked for again once they leave the server. Age is the **mtime**, not the filename, and every hit touches the file — including one served out of memory, which never opens it — so what is still in use stays however old it is and only what nothing plays ages out. A reaped phrase costs one synthesis the next time it is said.
 
@@ -286,7 +286,7 @@ Only used by tools that answer out loud. A deployment with no such tool enabled 
 | `TTS_STALL_SECONDS` | `10.0` | How long the player waits mid-clip for audio that never comes before ending it |
 | `TTS_LEAD_MS` | `500.0` | How much speech to have in hand before a clip starts playing, so a synthesizer that renders a phrase whole leaves no gap behind a chime. `0` starts on the first chunk |
 | `TTS_CACHE_DIR` | `/cache/tts` | Rendered speech. Mount a volume here to keep it across restarts |
-| `TTS_CACHE_ENTRIES` | `256` | Clips held in memory before the oldest is retired |
+| `TTS_CACHE_ENTRIES` | `256` | Clips held in memory before the least recently used is retired |
 | `TTS_CACHE_RETENTION_DAYS` | `90` | Days a rendered clip survives on disk without being played, counted from the last time it was. Any value below `1` keeps them forever; clips left there by hand are never reaped |
 
 ### Transcripts

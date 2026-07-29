@@ -98,7 +98,7 @@ class SpeechCache:
         """
         key = self._key(text)
 
-        remembered = self._memory.get(key)
+        remembered = self._recall(key)
         if remembered is not None:
             await self._touch(key)
             yield remembered
@@ -122,9 +122,11 @@ class SpeechCache:
         Reports whether it had to be synthesized, for a caller counting how much
         work warming turned out to be.
 
-        A phrase already in memory or on disk is left alone, and deliberately
-        not touched on the way past: warmed is not the same as wanted, and a
-        phrase nobody ever earns should still age out of the directory.
+        A phrase already held is left exactly as it was found: not touched on
+        disk, and not recalled in memory, so warming moves nothing to the back
+        of the queue. Warmed is not the same as wanted — a warm-up renders
+        whatever it can think of, in an order that means nothing — and a phrase
+        nobody ever earns should age out of both layers on the usual terms.
         """
         # Nowhere to keep it makes this a synthesis nobody will ever be served.
         if not tts_cfg.caching_enabled and self._directory is None:
@@ -266,14 +268,29 @@ class SpeechCache:
 
     # ── memory ────────────────────────────────────
 
-    def _remember(self, key: str, playback: bytes) -> None:
+    def _recall(self, key: str) -> bytes | None:
         """
-        Hold a clip, retiring the oldest once the cache is full.
+        A held clip, moved to the back of the queue for having been wanted.
 
-        Insertion order is eviction order. There is no recency to exploit here:
-        the entries are one phrase per speaker, and a speaker who has gone quiet
-        is not coming back sooner than one who has not.
+        Which is what makes the bound least-recently-used rather than
+        first-in-first-out, and it matters because the entries do not arrive one
+        at a time: a whole roster is rendered at startup, in no order that means
+        anything, and a cache evicting by arrival would retire whoever happened
+        to be warmed first however much they talk. Ordinary dictionary order
+        does the bookkeeping, so a hit costs one pop and one insert.
+
+        Aging the memory layer by use also puts it on the same footing as the
+        disk layer, which `_touch` ages by mtime for the same reason.
         """
+        playback = self._memory.pop(key, None)
+        if playback is None:
+            return None
+
+        self._memory[key] = playback
+        return playback
+
+    def _remember(self, key: str, playback: bytes) -> None:
+        """Hold a clip, retiring the least recently used once the cache is full."""
         if not tts_cfg.caching_enabled:
             return
 
