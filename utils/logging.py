@@ -30,8 +30,19 @@ def _configure_root() -> None:
         )
         root.addHandler(handler)
 
-    # Suppress noisy third-party loggers
-    for noisy in ("urllib3", "websockets", "discord.gateway", "discord.client"):
+    # Suppress noisy third-party loggers. The two voice_recv loggers report
+    # traffic they went on to handle correctly — an RTCP sender report, which is
+    # what a receiver gets, and the voice gateway's `seq` field, which discord.py
+    # consumes for resume — at INFO, once a second between them. Their real
+    # failures are logged at WARNING and above and still come through.
+    for noisy in (
+        "urllib3",
+        "websockets",
+        "discord.gateway",
+        "discord.client",
+        "discord.ext.voice_recv.reader",
+        "discord.ext.voice_recv.gateway",
+    ):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     _configured = True
