@@ -23,6 +23,7 @@ SOURCE_SAMPLES = int(SOURCE_RATE * SOURCE_SECONDS)
 
 CHUNKS = 4
 KEEP_TWO = 2
+CACHING_OFF = 0
 
 # Least-significant bits of a 16-bit sample. Chunked and one-pass filtering
 # round differently; at this magnitude the difference is around -78 dB, which is
@@ -272,6 +273,69 @@ async def test_nothing_happens_until_the_stream_is_drained(synthesizer, tmp_path
     assert synthesizer.calls == [PHRASE]
 
 
+# ── warming ───────────────────────────────────────
+
+
+async def test_warming_renders_a_phrase_nobody_has_said(synthesizer, tmp_path):
+    rendered = await SpeechCache(directory=tmp_path).warm(PHRASE)
+
+    assert rendered
+    assert synthesizer.calls == [PHRASE]
+    assert len(_cached_files(tmp_path)) == 1
+
+
+async def test_a_warmed_phrase_is_not_synthesized_when_it_is_said(synthesizer, tmp_path):
+    """The point of the exercise: the wait was paid before anyone was waiting."""
+    cache = SpeechCache(directory=tmp_path)
+    await cache.warm(PHRASE)
+
+    assert len(await _collect(cache)) > 0
+    assert synthesizer.calls == [PHRASE]
+
+
+async def test_warming_what_is_already_in_memory_synthesizes_nothing(
+    synthesizer, tmp_path
+):
+    cache = SpeechCache(directory=tmp_path)
+    await _collect(cache)
+
+    assert not await cache.warm(PHRASE)
+    assert synthesizer.calls == [PHRASE]
+
+
+async def test_warming_what_is_already_on_disk_synthesizes_nothing(
+    synthesizer, tmp_path
+):
+    """A restart should not re-render what the last process left behind."""
+    await SpeechCache(directory=tmp_path).warm(PHRASE)
+
+    assert not await SpeechCache(directory=tmp_path).warm(PHRASE)
+    assert synthesizer.calls == [PHRASE]
+
+
+async def test_warming_twice_synthesizes_once(synthesizer, tmp_path):
+    cache = SpeechCache(directory=tmp_path)
+
+    await cache.warm(PHRASE)
+    await cache.warm(PHRASE)
+
+    assert synthesizer.calls == [PHRASE]
+
+
+async def test_warming_with_nowhere_to_keep_it_synthesizes_nothing(
+    synthesizer, tmp_path, monkeypatch
+):
+    """No memory and no directory makes it a synthesis nobody is ever served."""
+    monkeypatch.setattr(
+        cache_module, "tts_cfg", replace(tts_cfg, cache_entries=CACHING_OFF)
+    )
+    blocked = tmp_path / "file-not-a-directory"
+    blocked.write_text("")
+
+    assert not await SpeechCache(directory=blocked / "cache").warm(PHRASE)
+    assert synthesizer.calls == []
+
+
 # ── clips kept by hand ────────────────────────────
 
 
@@ -513,6 +577,16 @@ async def test_a_reaped_clip_is_synthesized_again(synthesizer, tmp_path):
     await _collect(SpeechCache(directory=tmp_path, retention_days=RETAIN_DAYS))
 
     assert synthesizer.calls == [PHRASE, PHRASE]
+
+
+async def test_a_warmed_clip_nobody_plays_is_still_reaped(synthesizer, tmp_path):
+    """Warmed is not the same as wanted, and the reaper is right to take it."""
+    await SpeechCache(directory=tmp_path, retention_days=RETAIN_DAYS).warm(PHRASE)
+    _age(_cached_files(tmp_path)[0])
+
+    SpeechCache(directory=tmp_path, retention_days=RETAIN_DAYS)
+
+    assert _cached_files(tmp_path) == []
 
 
 async def test_touching_a_clip_that_was_never_stored_creates_nothing(

@@ -142,6 +142,7 @@ class STTBot:
             intents=intents,
         )
         self._watchdog: asyncio.Task | None = None
+        self._prewarm: asyncio.Task | None = None
 
         self._register_events()
         self._register_commands()
@@ -177,6 +178,7 @@ class STTBot:
             self._report_tools()
             self._processor.start(asyncio.get_running_loop())
             self._start_listen_watchdog()
+            self._start_prewarm()
             if discord_cfg.autojoin:
                 await self._join_active_channels()
 
@@ -328,6 +330,24 @@ class STTBot:
                     )
             except Exception as exc:
                 logger.error("Listen watchdog error: %s", exc)
+
+    def _start_prewarm(self) -> None:
+        """
+        Let the tools prepare what they can, out of the way of joining a channel.
+
+        A background task rather than an await: rendering a phrase per speaker
+        takes as long as the synthesizer takes, and the bot should be in the
+        channel and listening while it happens.
+
+        Once per process, however many readies the gateway sends. A second pass
+        would synthesize nothing, every phrase having been cached by the first,
+        but the scan and the line in the log are not free either.
+        """
+        if self._prewarm is not None:
+            return
+
+        self._prewarm = asyncio.create_task(self._tools.prewarm())
+        self._bot.background_tasks.append(self._prewarm)
 
     async def _join_active_channels(self) -> None:
         """Pick up channels that already had people in them when the bot started."""

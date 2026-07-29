@@ -25,6 +25,11 @@ servers:
     # which makes them poor labels for a transcript a summarizer will later
     # read. The roster is per server because the same person can be known
     # differently in two places.
+    #
+    # It is also the only thing a tool knows about who might speak before
+    # anybody does, and so who it can render speech for in advance. Somebody
+    # left off is still transcribed and still fined, under whatever Discord
+    # reports; they just wait for the synthesizer the first time.
     users:
       234567890123456789: Speaker One
       345678901234567890: Speaker Two
@@ -41,6 +46,10 @@ servers:
       #
       # The words below are placeholders. What a server objects to is its own
       # business and belongs in the mounted ConfigMap, not in this repository.
+      #
+      # Every name in `users` above is rendered at startup, against one, two,
+      # and three violations, so the fine lands while the offence is still what
+      # the channel is talking about.
       verbal-morality:
         enabled: false
         config:

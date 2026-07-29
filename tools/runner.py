@@ -13,7 +13,14 @@ import asyncio
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 
 from config import ServerConfig, file_cfg
-from tools.base import FinishedHandler, SilentSpeaker, Speaker, Tool, UtteranceHandler
+from tools.base import (
+    FinishedHandler,
+    SilentSpeaker,
+    Speaker,
+    Tool,
+    UtteranceHandler,
+    Warmer,
+)
 from tools.registry import TOOLS
 from transcript.writer import Transcript, TranscriptSession, Utterance
 from utils.logging import get_logger
@@ -22,6 +29,7 @@ logger = get_logger(__name__)
 
 UTTERANCE_MOMENT = "an utterance"
 FINISHED_MOMENT = "a finished transcript"
+PREWARM_MOMENT = "a pre-warm"
 
 
 class ToolRunner:
@@ -39,6 +47,7 @@ class ToolRunner:
         self._speaker = SilentSpeaker() if speaker is None else speaker
         self._on_utterance: dict[int, list[Tool]] = {}
         self._on_finished: dict[int, list[Tool]] = {}
+        self._warming: list[Tool] = []
         self._enabled: dict[str, list[str]] = {}
         self.problems: list[str] = []
 
@@ -69,6 +78,7 @@ class ToolRunner:
                     server=server.alias,
                     config=settings.config,
                     speaker=self._speaker,
+                    users=server.users,
                 )
             except Exception as exc:
                 self.problems.append(
@@ -97,11 +107,42 @@ class ToolRunner:
             )
             return
 
+        # After the check, so nothing is prepared for a tool that can never use it.
+        if isinstance(tool, Warmer):
+            self._warming.append(tool)
+
         self._enabled.setdefault(alias, []).append(name)
 
     def describe(self) -> Mapping[str, Sequence[str]]:
         """Tool names in play, by server alias, for the startup report."""
         return {alias: tuple(sorted(names)) for alias, names in self._enabled.items()}
+
+    async def prewarm(self) -> None:
+        """
+        Let every tool prepare whatever it can prepare in advance.
+
+        Serial rather than concurrent, unlike dispatch: nothing is waiting on
+        this, and the tools that have anything to warm are all talking to one
+        synthesizer. One at a time leaves that server free for whatever is
+        actually being said while this runs.
+
+        A tool that raises is logged and the rest still get their turn, on the
+        same terms as the moments: nothing a tool does at startup may cost
+        another tool its own.
+        """
+        for tool in self._warming:
+            try:
+                await tool.prewarm()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "Tool '%s' failed on %s: %s",
+                    tool.name,
+                    PREWARM_MOMENT,
+                    exc,
+                    exc_info=exc,
+                )
 
     # ── dispatch ──────────────────────────────────
 

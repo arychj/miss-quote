@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -16,6 +17,9 @@ SECOND_ALIAS = "second-server"
 
 TOOL_NAME = "recorder"
 OTHER_TOOL_NAME = "second-recorder"
+WARMING_TOOL_NAME = "warming-recorder"
+
+ROSTER = {234567890123456789: "Speaker One"}
 
 FIRST_SOURCE = Source(
     guild_id=FIRST_SERVER, guild_alias=FIRST_ALIAS, channel_id=1, channel="general-voice"
@@ -30,8 +34,8 @@ class Recorder(Tool):
 
     name = TOOL_NAME
 
-    def __init__(self, server, config, speaker):
-        super().__init__(server, config, speaker)
+    def __init__(self, server, config, speaker, users=None):
+        super().__init__(server, config, speaker, users)
         self.utterances = []
         self.transcripts = []
 
@@ -45,8 +49,8 @@ class Recorder(Tool):
 class UtteranceOnly(Tool):
     name = "utterance-only"
 
-    def __init__(self, server, config, speaker):
-        super().__init__(server, config, speaker)
+    def __init__(self, server, config, speaker, users=None):
+        super().__init__(server, config, speaker, users)
         self.calls = 0
 
     async def handle_utterance(self, utterance, session) -> None:
@@ -56,12 +60,38 @@ class UtteranceOnly(Tool):
 class FinishedOnly(Tool):
     name = "finished-only"
 
-    def __init__(self, server, config, speaker):
-        super().__init__(server, config, speaker)
+    def __init__(self, server, config, speaker, users=None):
+        super().__init__(server, config, speaker, users)
         self.calls = 0
 
     async def handle_finished(self, transcript) -> None:
         self.calls += 1
+
+
+class Warming(Recorder):
+    """A tool with something to prepare before it is asked for anything."""
+
+    name = WARMING_TOOL_NAME
+
+    def __init__(self, server, config, speaker, users=None):
+        super().__init__(server, config, speaker, users)
+        self.warmed = 0
+
+    async def prewarm(self) -> None:
+        self.warmed += 1
+
+
+class WarmingInert(Tool):
+    """A tool that warms and handles nothing. Prepared for a moment it never sees."""
+
+    name = "warming-inert"
+
+    def __init__(self, server, config, speaker, users=None):
+        super().__init__(server, config, speaker, users)
+        self.warmed = 0
+
+    async def prewarm(self) -> None:
+        self.warmed += 1
 
 
 class Inert(Tool):
@@ -79,11 +109,14 @@ class Exploding(Tool):
     async def handle_finished(self, transcript) -> None:
         raise RuntimeError("still no")
 
+    async def prewarm(self) -> None:
+        raise RuntimeError("not even that")
+
 
 class Unbuildable(Tool):
     name = "unbuildable"
 
-    def __init__(self, server, config, speaker):
+    def __init__(self, server, config, speaker, users=None):
         raise ValueError("missing something it needed")
 
 
@@ -92,13 +125,17 @@ class FakeSession:
         self.source = source
 
 
-def _servers(**tools_by_server: dict[str, ToolSettings]) -> dict[int, ServerConfig]:
+def _servers(
+    users: dict[int, str] | None = None, **tools_by_server: dict[str, ToolSettings]
+) -> dict[int, ServerConfig]:
     """Build a servers mapping from `alias=<tools>` keyword arguments."""
     ids = {FIRST_ALIAS: FIRST_SERVER, SECOND_ALIAS: SECOND_SERVER}
     aliases = {"first": FIRST_ALIAS, "second": SECOND_ALIAS}
 
     return {
-        ids[aliases[key]]: ServerConfig(alias=aliases[key], users={}, tools=tools)
+        ids[aliases[key]]: ServerConfig(
+            alias=aliases[key], users=users or {}, tools=tools
+        )
         for key, tools in tools_by_server.items()
     }
 
@@ -191,6 +228,22 @@ def test_tools_are_sorted_by_the_moments_they_handle():
     assert runner.describe() == {FIRST_ALIAS: ("finished-only", "utterance-only")}
 
 
+def test_a_tool_is_built_with_its_servers_roster():
+    """Who might speak is the one thing knowable before anybody does."""
+    runner = ToolRunner(
+        _servers(users=ROSTER, first={TOOL_NAME: _enabled()}), {TOOL_NAME: Recorder}
+    )
+
+    assert _only_tool(runner, FIRST_SERVER, "_on_utterance").users == ROSTER
+
+
+def test_a_server_with_no_roster_hands_over_an_empty_one():
+    """So a tool never has to check whether it was given anything."""
+    runner = ToolRunner(_servers(first={TOOL_NAME: _enabled()}), {TOOL_NAME: Recorder})
+
+    assert _only_tool(runner, FIRST_SERVER, "_on_utterance").users == {}
+
+
 def test_each_server_gets_its_own_instance():
     """A tool holds per-server state, so two servers must not share one."""
     runner = ToolRunner(
@@ -251,6 +304,91 @@ async def test_a_server_with_no_tools_dispatches_nothing(tmp_path):
     await runner.dispatch_finished(_transcript(FIRST_SOURCE, tmp_path / "s.jsonl"))
 
 
+# ── pre-warming ───────────────────────────────────
+
+
+async def test_a_tool_that_warms_is_warmed_at_startup():
+    runner = ToolRunner(
+        _servers(first={WARMING_TOOL_NAME: _enabled()}), {WARMING_TOOL_NAME: Warming}
+    )
+    tool = _only_tool(runner, FIRST_SERVER, "_on_utterance")
+
+    await runner.prewarm()
+
+    assert tool.warmed == 1
+
+
+async def test_a_tool_that_does_not_warm_is_not_asked_to():
+    runner = ToolRunner(_servers(first={TOOL_NAME: _enabled()}), {TOOL_NAME: Recorder})
+
+    await runner.prewarm()
+
+    assert runner._warming == []
+
+
+async def test_each_servers_tool_is_warmed():
+    """A phrase is per server, because the roster it comes from is."""
+    runner = ToolRunner(
+        _servers(
+            first={WARMING_TOOL_NAME: _enabled()}, second={WARMING_TOOL_NAME: _enabled()}
+        ),
+        {WARMING_TOOL_NAME: Warming},
+    )
+
+    await runner.prewarm()
+
+    assert [tool.warmed for tool in runner._warming] == [1, 1]
+
+
+async def test_a_tool_that_can_never_run_is_not_warmed():
+    """Nothing should be prepared for a tool that will never be asked for it."""
+    runner = ToolRunner(
+        _servers(first={WarmingInert.name: _enabled()}),
+        {WarmingInert.name: WarmingInert},
+    )
+
+    await runner.prewarm()
+
+    assert runner._warming == []
+    assert any("never run" in problem for problem in runner.problems)
+
+
+async def test_warming_nothing_is_not_an_error():
+    await ToolRunner({}, {TOOL_NAME: Recorder}).prewarm()
+
+
+async def test_a_raising_prewarm_does_not_stop_the_others(caplog):
+    registry = {WARMING_TOOL_NAME: Warming, OTHER_TOOL_NAME: Exploding}
+    runner = ToolRunner(
+        _servers(first={OTHER_TOOL_NAME: _enabled(), WARMING_TOOL_NAME: _enabled()}),
+        registry,
+    )
+    warming = next(tool for tool in runner._warming if isinstance(tool, Warming))
+
+    with caplog.at_level("ERROR"):
+        await runner.prewarm()
+
+    assert warming.warmed == 1
+    assert any("exploding" in record.message.lower() for record in caplog.records)
+
+
+async def test_prewarm_cancellation_is_not_swallowed():
+    """Shutting down mid-warm must not be mistaken for a tool failing."""
+
+    class Cancelling(Recorder):
+        name = "cancelling"
+
+        async def prewarm(self) -> None:
+            raise asyncio.CancelledError()
+
+    runner = ToolRunner(
+        _servers(first={TOOL_NAME: _enabled()}), {TOOL_NAME: Cancelling}
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await runner.prewarm()
+
+
 # ── failure isolation ─────────────────────────────
 
 
@@ -294,7 +432,6 @@ async def test_a_raising_tool_does_not_reach_the_caller():
 
 async def test_cancellation_is_not_swallowed():
     """Shutdown must not be mistaken for a tool failing."""
-    import asyncio
 
     class Cancelling(Tool):
         name = "cancelling"

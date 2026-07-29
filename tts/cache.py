@@ -18,6 +18,9 @@ nothing in the image can decode anything else.
 
 Rendered speech is reaped at startup once it has gone unplayed for long enough;
 a clip somebody put there by hand never is. See `_reap`.
+
+A caller that can work out in advance what it will have to say can render it
+before it is needed with `warm`, which costs nothing for a phrase already held.
 """
 
 from __future__ import annotations
@@ -111,6 +114,30 @@ class SpeechCache:
 
         async for chunk in self._synthesize(key, text):
             yield chunk
+
+    async def warm(self, text: str) -> bool:
+        """
+        Render a phrase now so that nothing waits for it later.
+
+        Reports whether it had to be synthesized, for a caller counting how much
+        work warming turned out to be.
+
+        A phrase already in memory or on disk is left alone, and deliberately
+        not touched on the way past: warmed is not the same as wanted, and a
+        phrase nobody ever earns should still age out of the directory.
+        """
+        # Nowhere to keep it makes this a synthesis nobody will ever be served.
+        if not tts_cfg.caching_enabled and self._directory is None:
+            return False
+
+        key = self._key(text)
+        if key in self._memory or self._stored(key):
+            return False
+
+        async for _ in self._synthesize(key, text):
+            pass
+
+        return True
 
     # ── clips kept by hand ────────────────────────
 
@@ -274,6 +301,11 @@ class SpeechCache:
 
     def _path(self, key: str) -> Path | None:
         return None if self._directory is None else self._directory / f"{key}{CACHE_SUFFIX}"
+
+    def _stored(self, key: str) -> bool:
+        path = self._path(key)
+
+        return path is not None and path.is_file()
 
     async def _touch(self, key: str) -> None:
         """
