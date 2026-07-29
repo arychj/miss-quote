@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/miss-quote.png" alt="miss-quote" width="180">
+  <img src="assets/miss-quote.png" alt="miss-quote" width="256">
 </p>
 
 # miss-quote
