@@ -99,8 +99,12 @@ class AudioConfig:
 
     @property
     def playback_frame_bytes(self) -> int:
-        samples = (
-            self.playback_sample_rate * self.playback_frame_ms // MILLISECONDS_PER_SECOND
+        return self.playback_bytes(self.playback_frame_ms)
+
+    def playback_bytes(self, milliseconds: float) -> int:
+        """How much playback PCM covers a span of time."""
+        samples = int(
+            self.playback_sample_rate * milliseconds // MILLISECONDS_PER_SECOND
         )
         return samples * self.playback_channels * self.sample_width
 
@@ -201,6 +205,14 @@ class TTSConfig:
         default_factory=lambda: _env_float("TTS_STALL_SECONDS", 10.0)
     )
 
+    # How much of a phrase to have in hand before a clip starts playing. A
+    # synthesizer that renders a phrase whole before sending any of it makes the
+    # first chunk the slow one and every chunk after it instant, which is silence
+    # in the middle of a clip that opens with a chime. Waiting for this much
+    # moves that wait to before the chime, where nobody hears it. Zero plays on
+    # the first chunk, as a synthesizer that streams as it renders wants.
+    lead_ms: float = field(default_factory=lambda: _env_float("TTS_LEAD_MS", 500.0))
+
     # Rendered speech, kept so a phrase is only ever synthesized once. An
     # unwritable or unset directory costs the persistence, not the feature.
     cache_directory: Path = field(
@@ -222,6 +234,10 @@ class TTSConfig:
     @property
     def caching_enabled(self) -> bool:
         return self.cache_entries >= 1
+
+    @property
+    def lead_bytes(self) -> int:
+        return audio_cfg.playback_bytes(self.lead_ms)
 
 
 # ──────────────────────────────────────────────

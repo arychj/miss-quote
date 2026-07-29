@@ -1,11 +1,14 @@
 """What the Verbal Morality Bot hears, and what it says about it."""
 
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
 import pytest
 
-from tools.verbal_morality import DEFAULT_ANNOUNCEMENT, VerbalMorality
+import tools.verbal_morality as verbal_morality
+from config import tts_cfg
+from tools.verbal_morality import DEFAULT_ANNOUNCEMENT, VerbalMorality, _lead
 from transcript.writer import Source, Utterance
 
 SERVER_ALIAS = "first-server"
@@ -13,6 +16,10 @@ SPEAKER = "Speaker One"
 
 CHIME_NAME = "chime.wav"
 CHIME_AUDIO = "♪"
+
+# A phrase in pieces, for tests about what is waited for before playback starts.
+CHUNKS = ("one", "two", "three")
+NO_HEAD_START = 0
 
 SOURCE = Source(
     guild_id=1, guild_alias=SERVER_ALIAS, channel_id=2, channel="general-voice"
@@ -51,10 +58,18 @@ class FakeSpeech:
         self.directory = directory
         self.asked: list[str] = []
         self.clips_asked: list[str] = []
+        self.pulled: list[str] = []
+
+        # Set by a test that cares how a phrase is paced; a phrase arrives whole
+        # otherwise, which is what a cache hit looks like.
+        self.chunks: tuple[str, ...] | None = None
 
     async def stream(self, text: str):
         self.asked.append(text)
-        yield text
+
+        for chunk in (text,) if self.chunks is None else self.chunks:
+            self.pulled.append(chunk)
+            yield chunk
 
     def clip_path(self, name: str) -> Path:
         return self.directory / name
@@ -375,3 +390,74 @@ async def test_an_empty_chime_is_the_same_as_none(speech, speaker):
     await _hear(tool, FORBIDDEN)
 
     assert speech.clips_asked == []
+
+
+# ── the head start ────────────────────────────────
+
+
+async def _first(clip) -> str:
+    """
+    The first piece of a clip, and no more.
+
+    Abandoned rather than drained, so what the stream has given up by then is
+    what it gave up before playback started.
+    """
+    leading = await anext(clip)
+    await clip.aclose()
+
+    return leading
+
+
+async def test_the_words_are_waited_for_before_the_chime(speech, speaker, chime):
+    """A chime that starts ahead of the speech leaves a gap in the middle."""
+    speech.chunks = CHUNKS
+    tool = _tool(speaker, {"words": WORDS, "chime": chime})
+
+    leading = await _first(tool._announce(DEFAULT_ANNOUNCEMENT))
+
+    assert leading == CHIME_AUDIO
+    assert speech.pulled == list(CHUNKS)
+
+
+async def test_no_head_start_plays_on_the_first_chunk(speech, speaker, chime, monkeypatch):
+    """A synthesizer that streams as it renders needs nothing held back."""
+    monkeypatch.setattr(
+        verbal_morality, "tts_cfg", replace(tts_cfg, lead_ms=NO_HEAD_START)
+    )
+    speech.chunks = CHUNKS
+    tool = _tool(speaker, {"words": WORDS, "chime": chime})
+
+    leading = await _first(tool._announce(DEFAULT_ANNOUNCEMENT))
+
+    assert leading == CHIME_AUDIO
+    assert speech.pulled == []
+
+
+async def test_the_head_start_does_not_reorder_the_announcement(speech, speaker, chime):
+    speech.chunks = CHUNKS
+    tool = _tool(speaker, {"words": WORDS, "chime": chime})
+
+    await _hear(tool, FORBIDDEN)
+
+    _, spoken = speaker.played[0]
+    assert spoken == CHIME_AUDIO + "".join(CHUNKS)
+
+
+async def test_a_head_start_stops_once_it_has_enough(speech):
+    speech.chunks = CHUNKS
+    words = speech.stream(DEFAULT_ANNOUNCEMENT)
+
+    held = await _lead(words, len(CHUNKS[0]) + 1)
+
+    assert held == [CHUNKS[0], CHUNKS[1]]
+    assert [chunk async for chunk in words] == [CHUNKS[2]]
+
+
+async def test_a_phrase_shorter_than_the_head_start_is_not_waited_on(speech):
+    """The stream ends; there is no more coming however much was asked for."""
+    speech.chunks = CHUNKS
+    words = speech.stream(DEFAULT_ANNOUNCEMENT)
+
+    held = await _lead(words, len("".join(CHUNKS)) + 1)
+
+    assert held == list(CHUNKS)
