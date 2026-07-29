@@ -5,6 +5,7 @@ Discord bot client setup, voice lifecycle, and command handling.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from enum import Enum
 from typing import Any
 
@@ -13,15 +14,38 @@ import discord.ext.voice_recv
 from discord.ext import commands
 
 from bot.audio_sink import STTAudioSink
-from config import discord_cfg, file_cfg
+from config import discord_cfg, file_cfg, transcript_cfg
 from stt.processor import STTProcessor
-from transcript.writer import TranscriptWriter, slugify
+from tools.runner import ToolRunner
+from transcript.writer import Source, TranscriptSession, TranscriptWriter, slugify
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 # How often to check that a connected voice client is still receiving audio.
 LISTEN_WATCHDOG_INTERVAL_SECONDS = 15.0
+
+UNKNOWN_NAME = "unknown"
+UNKNOWN_ID = 0
+
+
+def source_for(channel: Any) -> Source:
+    """
+    Where a channel's transcripts belong.
+
+    A session only exists for a server the bot was allowed to join, so the alias
+    is configured; the Discord name is a fallback for nothing in particular
+    going wrong.
+    """
+    guild = getattr(channel, "guild", None)
+    guild_id = getattr(guild, "id", UNKNOWN_ID)
+
+    return Source(
+        guild_id=guild_id,
+        guild_alias=file_cfg.alias_for(guild_id) or getattr(guild, "name", UNKNOWN_NAME),
+        channel_id=getattr(channel, "id", UNKNOWN_ID),
+        channel=getattr(channel, "name", UNKNOWN_NAME),
+    )
 
 
 class VoiceAction(Enum):
@@ -67,11 +91,17 @@ def plan_voice_action(
 
 
 class _Bot(commands.Bot):
-    """A Bot that drains the processor before the loop goes away."""
+    """A Bot that drains the processor and seals its transcripts before the loop goes away."""
 
-    def __init__(self, processor: STTProcessor, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        processor: STTProcessor,
+        on_close: Callable[[], Awaitable[None]],
+        **kwargs: Any,
+    ) -> None:
         super().__init__(**kwargs)
         self._processor = processor
+        self._on_close = on_close
         self.background_tasks: list[asyncio.Task] = []
 
     async def close(self) -> None:
@@ -81,6 +111,10 @@ class _Bot(commands.Bot):
             task.cancel()
 
         await self._processor.stop()
+
+        # Sessions close after the drain, so a tool handed a finished transcript
+        # sees every utterance that made it to disk.
+        await self._on_close()
         await super().close()
 
 
@@ -89,7 +123,10 @@ class STTBot:
 
     def __init__(self) -> None:
         self._writer = TranscriptWriter()
-        self._processor = STTProcessor(self._writer)
+        self._tools = ToolRunner()
+        self._processor = STTProcessor(self._tools)
+        self._sessions: dict[int, TranscriptSession] = {}
+        self._expiries: dict[int, asyncio.Task] = {}
 
         intents = discord.Intents.default()
         intents.message_content = True
@@ -98,6 +135,7 @@ class STTBot:
 
         self._bot = _Bot(
             self._processor,
+            self._close_all_sessions,
             command_prefix=discord_cfg.command_prefix,
             intents=intents,
         )
@@ -123,7 +161,8 @@ class STTBot:
         @bot.event
         async def on_ready() -> None:
             logger.info("Logged in as %s (ID: %s)", bot.user, bot.user.id)
-            self._report_known_servers()
+            self._report_servers()
+            self._report_tools()
             self._processor.start(asyncio.get_running_loop())
             self._start_listen_watchdog()
             if discord_cfg.autojoin:
@@ -136,8 +175,12 @@ class STTBot:
             after: discord.VoiceState,
         ) -> None:
             if bot.user is not None and member.id == bot.user.id:
+                # Being removed from a channel by someone else ends the session
+                # just as surely as leaving on purpose does.
                 if before.channel and not after.channel:
                     self._processor.flush_all("bot disconnected")
+                    await self._processor.drain()
+                    await self._end_session(getattr(before.channel, "id", UNKNOWN_ID))
                 return
 
             if before.channel and before.channel != after.channel:
@@ -155,16 +198,20 @@ class STTBot:
                 logger.info("Channel '%s' is empty; leaving.", channel)
                 await self._disconnect(guild_voice)
 
-    def _report_known_servers(self) -> None:
+    def _report_servers(self) -> None:
         """
         Reconcile the configured servers against the ones the bot is actually in.
 
-        Three things can be wrong and none of them raise: nothing is configured,
-        a server is configured but the bot was never invited, or the bot is in a
-        server nobody configured. Each is reported so none of them has to be
-        discovered by noticing an empty transcript directory.
+        Four things can be wrong and none of them raise: the file has entries
+        that would not parse, nothing is configured, a server is configured but
+        the bot was never invited, or the bot is in a server nobody configured.
+        Each is reported so none of them has to be discovered by noticing an
+        empty transcript directory.
         """
-        if not file_cfg.known_servers:
+        for problem in file_cfg.problems:
+            logger.error("%s: %s", file_cfg.path, problem)
+
+        if not file_cfg.servers:
             logger.warning(
                 "No servers are configured (%s %s); the bot will not join any voice channel.",
                 file_cfg.path,
@@ -173,20 +220,21 @@ class STTBot:
             return
 
         joined = {guild.id for guild in self._bot.guilds}
+        aliases = [server.alias for server in file_cfg.servers.values()]
 
         logger.info(
             "Known servers: %s",
             ", ".join(
-                f"{alias} ({'joined' if server_id in joined else 'not joined'})"
-                for server_id, alias in sorted(
-                    file_cfg.known_servers.items(), key=lambda item: item[1]
+                f"{server.alias} ({'joined' if server_id in joined else 'not joined'})"
+                for server_id, server in sorted(
+                    file_cfg.servers.items(), key=lambda item: item[1].alias
                 )
             ),
         )
 
         missing = [
-            alias
-            for server_id, alias in file_cfg.known_servers.items()
+            server.alias
+            for server_id, server in file_cfg.servers.items()
             if server_id not in joined
         ]
         if missing:
@@ -195,15 +243,12 @@ class STTBot:
                 ", ".join(sorted(missing)),
             )
 
-        duplicates = sorted(
-            alias
-            for alias in set(file_cfg.known_servers.values())
-            if list(file_cfg.known_servers.values()).count(alias) > 1
-        )
+        duplicates = sorted(alias for alias in set(aliases) if aliases.count(alias) > 1)
         if duplicates:
             logger.error(
                 "Alias reused by more than one server: %s. "
-                "Transcripts from those servers will be written to the same directory.",
+                "Their transcripts will be mixed together in one directory, with "
+                "nothing to say which came from where.",
                 ", ".join(duplicates),
             )
 
@@ -214,6 +259,23 @@ class STTBot:
                 len(unknown),
                 ", ".join(f"{guild.name} ({guild.id})" for guild in unknown),
             )
+
+    def _report_tools(self) -> None:
+        """Say which tools are in play, and complain about the ones that are not."""
+        for problem in self._tools.problems:
+            logger.error("%s", problem)
+
+        enabled = self._tools.describe()
+        if not enabled:
+            logger.info("No tools are enabled; transcripts are written and nothing reads them.")
+            return
+
+        logger.info(
+            "Tools enabled: %s",
+            "; ".join(
+                f"{alias}: {', '.join(names)}" for alias, names in sorted(enabled.items())
+            ),
+        )
 
     def _start_listen_watchdog(self) -> None:
         if self._watchdog is not None and not self._watchdog.done():
@@ -245,8 +307,12 @@ class STTBot:
                         "Voice receive stopped in '%s'; re-attaching the sink.",
                         voice_client.channel,
                     )
+                    # The existing session is reused: the bot never left, so the
+                    # transcript should not be split by an internal failure.
                     voice_client.listen(
-                        STTAudioSink(self._processor, voice_client.channel)
+                        STTAudioSink(
+                            self._processor, self._session_for(voice_client.channel)
+                        )
                     )
             except Exception as exc:
                 logger.error("Listen watchdog error: %s", exc)
@@ -280,7 +346,7 @@ class STTBot:
             voice_client = await channel.connect(
                 cls=discord.ext.voice_recv.VoiceRecvClient,
             )
-            voice_client.listen(STTAudioSink(self._processor, channel))
+            voice_client.listen(STTAudioSink(self._processor, self._session_for(channel)))
             logger.info("Joined voice channel: %s", channel)
         except Exception as exc:
             logger.error("Could not join %s: %s", channel, exc)
@@ -304,15 +370,40 @@ class STTBot:
         if clashing:
             logger.error(
                 "Voice channel '%s' shares the directory '%s' with: %s. "
-                "Their transcripts will be interleaved.",
+                "Their transcripts will be mixed together, with nothing to say "
+                "which came from where.",
                 channel,
                 slug,
                 ", ".join(clashing),
             )
 
+    async def _move(
+        self, voice_client: discord.VoiceClient, channel: discord.abc.Connectable
+    ) -> None:
+        """
+        Move to another channel, ending one transcript and starting another.
+
+        A bot holds one voice connection per guild, so a move is a leave and a
+        join. Carrying the session across would file one channel's speech under
+        another channel's directory.
+        """
+        previous = getattr(voice_client.channel, "id", UNKNOWN_ID)
+
+        self._processor.flush_all("moving channel")
+        await self._processor.drain()
+        if voice_client.is_listening():
+            voice_client.stop_listening()
+
+        await voice_client.move_to(channel)
+        await self._end_session(previous)
+
+        voice_client.listen(STTAudioSink(self._processor, self._session_for(channel)))
+
     async def _disconnect(self, voice_client: discord.VoiceClient | None) -> None:
         if voice_client is None:
             return
+
+        channel_id = getattr(voice_client.channel, "id", UNKNOWN_ID)
 
         self._processor.flush_all("leaving channel")
         await self._processor.drain()
@@ -320,6 +411,97 @@ class STTBot:
         if voice_client.is_listening():
             voice_client.stop_listening()
         await voice_client.disconnect()
+
+        await self._end_session(channel_id)
+
+    # ── transcript sessions ───────────────────────
+
+    def _session_for(self, channel: Any) -> TranscriptSession:
+        """
+        The open session for a channel, opening one if there is none.
+
+        Keyed by channel rather than guild so the lookup stays honest if a bot
+        is ever able to hold two voice connections in one server.
+        """
+        channel_id = getattr(channel, "id", UNKNOWN_ID)
+
+        session = self._sessions.get(channel_id)
+        if session is not None:
+            if self._cancel_expiry(channel_id):
+                session.resume()
+                logger.info("Resuming transcript %s.", session.path)
+            return session
+
+        session = self._writer.open(source_for(channel))
+        self._sessions[channel_id] = session
+        return session
+
+    async def _end_session(self, channel_id: int) -> None:
+        """
+        Start the clock on a channel's transcript rather than sealing it.
+
+        A channel that empties and refills inside the resume window is one
+        conversation with a gap in it — someone's client dropped, or the last
+        person stepped away — so the transcript is held open for it. Sealing on
+        every disconnect would hand a tool a fragment, then hand it a second
+        fragment containing the first one over again.
+        """
+        session = self._sessions.get(channel_id)
+        if session is None:
+            return
+
+        self._cancel_expiry(channel_id)
+        session.suspend()
+
+        if not transcript_cfg.resume_enabled:
+            del self._sessions[channel_id]
+            await self._finalize(session)
+            return
+
+        self._expiries[channel_id] = asyncio.create_task(
+            self._expire_session(channel_id, session)
+        )
+
+    async def _expire_session(self, channel_id: int, session: TranscriptSession) -> None:
+        """Seal a session nobody came back for. Cancelled if they do."""
+        await asyncio.sleep(transcript_cfg.resume_window_seconds)
+
+        self._expiries.pop(channel_id, None)
+        if self._sessions.get(channel_id) is session:
+            del self._sessions[channel_id]
+
+        await self._finalize(session)
+
+    def _cancel_expiry(self, channel_id: int) -> bool:
+        """Stop a pending seal, reporting whether there was one."""
+        task = self._expiries.pop(channel_id, None)
+        if task is None:
+            return False
+
+        task.cancel()
+        return True
+
+    async def _finalize(self, session: TranscriptSession) -> None:
+        """Seal a transcript and hand it to the tools that want one."""
+        transcript = session.close()
+        logger.info(
+            "Transcript closed: %s (%d utterance(s)).",
+            transcript.path,
+            transcript.utterances,
+        )
+
+        await self._tools.dispatch_finished(transcript)
+
+    async def _close_all_sessions(self) -> None:
+        """
+        Seal everything now, resume window or not.
+
+        This runs on the way to the loop stopping, so a session held open for a
+        reconnect that will never come would be lost rather than delayed.
+        """
+        for channel_id in list(self._sessions):
+            self._cancel_expiry(channel_id)
+            await self._finalize(self._sessions.pop(channel_id))
 
     # ── commands ──────────────────────────────────
 
@@ -336,7 +518,7 @@ class STTBot:
             channel = ctx.author.voice.channel
 
             if ctx.voice_client is not None:
-                await ctx.voice_client.move_to(channel)
+                await self._move(ctx.voice_client, channel)
             else:
                 await self._connect(channel)
 

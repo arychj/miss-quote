@@ -3,12 +3,16 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from config import transcript_cfg
 from transcript.writer import Source, TranscriptWriter
 
 TIMEZONE = "America/Los_Angeles"
 KEEP_FOREVER = -1
 DISABLED_BY_ZERO = 0
 KEEP_A_WEEK = 7
+
+# Any time of day will do; retention is decided by the date part alone.
+SEEDED_TIME = (14, 30, 0)
 
 SOURCE = Source(
     guild_id=987654321, guild_alias="first-server", channel_id=456123, channel="general-voice"
@@ -28,11 +32,19 @@ def _today() -> date:
     return datetime.now(ZoneInfo(TIMEZONE)).date()
 
 
-def _seed(directory, days_ago: int, source=SOURCE) -> None:
+def _name(days_ago: int) -> str:
+    """The filename a session opened that many days ago would have."""
     day = _today() - timedelta(days=days_ago)
+    moment = datetime.combine(day, datetime.min.time()).replace(
+        hour=SEEDED_TIME[0], minute=SEEDED_TIME[1], second=SEEDED_TIME[2]
+    )
+    return f"{moment.strftime(transcript_cfg.filename_timestamp_format)}{transcript_cfg.filename_suffix}"
+
+
+def _seed(directory, days_ago: int, source=SOURCE) -> None:
     channel_directory = directory / source.relative_directory
     channel_directory.mkdir(parents=True, exist_ok=True)
-    (channel_directory / f"{day.isoformat()}.jsonl").write_text("{}\n")
+    (channel_directory / _name(days_ago)).write_text("{}\n")
 
 
 def _names(directory) -> set[str]:
@@ -64,21 +76,16 @@ def test_positive_retention_removes_only_old_files(tmp_path) -> None:
     )
 
     survivors = _names(tmp_path)
-    today = _today()
 
-    assert f"{(today - timedelta(days=3)).isoformat()}.jsonl" in survivors
-    assert f"{today.isoformat()}.jsonl" in survivors
-    assert f"{(today - timedelta(days=30)).isoformat()}.jsonl" not in survivors
-    assert f"{(today - timedelta(days=8)).isoformat()}.jsonl" not in survivors
+    assert _name(3) in survivors
+    assert _name(0) in survivors
+    assert _name(30) not in survivors
+    assert _name(8) not in survivors
 
 
 def test_age_comes_from_filename_not_mtime(tmp_path) -> None:
     """A stale file touched recently must still be pruned."""
-    old = (
-        tmp_path
-        / SOURCE.relative_directory
-        / f"{(_today() - timedelta(days=90)).isoformat()}.jsonl"
-    )
+    old = tmp_path / SOURCE.relative_directory / _name(90)
     old.parent.mkdir(parents=True, exist_ok=True)
     old.write_text("{}\n")
     old.touch()  # mtime is now; the filename says otherwise
@@ -112,6 +119,17 @@ def test_pruning_reaches_every_channel(tmp_path) -> None:
         directory=tmp_path, timezone=TIMEZONE, retention_days=KEEP_A_WEEK
     )
 
-    survivors = _names(tmp_path)
+    assert _names(tmp_path) == {_name(1)}
 
-    assert survivors == {f"{(_today() - timedelta(days=1)).isoformat()}.jsonl"}
+
+def test_opening_a_session_prunes(tmp_path) -> None:
+    """Sessions are the only recurring event the writer sees now."""
+    writer = TranscriptWriter(
+        directory=tmp_path, timezone=TIMEZONE, retention_days=KEEP_A_WEEK
+    )
+    _seed(tmp_path, days_ago=30)
+
+    session = writer.open(SOURCE)
+
+    assert _name(30) not in _names(tmp_path)
+    assert session.path.is_file()
