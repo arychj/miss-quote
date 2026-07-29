@@ -84,6 +84,26 @@ class AudioConfig:
     output_channels: int = 1          # Mono
     sample_width: int = BYTES_PER_INT16_SAMPLE
 
+    # Discord's player reads one frame per tick and stops on anything short of a
+    # full one, so playback is framed rather than streamed byte by byte.
+    playback_frame_ms: int = 20
+
+    @property
+    def playback_sample_rate(self) -> int:
+        """Playing into Discord takes back exactly what the gateway delivers."""
+        return self.input_sample_rate
+
+    @property
+    def playback_channels(self) -> int:
+        return self.input_channels
+
+    @property
+    def playback_frame_bytes(self) -> int:
+        samples = (
+            self.playback_sample_rate * self.playback_frame_ms // MILLISECONDS_PER_SECOND
+        )
+        return samples * self.playback_channels * self.sample_width
+
 
 # ──────────────────────────────────────────────
 # VAD  (Silero, via onnxruntime)
@@ -146,6 +166,54 @@ class STTConfig:
 
     # A hung ASR must not pin a semaphore slot forever.
     timeout_seconds: float = 30.0
+
+
+# ──────────────────────────────────────────────
+# TTS  (Wyoming)
+# ──────────────────────────────────────────────
+@dataclass(frozen=True)
+class TTSConfig:
+    """
+    Speech synthesis, for tools that answer out loud.
+
+    A separate host and port from `STTConfig`: recognition and synthesis are
+    both Wyoming, but they are two servers and only one of them wants a GPU.
+    """
+
+    host: str = field(default_factory=lambda: _env_str("TTS_HOST", "localhost"))
+    port: int = field(default_factory=lambda: _env_int("TTS_PORT", 10200))
+
+    # Empty asks the synthesizer for whatever it considers its default, so a
+    # deployment with one voice loaded needs no setting at all.
+    voice: str = field(default_factory=lambda: _env_str("TTS_VOICE", ""))
+
+    # Budget for a single wait on the synthesizer, not for the whole clip: a
+    # server that streams slowly but steadily is healthy, one that goes quiet
+    # for this long is not.
+    timeout_seconds: float = field(
+        default_factory=lambda: _env_float("TTS_TIMEOUT_SECONDS", 30.0)
+    )
+
+    # How long the player waits for the next piece of a clip before ending it.
+    # Playback begins on the first chunk, so a synthesizer that stalls mid-word
+    # leaves a thread holding the channel open until this expires.
+    stall_seconds: float = field(
+        default_factory=lambda: _env_float("TTS_STALL_SECONDS", 10.0)
+    )
+
+    # Rendered speech, kept so a phrase is only ever synthesized once. An
+    # unwritable or unset directory costs the persistence, not the feature.
+    cache_directory: Path = field(
+        default_factory=lambda: Path(_env_str("TTS_CACHE_DIR", "/cache/tts"))
+    )
+
+    # Clips held in memory. The bound exists because what gets synthesized can
+    # include a speaker's Discord display name, and those are not a closed set.
+    cache_entries: int = field(default_factory=lambda: _env_int("TTS_CACHE_ENTRIES", 256))
+
+    @property
+    def caching_enabled(self) -> bool:
+        return self.cache_entries >= 1
 
 
 # ──────────────────────────────────────────────
@@ -430,6 +498,7 @@ discord_cfg = DiscordConfig()
 audio_cfg = AudioConfig()
 vad_cfg = VADConfig()
 stt_cfg = STTConfig()
+tts_cfg = TTSConfig()
 transcript_cfg = TranscriptConfig()
 process_cfg = ProcessConfig()
 log_cfg = LogConfig()

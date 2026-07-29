@@ -14,8 +14,11 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from tools.base import Tool
+from tools.verbal_morality import VerbalMorality
 
-TOOLS: Mapping[str, type[Tool]] = {}
+TOOLS: Mapping[str, type[Tool]] = {
+    VerbalMorality.name: VerbalMorality,
+}
 
 
 def lookup(name: str) -> type[Tool] | None:

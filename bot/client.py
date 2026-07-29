@@ -14,6 +14,7 @@ import discord.ext.voice_recv
 from discord.ext import commands
 
 from bot.audio_sink import STTAudioSink
+from bot.speaker import DiscordSpeaker
 from config import discord_cfg, file_cfg, transcript_cfg
 from stt.processor import STTProcessor
 from tools.runner import ToolRunner
@@ -123,7 +124,8 @@ class STTBot:
 
     def __init__(self) -> None:
         self._writer = TranscriptWriter()
-        self._tools = ToolRunner()
+        self._speaker = DiscordSpeaker(self._guild)
+        self._tools = ToolRunner(speaker=self._speaker)
         self._processor = STTProcessor(self._tools)
         self._sessions: dict[int, TranscriptSession] = {}
         self._expiries: dict[int, asyncio.Task] = {}
@@ -143,6 +145,16 @@ class STTBot:
 
         self._register_events()
         self._register_commands()
+
+    def _guild(self, guild_id: int) -> discord.Guild | None:
+        """
+        Resolve a guild for the speaker.
+
+        Handed over as a callable rather than the bot itself, because the
+        speaker is built before the bot is: the bot is built around the
+        processor, the processor around the tools, and the tools want a speaker.
+        """
+        return self._bot.get_guild(guild_id)
 
     # ── public ────────────────────────────────────
 

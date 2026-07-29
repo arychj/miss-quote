@@ -35,13 +35,25 @@ servers:
     # bot leaves the channel, or both. All this says is whether the server is
     # opted in, and what settings the tool is handed. A tool listed without
     # `enabled: true` is off, and a name no tool answers to is reported at
-    # startup and skipped, which is why the example below is commented out.
-    #
-    # tools:
-    #   example-tool:
-    #     enabled: true
-    #     config:
-    #       some-setting: a value
+    # startup and skipped.
+    tools:
+      # Announces a fine, out loud, when someone says one of `words`.
+      #
+      # The words below are placeholders. What a server objects to is its own
+      # business and belongs in the mounted ConfigMap, not in this repository.
+      verbal-morality:
+        enabled: false
+        config:
+          words:
+            - fiddlesticks
+            - poppycock
+
+          # Optional. The tool carries the line from the film, so a server that
+          # only wants the default can leave this out entirely. `{user}` is the
+          # only placeholder, and is filled with the speaker's name from `users`
+          # where one is set.
+          #
+          # announcement: "{user}, you are fined one credit for a violation of the verbal morality statute."
 
   876543210987654321:
     alias: second-server
