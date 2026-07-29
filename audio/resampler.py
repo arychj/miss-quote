@@ -8,6 +8,11 @@ load-bearing rather than a convenience: Silero only accepts 512-sample frames at
 
 Outbound, `PlaybackResampler` takes a synthesizer's mono output at whatever rate
 it works in and produces the 48 kHz stereo Discord plays.
+
+`to_mono` is here rather than beside either of them because channel layout is
+this module's business wherever it comes up, and audio that entered the process
+as a file rather than through the pipeline has whatever layout it was authored
+with.
 """
 
 from __future__ import annotations
@@ -20,7 +25,8 @@ from utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-STEREO_INTERLEAVED_SHAPE = (-1, audio_cfg.input_channels)
+INFERRED_LENGTH = -1
+STEREO_INTERLEAVED_SHAPE = (INFERRED_LENGTH, audio_cfg.input_channels)
 CHANNEL_AXIS = 1
 
 # VHQ is the bit-exact-enough end of soxr's quality ladder and costs microseconds
@@ -29,8 +35,25 @@ RESAMPLE_QUALITY = "VHQ"
 
 MONO_CHANNELS = 1
 SAMPLE_DTYPE = np.int16
-MONO_COLUMN_SHAPE = (-1, MONO_CHANNELS)
+MONO_COLUMN_SHAPE = (INFERRED_LENGTH, MONO_CHANNELS)
 NO_SAMPLES = np.empty(0, dtype=SAMPLE_DTYPE)
+
+
+def to_mono(pcm: bytes, channels: int) -> bytes:
+    """
+    Collapse interleaved int16 PCM to a single channel.
+
+    Averaged in int32 so a pair of near-full-scale samples cannot wrap, and a
+    no-op on audio that is already mono rather than a round trip through numpy
+    to arrive at what it was handed.
+    """
+    if channels <= MONO_CHANNELS:
+        return pcm
+
+    samples = np.frombuffer(pcm, dtype=SAMPLE_DTYPE).reshape(INFERRED_LENGTH, channels)
+    return (
+        samples.astype(np.int32).mean(axis=CHANNEL_AXIS).astype(SAMPLE_DTYPE).tobytes()
+    )
 
 
 class AudioResampler:

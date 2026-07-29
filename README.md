@@ -189,19 +189,25 @@ verbal-morality:
   enabled: true
   config:
     words: [fiddlesticks, poppycock]
-    announcement: "{user}, you are fined one credit for a violation of the verbal morality statute."
+    announcement: "{user}, you are fined {credits} for a violation of the verbal morality statute."
+    chime: chime.wav
 ```
 
 | Setting | Required | Purpose |
 |---|---|---|
 | `words` | yes | What the server objects to. A lone word may be written unquoted rather than as a list |
-| `announcement` | no | What gets said. `{user}` is the only placeholder |
+| `announcement` | no | What gets said. `{user}` and `{credits}` are the placeholders |
+| `chime` | no | A WAV in the speech cache directory, played ahead of the announcement |
 
 `announcement` defaults to the line above, which the tool carries, so a server that wants the default can leave it out. A template with a placeholder nothing fills is rejected at startup rather than at the moment someone swears.
 
 The name is the one the transcript uses — the roster name from `users` where a server has set one, the Discord display name otherwise — so nothing has to be configured twice.
 
-Matching is **whole words, case-insensitive**. A substring match fines the innocent, and the canonical example, Scunthorpe, is a place people live. An utterance containing three violations earns one announcement: a speaker who strings them together earns three credits in spirit, but three announcements over the top of each other is a denial of service on the channel. Two people swearing at once are fined one after the other.
+Matching is **whole words, case-insensitive**. A substring match fines the innocent, and the canonical example, Scunthorpe, is a place people live.
+
+**The fine scales with the utterance**: one credit per forbidden word in it, so three of them is `3 credits` and one is `1 credit`. The count is filled into `{credits}` already pluralized, as a numeral — every synthesizer worth pointing this at reads `3` as a number, and `1 credits` is wrong in a way a listener hears. What does not scale is the number of announcements: three violations earn one, because three announcements over the top of each other is a denial of service on the channel. Two people swearing at once are fined one after the other.
+
+`chime` is resolved **inside** `TTS_CACHE_DIR` — a bare name, or a path below it; anything that climbs out is refused at startup. It must be a **16-bit WAV**, at any sample rate and in mono or stereo, both of which are converted on the way in. WAV rather than MP3 because playing audio without ffmpeg is the point of this path, and nothing in the image can decode anything else. The clip is read once, kept for the life of the process, and never evicted to make room for a phrase. A chime that is missing or will not parse is reported and costs the chime, not the announcement.
 
 A server electing in with no `words` is enabled and listening for nothing, which is reported at startup rather than left to be discovered by swearing at it.
 
@@ -225,6 +231,8 @@ Synthesis is a second Wyoming server (`TTS_HOST`, `TTS_PORT`) — recognition an
 The first hit after a restart pays one resample and nothing else. Mount a volume at `TTS_CACHE_DIR` to keep clips across restarts; an unwritable or absent directory costs the persistence, not the feature. Writes go through a temporary file and a rename, because a process killed mid-write would otherwise cache a truncated clip forever, and a clip is only stored once the synthesizer says it is whole — a failure partway through plays what arrived and stores nothing.
 
 The memory layer is bounded (`TTS_CACHE_ENTRIES`) because what gets synthesized can include a Discord display name, and those are not a closed set.
+
+The same directory also holds **clips nobody synthesized** — a chime a tool plays ahead of what it has to say. Drop a 16-bit WAV in and name it from the tool's config; it is read once, converted to playback PCM, and held apart from rendered speech so it is never evicted for a phrase somebody said once. Names are resolved against the directory rather than taken at their word: a setting cannot be pointed at an arbitrary file on the host.
 
 ## Environment
 

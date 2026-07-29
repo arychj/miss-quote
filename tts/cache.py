@@ -10,6 +10,11 @@ Two layers, each holding the form that suits it:
 The first hit after a restart therefore pays one resample and nothing else. The
 disk layer is optional: an unwritable or absent directory costs the persistence,
 not the feature.
+
+The same directory also holds clips nobody synthesized — a chime a tool plays
+ahead of what it has to say — which `clip` serves by name. WAV only, and
+deliberately: playing audio without ffmpeg is the reason this path exists, and
+nothing in the image can decode anything else.
 """
 
 from __future__ import annotations
@@ -20,7 +25,7 @@ import wave
 from collections.abc import AsyncIterator
 from pathlib import Path
 
-from audio.resampler import PlaybackResampler
+from audio.resampler import PlaybackResampler, to_mono
 from config import audio_cfg, tts_cfg
 from tts.client import SynthesisError, synthesize
 from utils.logging import get_logger
@@ -31,6 +36,8 @@ CACHE_SUFFIX = ".wav"
 PARTIAL_SUFFIX = ".partial"
 KEY_SEPARATOR = "\n"
 MONO_CHANNELS = 1
+BITS_PER_BYTE = 8
+NOTHING = b""
 
 WAVE_READ = "rb"
 WAVE_WRITE = "wb"
@@ -47,6 +54,7 @@ class SpeechCache:
     def __init__(self, directory: Path | None = None, entries: int | None = None) -> None:
         self._entries = tts_cfg.cache_entries if entries is None else entries
         self._memory: dict[str, bytes] = {}
+        self._clips: dict[str, bytes] = {}
         self._directory = self._prepare(
             Path(tts_cfg.cache_directory if directory is None else directory)
         )
@@ -77,6 +85,82 @@ class SpeechCache:
 
         async for chunk in self._synthesize(key, text):
             yield chunk
+
+    # ── clips kept by hand ────────────────────────
+
+    def clip_path(self, name: str) -> Path | None:
+        """
+        Where a named clip lives, if it lives inside the cache directory.
+
+        Names arrive from configuration and are resolved against the directory
+        rather than taken at their word, so a setting cannot be pointed at an
+        arbitrary file on the host and have the bot read it out.
+        """
+        if self._directory is None:
+            return None
+
+        root = self._directory.resolve()
+        path = (root / name).resolve()
+
+        if not path.is_relative_to(root):
+            logger.error("Clip '%s' resolves outside %s; ignoring it.", name, root)
+            return None
+
+        return path
+
+    async def clip(self, name: str) -> bytes:
+        """
+        Playback-ready PCM for a WAV file kept in the cache directory.
+
+        For audio the synthesizer had no part in. Held apart from rendered
+        speech and never evicted: there are a handful of these, each was put
+        there deliberately, and one should not be dropped to make room for a
+        phrase somebody said once.
+
+        A clip that is missing or will not parse returns nothing playable
+        rather than raising. It is the opening flourish; whatever it was going
+        to introduce is the part that matters.
+        """
+        remembered = self._clips.get(name)
+        if remembered is not None:
+            return remembered
+
+        path = self.clip_path(name)
+        if path is None or not path.is_file():
+            logger.error("No clip at '%s'; carrying on without it.", path or name)
+            return NOTHING
+
+        try:
+            rate, pcm = await asyncio.to_thread(self._read_clip, path)
+        except (OSError, wave.Error) as exc:
+            logger.error("Ignoring unplayable clip %s: %s", path, exc)
+            return NOTHING
+
+        playback = self._to_playback(rate, pcm)
+        self._clips[name] = playback
+        return playback
+
+    @staticmethod
+    def _read_clip(path: Path) -> tuple[int, bytes]:
+        """
+        One WAV off disk as mono, whatever layout it was authored in.
+
+        Sample rate and channel count are the file's own business — soxr covers
+        the first and a downmix the second — but sample width is not. Anything
+        other than int16 is a different format rather than a different
+        arrangement of this one, and is refused with a line saying so instead
+        of played as noise.
+        """
+        with wave.open(str(path), WAVE_READ) as handle:
+            width = handle.getsampwidth()
+            if width != audio_cfg.sample_width:
+                raise wave.Error(
+                    f"{width * BITS_PER_BYTE}-bit audio, but only "
+                    f"{audio_cfg.sample_width * BITS_PER_BYTE}-bit can be played"
+                )
+
+            frames = handle.readframes(handle.getnframes())
+            return handle.getframerate(), to_mono(frames, handle.getnchannels())
 
     # ── synthesis ─────────────────────────────────
 

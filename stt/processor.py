@@ -17,7 +17,7 @@ from stt.user_state import UserState, UserStateManager
 from stt.vad import SileroVAD
 from stt.wyoming_client import transcribe
 from tools.runner import ToolRunner
-from transcript.writer import TranscriptSession
+from transcript.writer import TranscriptSession, Utterance
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -41,6 +41,7 @@ class STTProcessor:
 
         self._semaphore = asyncio.Semaphore(stt_cfg.max_concurrent)
         self._pending: set[asyncio.Task] = set()
+        self._tool_work: set[asyncio.Task] = set()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._maintenance: asyncio.Task | None = None
 
@@ -66,9 +67,18 @@ class STTProcessor:
         await self.drain()
 
     async def drain(self) -> None:
-        """Wait for all dispatched transcriptions to complete."""
+        """
+        Wait for all dispatched transcriptions, and then for the tools.
+
+        In that order, because a transcription still in flight has a tool call
+        ahead of it. A tool may be mid-sentence when this is called, and cutting
+        it off is only worth doing once nothing more is going to reach it.
+        """
         if self._pending:
             await asyncio.gather(*tuple(self._pending), return_exceptions=True)
+
+        if self._tool_work:
+            await asyncio.gather(*tuple(self._tool_work), return_exceptions=True)
 
     # ── ingest ────────────────────────────────────
 
@@ -169,9 +179,21 @@ class STTProcessor:
         )
         logger.info("📝 [%s] %s", speaker.name, text)
 
-        # Dispatched after the line is on disk, so a tool that reads the file
-        # rather than the utterance handed to it sees the same thing.
-        await self._tools.dispatch_utterance(speaker.session, utterance)
+        self._notify_tools(speaker.session, utterance)
+
+    def _notify_tools(self, session: TranscriptSession, utterance: Utterance) -> None:
+        """
+        Hand a line to the tools without waiting for them.
+
+        Started after the line is on disk, so a tool that reads the file rather
+        than the utterance handed to it still sees the same thing, but not
+        awaited: a tool that answers out loud takes as long as the announcement
+        does, and holding the transcription task open for it would put anything
+        the transcription path does next behind an audio clip.
+        """
+        work = asyncio.create_task(self._tools.dispatch_utterance(session, utterance))
+        self._tool_work.add(work)
+        work.add_done_callback(self._tool_work.discard)
 
     # ── maintenance ───────────────────────────────
 
