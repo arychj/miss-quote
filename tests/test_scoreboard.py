@@ -6,11 +6,11 @@ from pathlib import Path
 import discord
 import pytest
 
-import bot.client as client_module
-import bot.scoreboard as scoreboard_module
-from bot.scoreboard import Scoreboard
-from config import FileConfig, ServerConfig
-from ledger.credits import CreditLedger
+import miss_quote.bot.client as client_module
+import miss_quote.bot.scoreboard as scoreboard_module
+from miss_quote.bot.scoreboard import Scoreboard
+from miss_quote.config import FileConfig, ServerConfig
+from miss_quote.ledger.credits import CreditLedger
 
 SERVER_ID = 123456789012345678
 SERVER = "first-server"

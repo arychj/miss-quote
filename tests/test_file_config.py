@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-import config as config_module
+import miss_quote.config as config_module
 
 FIRST_SERVER = 123456789012345678
 SECOND_SERVER = 876543210987654321

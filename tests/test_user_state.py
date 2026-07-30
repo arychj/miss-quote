@@ -1,7 +1,7 @@
 import time
 from types import SimpleNamespace
 
-import stt.user_state as user_state
+import miss_quote.stt.user_state as user_state
 
 
 def test_stale_speech_state_is_detected(monkeypatch) -> None:

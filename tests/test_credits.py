@@ -5,7 +5,7 @@ import re
 
 import pytest
 
-from ledger.credits import (
+from miss_quote.ledger.credits import (
     CREDITS_FIELD,
     ENTRY_SEPARATOR,
     NAME_FIELD,

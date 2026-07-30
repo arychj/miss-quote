@@ -2,8 +2,8 @@ from pathlib import Path
 
 import pytest
 
-import bot.client as client_module
-from config import FileConfig, ServerConfig
+import miss_quote.bot.client as client_module
+from miss_quote.config import FileConfig, ServerConfig
 
 KNOWN_SERVER = 123456789012345678
 OTHER_SERVER = 111222333444555666
@@ -146,7 +146,7 @@ def test_transcript_path_uses_the_alias_not_the_discord_name(monkeypatch):
 
 
 def test_speaker_names_come_from_the_servers_own_roster(monkeypatch):
-    import bot.audio_sink as sink_module
+    import miss_quote.bot.audio_sink as sink_module
 
     speaker = 234567890123456789
     monkeypatch.setattr(

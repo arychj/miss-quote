@@ -1,4 +1,4 @@
-from audio.ring_buffer import RingBuffer
+from miss_quote.audio.ring_buffer import RingBuffer
 
 
 def test_ring_buffer_drops_oldest_and_drains_in_order() -> None:

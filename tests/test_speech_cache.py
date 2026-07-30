@@ -9,10 +9,10 @@ from datetime import timedelta
 import numpy as np
 import pytest
 
-from config import audio_cfg, tts_cfg
-from tts import cache as cache_module
-from tts.cache import SpeechCache
-from tts.client import Speech, SynthesisError
+from miss_quote.config import audio_cfg, tts_cfg
+from miss_quote.tts import cache as cache_module
+from miss_quote.tts.cache import SpeechCache
+from miss_quote.tts.client import Speech, SynthesisError
 
 PHRASE = "you are fined one credit"
 OTHER_PHRASE = "and another one"

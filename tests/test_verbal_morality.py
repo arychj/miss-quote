@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-import tools.verbal_morality as verbal_morality
-from config import (
+import miss_quote.tools.verbal_morality as verbal_morality
+from miss_quote.config import (
     SILENT_VOLUME,
     UNITY_VOLUME,
     ServerConfig,
@@ -16,9 +16,9 @@ from config import (
     morality_cfg,
     tts_cfg,
 )
-from ledger.credits import CreditLedger
-from tools.runner import ToolRunner
-from tools.verbal_morality import (
+from miss_quote.ledger.credits import CreditLedger
+from miss_quote.tools.runner import ToolRunner
+from miss_quote.tools.verbal_morality import (
     DEFAULT_ANNOUNCEMENT,
     DEFAULT_REPEAT_ANNOUNCEMENT,
     REPEATED_FINE,
@@ -26,7 +26,7 @@ from tools.verbal_morality import (
     VerbalMorality,
     _lead,
 )
-from transcript.writer import Source, Utterance
+from miss_quote.transcript.writer import Source, Utterance
 
 SERVER_ALIAS = "first-server"
 OTHER_SERVER_ALIAS = "second-server"
@@ -164,7 +164,7 @@ class FakeSession:
 def speech(monkeypatch, tmp_path):
     """Replace the process-wide cache so nothing reaches a synthesizer."""
     fake = FakeSpeech(tmp_path)
-    monkeypatch.setattr("tools.verbal_morality.shared_cache", lambda: fake)
+    monkeypatch.setattr("miss_quote.tools.verbal_morality.shared_cache", lambda: fake)
     return fake
 
 
@@ -178,7 +178,7 @@ def credits(monkeypatch, tmp_path) -> CreditLedger:
     disk — and, worse, count into it.
     """
     ledger = CreditLedger(tmp_path / "credits.json")
-    monkeypatch.setattr("tools.verbal_morality.shared_ledger", lambda: ledger)
+    monkeypatch.setattr("miss_quote.tools.verbal_morality.shared_ledger", lambda: ledger)
 
     return ledger
 

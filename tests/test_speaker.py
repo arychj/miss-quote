@@ -7,11 +7,11 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-import bot.speaker as speaker_module
-from audio.gain import scaled
-from bot.speaker import PCMStream, DiscordSpeaker
-from config import audio_cfg
-from transcript.writer import Source
+import miss_quote.bot.speaker as speaker_module
+from miss_quote.audio.gain import scaled
+from miss_quote.bot.speaker import PCMStream, DiscordSpeaker
+from miss_quote.config import audio_cfg
+from miss_quote.transcript.writer import Source
 
 GUILD_ID = 1
 CHANNEL_ID = 2

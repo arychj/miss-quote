@@ -1,0 +1,6 @@
+# Everything about the package itself is in setup.cfg. This declares only what
+# builds it, which is the one thing that cannot live there.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

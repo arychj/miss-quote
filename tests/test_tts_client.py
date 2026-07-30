@@ -6,9 +6,9 @@ import pytest
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
 from wyoming.tts import Synthesize
 
-from config import tts_cfg
-from tts import client as client_module
-from tts.client import SynthesisError, synthesize
+from miss_quote.config import tts_cfg
+from miss_quote.tts import client as client_module
+from miss_quote.tts.client import SynthesisError, synthesize
 
 PHRASE = "you are fined one credit"
 VOICE = "some-voice"

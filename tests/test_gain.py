@@ -2,8 +2,8 @@
 
 import numpy as np
 
-from audio.gain import LOUDEST_SAMPLE, QUIETEST_SAMPLE, scaled
-from config import SILENT_VOLUME, UNITY_VOLUME
+from miss_quote.audio.gain import LOUDEST_SAMPLE, QUIETEST_SAMPLE, scaled
+from miss_quote.config import SILENT_VOLUME, UNITY_VOLUME
 
 SAMPLE_DTYPE = np.int16
 QUIETER = 0.8

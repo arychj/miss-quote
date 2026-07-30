@@ -4,10 +4,10 @@ from pathlib import Path
 
 import pytest
 
-from config import ServerConfig, ToolSettings
-from tools.base import Tool
-from tools.runner import ToolRunner
-from transcript.writer import Source, Transcript, Utterance
+from miss_quote.config import ServerConfig, ToolSettings
+from miss_quote.tools.base import Tool
+from miss_quote.tools.runner import ToolRunner
+from miss_quote.transcript.writer import Source, Transcript, Utterance
 
 FIRST_SERVER = 123456789012345678
 SECOND_SERVER = 876543210987654321

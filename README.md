@@ -361,7 +361,7 @@ Only used by `quotes`. A deployment with it disabled never opens the file.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `QUOTES_FILE` | `/app/resources/quotes.csv` | The triggers and the lines they answer with, as a CSV of `movie,trigger,quote`. One list per deployment; the image ships the one in `resources/`, and mounting a file over that path replaces it |
+| `QUOTES_FILE` | `/app/src/miss_quote/resources/quotes.csv` | The triggers and the lines they answer with, as a CSV of `movie,trigger,quote`. One list per deployment; the image ships the one in `resources/`, and mounting a file over that path replaces it |
 | `QUOTE_BACKOFF_SECONDS` | `300.0` | How long a trigger stays spent after it fires, so a channel that keeps saying the same word hears the line once. `0`, or any value below it, answers every trigger every time |
 
 ### Credits
@@ -438,43 +438,57 @@ Added: `AUTOJOIN`, `RETENTION_DAYS`, `TRANSCRIPT_DIR`, `TZ`, `SESSION_RESUME_SEC
 
 ```
 miss-quote/
-├── main.py                    # Entry point
-├── config.py                  # Grouped configuration (dataclasses)
-├── bot/
-│   ├── client.py              # Bot setup, voice lifecycle, auto-join policy
-│   ├── audio_sink.py          # AudioSink + resampling bridge
-│   ├── scoreboard.py          # The tally, to disk and to the channel topic
-│   └── speaker.py             # Playback into a voice channel, fed while it plays
-├── audio/
-│   ├── resampler.py           # soxr, both directions
-│   ├── gain.py                # Playback loudness
-│   └── ring_buffer.py         # Pre-speech context buffer
-├── stt/
-│   ├── vad.py                 # Silero VAD via onnxruntime
-│   ├── user_state.py          # Per-user VAD state machine
-│   ├── processor.py           # Segmentation and bounded dispatch
-│   ├── wyoming_client.py      # Per-utterance Wyoming round-trip
-│   └── models/
-│       └── silero_vad.onnx    # Vendored (~2 MB)
-├── ledger/
-│   └── credits.py             # What everybody has left, per server
-├── resources/
-│   └── quotes.csv             # Triggers and the film lines they answer with
-├── tools/
-│   ├── base.py                # What a tool is: the two optional handlers, and a speaker
-│   ├── registry.py            # Tool names a config file can switch on
-│   ├── runner.py              # Per-server instances, dispatch, failure isolation
-│   ├── quotes.py              # Answers a trigger phrase with the line it belongs to
-│   └── verbal_morality.py     # Fines a speaker, out loud, for saying the wrong thing
-├── transcript/
-│   └── writer.py              # Per-session JSONL appender + retention
-├── tts/
-│   ├── client.py              # Streaming Wyoming synthesis
-│   └── cache.py               # Render a phrase once, keep it in memory and on disk
-└── utils/
-    ├── logging.py
-    └── stems.py               # A stem and the endings it is said with
+├── pyproject.toml             # What builds the package, and nothing else
+├── setup.cfg                  # The package itself: metadata and where it lives
+├── pytest.ini
+├── requirements.txt           # What the image installs
+├── config.yaml                # A sample of the mounted file
+├── src/
+│   └── miss_quote/
+│       ├── __main__.py        # Entry point: python -m miss_quote
+│       ├── config.py          # Grouped configuration (dataclasses)
+│       ├── bot/
+│       │   ├── client.py      # Bot setup, voice lifecycle, auto-join policy
+│       │   ├── audio_sink.py  # AudioSink + resampling bridge
+│       │   ├── speaker.py     # Playback into a voice channel, fed while it plays
+│       │   └── scoreboard.py  # The tally, to disk and to the channel topic
+│       ├── audio/
+│       │   ├── resampler.py   # soxr, both directions
+│       │   ├── gain.py        # Playback loudness
+│       │   └── ring_buffer.py # Pre-speech context buffer
+│       ├── stt/
+│       │   ├── vad.py         # Silero VAD via onnxruntime
+│       │   ├── user_state.py  # Per-user VAD state machine
+│       │   ├── processor.py   # Segmentation and bounded dispatch
+│       │   ├── wyoming_client.py  # Per-utterance Wyoming round-trip
+│       │   └── models/
+│       │       └── silero_vad.onnx  # Vendored (~2 MB)
+│       ├── ledger/
+│       │   └── credits.py     # What everybody has left, per server
+│       ├── resources/
+│       │   └── quotes.csv     # Triggers and the film lines they answer with
+│       ├── tools/
+│       │   ├── base.py        # What a tool is: the optional handlers, and a speaker
+│       │   ├── registry.py    # Tool names a config file can switch on
+│       │   ├── runner.py      # Per-server instances, dispatch, failure isolation
+│       │   ├── quotes.py      # Answers a trigger phrase with the line it belongs to
+│       │   └── verbal_morality.py  # Fines a speaker, out loud, for the wrong thing
+│       ├── transcript/
+│       │   └── writer.py      # Per-session JSONL appender + retention
+│       ├── tts/
+│       │   ├── client.py      # Streaming Wyoming synthesis
+│       │   └── cache.py       # Render a phrase once, keep it in memory and on disk
+│       └── utils/
+│           ├── logging.py
+│           └── stems.py       # A stem and the endings it is said with
+└── tests/
 ```
+
+Paths in prose below are written relative to `src/miss_quote/`, which is where all of the code is.
+
+The package directory is `miss_quote` where everything else is `miss-quote`, a hyphen not being importable. It sits under `src/` so that a test run imports the package that is on the path rather than whatever happens to be in the working directory — the failure a flat layout hides is a module that only resolves because pytest added the repository root.
+
+Dependencies stay in `requirements.txt` rather than `setup.cfg`, because one of them is pinned to a VCS revision and the image installs it verbatim. Nothing installs the package: `PYTHONPATH` points at `src/`, in the container and in `pytest.ini` both.
 
 The Silero model is vendored rather than installed, because the `silero-vad` package declares `torch` even in ONNX mode.
 
@@ -491,9 +505,9 @@ pytest
 The ASR path is the riskiest integration and is worth exercising on its own, before any Discord wiring. Point `WYOMING_HOST` at any reachable Wyoming server and send the bundled speech fixture through the client:
 
 ```bash
-WYOMING_HOST=<asr-host> python -c "
+PYTHONPATH=src WYOMING_HOST=<asr-host> python -c "
 import asyncio, wave
-from stt.wyoming_client import transcribe
+from miss_quote.stt.wyoming_client import transcribe
 with wave.open('tests/fixtures/speech_16k_mono.wav', 'rb') as f:
     pcm = f.readframes(f.getnframes())
 print(asyncio.run(transcribe(pcm)))
