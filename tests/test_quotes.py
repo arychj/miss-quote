@@ -25,6 +25,7 @@ from miss_quote.tools.quotes import (
     DEFAULT_SELF_ANSWER_ANNOUNCEMENT,
     DEFAULT_SELF_ANSWER_PENALTY,
     DEFAULT_TIE_ANNOUNCEMENT,
+    FIRST_ROW,
     PENALIZE_SELF_ANSWERS_KEY,
     REMARKS_KEY,
     SELF_ANSWER_ANNOUNCEMENT_KEY,
@@ -233,6 +234,19 @@ def settled(monkeypatch) -> None:
     )
 
 
+def _drawn(monkeypatch, last: bool = False) -> None:
+    """
+    Settle which of several the tool draws, overriding the autouse `settled`.
+
+    For the two things it leaves to chance — the ending an announcement takes,
+    and the answer a repeated trigger gives — where a test is about the drawing
+    rather than about what was drawn.
+    """
+    monkeypatch.setattr(
+        "miss_quote.tools.quotes._chosen", lambda options: options[-1 if last else 0]
+    )
+
+
 @pytest.fixture
 def board(monkeypatch, tmp_path) -> Scoreboard:
     """
@@ -315,8 +329,10 @@ def _warmed_awards(
 
 def test_a_quote_is_loaded_for_every_row(quotes_file):
     assert _load(quotes_file) == {
-        TRIGGER: Quote(movie=MOVIE, trigger=TRIGGER, text=QUOTE),
-        OTHER_TRIGGER: Quote(movie=OTHER_MOVIE, trigger=OTHER_TRIGGER, text=OTHER_QUOTE),
+        TRIGGER: (Quote(movie=MOVIE, trigger=TRIGGER, text=QUOTE),),
+        OTHER_TRIGGER: (
+            Quote(movie=OTHER_MOVIE, trigger=OTHER_TRIGGER, text=OTHER_QUOTE),
+        ),
     }
 
 
@@ -363,10 +379,39 @@ def test_a_quote_with_an_unfillable_placeholder_is_dropped(monkeypatch, tmp_path
     assert set(_load(path)) == {TRIGGER, OTHER_TRIGGER}
 
 
-def test_the_first_of_two_rows_sharing_a_trigger_wins(monkeypatch, tmp_path):
-    path = _written(monkeypatch, tmp_path, HEADER, *ROWS, f"{MOVIE},{TRIGGER},something else")
+def test_every_row_sharing_a_trigger_is_kept(monkeypatch, tmp_path):
+    """A phrase worth answering two ways says so by being written down twice."""
+    path = _written(monkeypatch, tmp_path, HEADER, *ROWS, f"{MOVIE},{TRIGGER},{OTHER_QUOTE}")
 
-    assert _load(path)[TRIGGER].text == QUOTE
+    assert [quote.text for quote in _load(path)[TRIGGER]] == [QUOTE, OTHER_QUOTE]
+
+
+def test_rows_sharing_a_trigger_keep_the_order_of_the_file(monkeypatch, tmp_path):
+    """So that a seeded draw picks the same answer twice running."""
+    path = _written(
+        monkeypatch,
+        tmp_path,
+        HEADER,
+        f"{MOVIE},{TRIGGER},{OTHER_QUOTE}",
+        f"{MOVIE},{TRIGGER},{QUOTE}",
+    )
+
+    assert [quote.text for quote in _load(path)[TRIGGER]] == [OTHER_QUOTE, QUOTE]
+
+
+def test_rows_sharing_a_trigger_in_different_cases_are_one_trigger(monkeypatch, tmp_path):
+    """The trigger is folded before it is keyed, so case is not what tells them apart."""
+    path = _written(
+        monkeypatch,
+        tmp_path,
+        HEADER,
+        f"{MOVIE},{TRIGGER},{QUOTE}",
+        f"{MOVIE},{TRIGGER.upper()},{OTHER_QUOTE}",
+    )
+
+    loaded = _load(path)
+    assert set(loaded) == {TRIGGER}
+    assert len(loaded[TRIGGER]) == 2
 
 
 def test_two_triggers_may_share_a_quote(monkeypatch, tmp_path):
@@ -376,7 +421,7 @@ def test_two_triggers_may_share_a_quote(monkeypatch, tmp_path):
     )
 
     loaded = _load(path)
-    assert loaded[TRIGGER].text == loaded[GENERAL_TRIGGER].text == QUOTE
+    assert loaded[TRIGGER][0].text == loaded[GENERAL_TRIGGER][0].text == QUOTE
 
 
 def test_a_quote_may_hold_a_comma(monkeypatch, tmp_path):
@@ -384,7 +429,34 @@ def test_a_quote_may_hold_a_comma(monkeypatch, tmp_path):
     path = _written(monkeypatch, tmp_path, HEADER, f'{MOVIE},{COMMA_TRIGGER},"{COMMA_QUOTE}"')
 
     assert path.read_text(encoding="utf-8").count('"') == 2
-    assert _load(path)[COMMA_TRIGGER].text == COMMA_QUOTE
+    assert _load(path)[COMMA_TRIGGER][0].text == COMMA_QUOTE
+
+
+def test_a_row_with_an_unquoted_comma_is_dropped(monkeypatch, tmp_path):
+    """
+    What survives it is the line cut at the comma, which is worse than silence.
+
+    The only mistake in the file that loads cleanly: the reader files the rest of
+    the sentence under an overflow nothing reads, so `Boy, that escalated
+    quickly.` becomes `Boy` and nothing anywhere says so.
+    """
+    path = _written(
+        monkeypatch, tmp_path, HEADER, f"{MOVIE},{COMMA_TRIGGER},{COMMA_QUOTE}", *ROWS
+    )
+
+    assert set(_load(path)) == {TRIGGER, OTHER_TRIGGER}
+
+
+def test_the_dropped_row_says_which_line_and_why(monkeypatch, tmp_path, caplog):
+    path = _written(
+        monkeypatch, tmp_path, HEADER, f"{MOVIE},{COMMA_TRIGGER},{COMMA_QUOTE}", *ROWS
+    )
+
+    with caplog.at_level("WARNING"):
+        _load(path)
+
+    assert f"line {FIRST_ROW}" in caplog.text
+    assert "comma" in caplog.text
 
 
 def test_a_trigger_is_folded_for_matching(monkeypatch, tmp_path):
@@ -495,6 +567,86 @@ async def test_the_more_specific_of_two_overlapping_triggers_wins(
     await _hear(_tool(speaker), f"somebody has a {SPECIFIC_TRIGGER}")
 
     assert speech.asked == [SPECIFIC_QUOTE]
+
+
+# ── a trigger with more than one answer ───────────
+
+
+async def test_a_trigger_with_two_answers_gives_one_of_them(
+    monkeypatch, tmp_path, speech, speaker
+):
+    _written(
+        monkeypatch,
+        tmp_path,
+        HEADER,
+        f"{MOVIE},{TRIGGER},{QUOTE}",
+        f"{MOVIE},{TRIGGER},{OTHER_QUOTE}",
+    )
+
+    await _hear(_tool(speaker), TRIGGER)
+
+    assert speech.asked in ([QUOTE], [OTHER_QUOTE])
+
+
+async def test_which_answer_a_trigger_gives_is_drawn_each_time(
+    monkeypatch, tmp_path, speech, speaker
+):
+    """
+    Drawn when the trigger fires rather than settled at load.
+
+    A choice made once at startup would be the same one until the next restart,
+    which is a file with two answers in it and a channel that only ever hears
+    the one.
+    """
+    _written(
+        monkeypatch,
+        tmp_path,
+        HEADER,
+        f"{MOVIE},{TRIGGER},{QUOTE}",
+        f"{MOVIE},{TRIGGER},{OTHER_QUOTE}",
+    )
+    _drawn(monkeypatch, last=True)
+
+    tool = _tool(speaker, config={})
+    await _hear(tool, TRIGGER)
+
+    assert speech.asked == [OTHER_QUOTE]
+
+
+async def test_every_answer_a_trigger_can_give_is_warmed(
+    monkeypatch, tmp_path, speech, speaker
+):
+    """Warming any less would leave the channel waiting on the coin toss."""
+    _written(
+        monkeypatch,
+        tmp_path,
+        HEADER,
+        f"{MOVIE},{TRIGGER},{QUOTE}",
+        f"{MOVIE},{TRIGGER},{OTHER_QUOTE}",
+    )
+
+    await _tool(speaker).prewarm()
+
+    assert speech.warmed == [QUOTE, OTHER_QUOTE]
+
+
+async def test_a_trigger_with_two_answers_still_fires_once_per_window(
+    monkeypatch, tmp_path, speech, speaker
+):
+    """The backoff is on the trigger, so several answers are spent together."""
+    _written(
+        monkeypatch,
+        tmp_path,
+        HEADER,
+        f"{MOVIE},{TRIGGER},{QUOTE}",
+        f"{MOVIE},{TRIGGER},{OTHER_QUOTE}",
+    )
+
+    tool = _tool(speaker)
+    await _hear(tool, TRIGGER)
+    await _hear(tool, TRIGGER)
+
+    assert len(speech.asked) == 1
 
 
 # ── the speaker's name ────────────────────────────

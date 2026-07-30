@@ -5,11 +5,17 @@ Listens for a trigger phrase and, on hearing one, says the associated quote out
 loud where it was said. The pairs come from a CSV — a film, the phrase that sets
 it off, and the line — so adding a quote is a row rather than a deployment.
 
+A trigger may appear on more than one row, and one of them is drawn at random
+each time it fires. That is how a phrase worth answering several ways says so —
+the file lists the answers and the channel gets one of them — and it is why the
+list is keyed on the trigger rather than the row. See `_load`.
+
 A trigger that has just fired goes quiet for a while — five minutes by default.
 The joke is the recognition, and a channel that says "cool" four times in a
 minute does not want "Shiny." four times back. The backoff is per trigger rather
-than per speaker: what wears out is the line, not the person who set it off. See
-`RecentQuotes`.
+than per speaker: what wears out is the line, not the person who set it off, and
+a trigger with several answers spends all of them at once for the same reason.
+See `RecentQuotes`.
 
 A line that has just been said is also a question. For a few seconds afterwards
 the channel can name the title it came from — "what is Firefly" — and whoever
@@ -51,7 +57,7 @@ import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from miss_quote.config import quotes_cfg, scoreboard_cfg
 from miss_quote.tools.base import Tool, ToolContext
@@ -63,6 +69,8 @@ from miss_quote.utils.stems import plural
 
 logger = get_logger(__name__)
 
+T = TypeVar("T")
+
 MOVIE_COLUMN = "movie"
 TRIGGER_COLUMN = "trigger"
 QUOTE_COLUMN = "quote"
@@ -70,6 +78,12 @@ COLUMNS = (MOVIE_COLUMN, TRIGGER_COLUMN, QUOTE_COLUMN)
 
 FILE_ENCODING = "utf-8"
 COLUMN_SEPARATOR = ", "
+
+# Where `DictReader` files the fields a row has beyond its header. It is not a
+# column and nothing reads it, which is what makes an unquoted comma in a line
+# the one mistake that loads cleanly: the quote is cut at the comma and the rest
+# of the sentence lands here.
+OVERFLOW_COLUMN = None
 
 # Row 1 is the header, which `DictReader` consumes, so the first row of data is
 # the second line of the file. Counting the way an editor does is the point: a
@@ -133,7 +147,7 @@ DEFAULT_TIE_ANNOUNCEMENT = (
 # to know anything to give — the trigger and the title are both in front of
 # them — so it is the one worth being rude about.
 DEFAULT_SELF_ANSWER_ANNOUNCEMENT = (
-    "Nuh uh uh. {user}, you set it off, so you do not get to name it. "
+    "Nuh uh uh. {user}, you set it off, so you don't get to name it. "
     "You are fined {credits} for being a dick."
 )
 
@@ -442,9 +456,10 @@ class Quotes(Tool):
         self._rounds: dict[str, Round] = {}
 
         logger.debug(
-            "[%s] Listening for %d triggers: %s",
+            "[%s] Listening for %d triggers across %d quotes: %s",
             self.server,
             len(self._quotes),
+            _counted(self._quotes),
             TRIGGER_SEPARATOR.join(self._quotes),
         )
 
@@ -468,6 +483,11 @@ class Quotes(Tool):
         the spot. Which one comes up is decided when somebody answers; that all
         of them are already rendered is decided here.
 
+        Every answer a trigger can give is rendered, not the one it happens to
+        draw first. Which of them a trigger comes back with is decided when
+        somebody says it, so warming any less than all of them would leave the
+        channel waiting on a coin toss.
+
         Serial, and unhurried. Nothing is waiting on this, and a synthesizer
         asked for fifty phrases at once is one not answering whoever is speaking
         right now.
@@ -486,7 +506,8 @@ class Quotes(Tool):
         names = sorted(set(self.users.values()))
         wordings = [
             wording
-            for quote in self._quotes.values()
+            for answers in self._quotes.values()
+            for quote in answers
             for wording in self._wordings(quote, names)
         ]
 
@@ -503,7 +524,7 @@ class Quotes(Tool):
             "%d rendered, %d already cached.",
             self.server,
             len(wordings),
-            len(self._quotes),
+            _counted(self._quotes),
             len(names),
             rendered,
             len(wordings) - rendered,
@@ -754,16 +775,21 @@ class Quotes(Tool):
         Matches are walked in the order they were said rather than the order the
         file lists them, so the line that answers is the one whoever spoke
         arrived at first.
+
+        Where a trigger has more than one answer, which of them comes back is
+        drawn here rather than at load: the point of listing several is that the
+        channel does not get the same one twice, and a choice made once at
+        startup would be the same one until the next restart.
         """
         for match in self._triggers.finditer(text):
             trigger = match.group().casefold()
-            quote = self._quotes.get(trigger)
+            answers = self._quotes.get(trigger)
 
-            if quote is None:
+            if not answers:
                 continue
 
             if self._recent.ready(trigger):
-                return quote
+                return _chosen(answers)
 
             logger.debug(
                 "[%s] '%s' has been quoted inside the last %.0f seconds; letting it lie.",
@@ -886,14 +912,16 @@ def _remarks(extra: Any) -> tuple[str, ...]:
     return DEFAULT_REMARKS + added
 
 
-def _chosen(remarks: Sequence[str]) -> str:
+def _chosen(options: Sequence[T]) -> T:
     """
-    One ending, at random.
+    One of several, at random.
 
     Its own function so a test can settle what comes up without seeding the
-    process-wide generator out from under whatever else is using it.
+    process-wide generator out from under whatever else is using it. Used for
+    both things this tool leaves to chance: which ending an announcement takes,
+    and which answer a trigger with several of them gives.
     """
-    return random.choice(remarks)
+    return random.choice(options)
 
 
 def _normalized(text: str) -> str:
@@ -933,14 +961,20 @@ def _spoken(word: str) -> str:
     return SAID_ALIKE.get(word, re.escape(word))
 
 
-def _load(path: Path) -> Mapping[str, Quote]:
+def _load(path: Path) -> Mapping[str, tuple[Quote, ...]]:
     """
     Every quote in the file, by the trigger that sets it off.
 
-    One trigger per row, and a line may be reached by more than one of them: two
-    rows sharing an answer is how the file says that two phrases deserve the same
-    reply. The trigger is folded for matching, so a file may write it however it
-    reads best.
+    A trigger may appear on several rows, and each of them is kept: a phrase
+    worth answering more than one way says so by being written down more than
+    once, and which answer the channel gets is drawn when the trigger fires. The
+    reverse also holds — two rows may share an answer, which is how the file says
+    that two phrases deserve the same reply.
+
+    Rows keep the order the file lists them in, so a run is reproducible for
+    anything that seeds the draw. The trigger is folded for matching, so a file
+    may write it however it reads best, and so `Cool` and `cool` are two answers
+    to one trigger rather than two triggers.
 
     A row that is unusable is reported and dropped rather than raised on: a
     typo in one of fifty lines should cost that line. A file that is missing,
@@ -949,31 +983,33 @@ def _load(path: Path) -> Mapping[str, Quote]:
     startup instead of silence forever.
     """
     rows = _rows(path)
-    quotes: dict[str, Quote] = {}
+    quotes: dict[str, list[Quote]] = {}
 
     for number, row in enumerate(rows, start=FIRST_ROW):
         quote = _quote(path, number, row)
         if quote is None:
             continue
 
-        if quote.trigger in quotes:
-            logger.warning(
-                "%s line %d: '%s' already answers with %r; ignoring this one.",
-                path,
-                number,
-                quote.trigger,
-                quotes[quote.trigger].text,
-            )
-            continue
-
-        quotes[quote.trigger] = quote
+        quotes.setdefault(quote.trigger, []).append(quote)
 
     if not quotes:
         raise ValueError(f"{path} holds no usable quotes, so there is nothing to listen for.")
 
-    logger.info("Loaded %d quotes from %s.", len(quotes), path)
+    answers = {trigger: tuple(found) for trigger, found in quotes.items()}
 
-    return quotes
+    logger.info(
+        "Loaded %d quotes across %d triggers from %s.",
+        _counted(answers),
+        len(answers),
+        path,
+    )
+
+    return answers
+
+
+def _counted(quotes: Mapping[str, tuple[Quote, ...]]) -> int:
+    """How many rows the file gave, where `len` gives how many triggers they set off."""
+    return sum(len(answers) for answers in quotes.values())
 
 
 def _rows(path: Path) -> list[Mapping[str, str]]:
@@ -1007,10 +1043,32 @@ def _quote(path: Path, number: int, row: Mapping[str, str]) -> Quote | None:
     carrying a placeholder nothing fills — which is checked here rather than at
     the moment somebody says the trigger, by which point the tool has one job
     and cannot do it.
+
+    So is a row with more fields than columns, which is what an unquoted comma
+    in a line looks like from here. That one is dropped rather than kept because
+    what survives it is the quote cut at the comma — "Boy" for "Boy, that
+    escalated quickly." — and a film line delivered with its second half missing
+    is worse out loud than not being said at all. `scripts/validate_quotes.py`
+    catches it before a merge; this catches it in a file mounted over the shipped
+    one, which never goes past CI.
     """
     trigger = (row.get(TRIGGER_COLUMN) or "").strip()
     text = (row.get(QUOTE_COLUMN) or "").strip()
     movie = (row.get(MOVIE_COLUMN) or "").strip()
+
+    overflow = row.get(OVERFLOW_COLUMN)
+    if overflow:
+        logger.warning(
+            "%s line %d: %r has %d field(s) beyond %s, so %r would be cut at the "
+            "comma. Quote a value that contains one. Skipping it.",
+            path,
+            number,
+            trigger or movie,
+            len(overflow),
+            COLUMN_SEPARATOR.join(COLUMNS),
+            text,
+        )
+        return None
 
     if not trigger or not text:
         logger.warning(

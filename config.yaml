@@ -132,7 +132,7 @@ servers:
           # name their own line, where `{credits}` is what it cost them. Never
           # said at all where `penalize_self_answers` is false.
           #
-          # self_answer_announcement: "Nuh uh uh. {user}, you set it off, so you do not get to name it. You are fined {credits} for being a dick."
+          # self_answer_announcement: "Nuh uh uh. {user}, you set it off, so you don't get to name it. You are fined {credits} for being a dick."
 
       # Keeps this server's running tally and publishes it to the voice channel
       # topic as `Eli: -9 Erik: -2`, which needs Set Voice Channel Status on the
