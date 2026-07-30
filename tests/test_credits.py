@@ -69,42 +69,53 @@ def test_a_fresh_ledger_has_spent_nothing(ledger):
 
 def test_a_fine_comes_off_a_balance(ledger):
     """A fine is a debit: what it says is what swearing has cost somebody."""
-    ledger.fine(SERVER, ELI_ID, ELI, 2)
+    ledger.debit(SERVER, ELI_ID, ELI, 2)
 
     assert ledger.total(SERVER, ELI_ID) == -2
 
 
 def test_fines_accumulate(ledger):
-    ledger.fine(SERVER, ELI_ID, ELI, 2)
-    ledger.fine(SERVER, ELI_ID, ELI, 3)
+    ledger.debit(SERVER, ELI_ID, ELI, 2)
+    ledger.debit(SERVER, ELI_ID, ELI, 3)
 
     assert ledger.total(SERVER, ELI_ID) == -5
 
 
 def test_a_fine_reports_the_new_balance(ledger):
-    ledger.fine(SERVER, ELI_ID, ELI, 2)
+    ledger.debit(SERVER, ELI_ID, ELI, 2)
 
-    assert ledger.fine(SERVER, ELI_ID, ELI, 1) == -3
+    assert ledger.debit(SERVER, ELI_ID, ELI, 1) == -3
 
 
 def test_a_balance_is_per_server(ledger):
-    ledger.fine(SERVER, ELI_ID, ELI, 2)
+    ledger.debit(SERVER, ELI_ID, ELI, 2)
 
     assert ledger.total(OTHER_SERVER, ELI_ID) == 0
 
 
 def test_a_balance_is_per_person(ledger):
-    ledger.fine(SERVER, ELI_ID, ELI, 2)
+    ledger.debit(SERVER, ELI_ID, ELI, 2)
 
     assert ledger.total(SERVER, ERIK_ID) == 0
+
+
+def test_a_credit_goes_the_other_way(ledger):
+    """Nothing about the board assumes a balance only ever falls."""
+    ledger.debit(SERVER, ELI_ID, ELI, 2)
+
+    assert ledger.credit(SERVER, ELI_ID, ELI, 3) == 1
+
+
+def test_a_credit_opens_an_account_for_a_stranger(ledger):
+    assert ledger.credit(SERVER, ERIK_ID, ERIK, 2) == 2
 
 
 def test_a_renamed_speaker_keeps_their_debt(ledger):
     """Identity is the ID; the name is only what gets printed."""
     ledger.enroll(SERVER, {ELI_ID: ELI})
-    ledger.fine(SERVER, ELI_ID, ELI, 2)
+    ledger.debit(SERVER, ELI_ID, ELI, 2)
 
-    ledger.fine(SERVER, ELI_ID, "Elijah", 1)
+    ledger.debit(SERVER, ELI_ID, "Elijah", 1)
 
     assert ledger.topic(SERVER) == "Elijah: -3"
 
@@ -120,7 +131,7 @@ def test_a_roster_starts_on_the_board_at_nothing_spent(ledger):
 
 def test_enrolling_does_not_reset_a_balance(ledger):
     """It runs at every startup, and a restart is not an amnesty."""
-    ledger.fine(SERVER, ELI_ID, ELI, 4)
+    ledger.debit(SERVER, ELI_ID, ELI, 4)
 
     ledger.enroll(SERVER, ROSTER)
 
@@ -150,8 +161,8 @@ def test_enrolling_the_same_roster_twice_changes_nothing(ledger):
 def test_the_board_is_ordered_worst_first(ledger):
     """It is a leaderboard now, and who is winning is what a reader wants."""
     ledger.enroll(SERVER, ROSTER)
-    ledger.fine(SERVER, ELI_ID, ELI, 1)
-    ledger.fine(SERVER, RYAN_ID, RYAN, 9)
+    ledger.debit(SERVER, ELI_ID, ELI, 1)
+    ledger.debit(SERVER, RYAN_ID, RYAN, 9)
 
     assert ledger.topic(SERVER) == f"{RYAN}: -9 {ELI}: -1 {ERIK}: 0 {LUKE}: 0"
 
@@ -159,7 +170,7 @@ def test_the_board_is_ordered_worst_first(ledger):
 def test_the_board_holds_four_places(ledger):
     ledger.enroll(SERVER, _contenders())
     for user_id in _contenders():
-        ledger.fine(SERVER, user_id, f"{NAME}-{user_id}", user_id)
+        ledger.debit(SERVER, user_id, f"{NAME}-{user_id}", user_id)
 
     entries = re.findall(rf"{NAME}-\d+: -\d+", ledger.topic(SERVER))
 
@@ -169,7 +180,7 @@ def test_the_board_holds_four_places(ledger):
 def test_the_board_holds_the_worst_of_them(ledger):
     ledger.enroll(SERVER, _contenders())
     for user_id in _contenders():
-        ledger.fine(SERVER, user_id, f"{NAME}-{user_id}", user_id)
+        ledger.debit(SERVER, user_id, f"{NAME}-{user_id}", user_id)
 
     deepest = sorted(_contenders(), reverse=True)[:SCOREBOARD_PLACES]
     assert ledger.topic(SERVER) == ENTRY_SEPARATOR.join(
@@ -180,8 +191,8 @@ def test_the_board_holds_the_worst_of_them(ledger):
 def test_a_tie_breaks_on_the_name(ledger):
     """So two people on one balance do not swap places between edits for nothing."""
     ledger.enroll(SERVER, {ERIK_ID: ERIK, ELI_ID: ELI})
-    ledger.fine(SERVER, ERIK_ID, ERIK, 3)
-    ledger.fine(SERVER, ELI_ID, ELI, 3)
+    ledger.debit(SERVER, ERIK_ID, ERIK, 3)
+    ledger.debit(SERVER, ELI_ID, ELI, 3)
 
     assert ledger.topic(SERVER) == f"{ELI}: -3 {ERIK}: -3"
 
@@ -190,7 +201,7 @@ def test_somebody_off_the_roster_is_not_on_the_board(ledger):
     """A nickname its owner can set to anything is not going in a channel topic."""
     ledger.enroll(SERVER, {ELI_ID: ELI})
 
-    ledger.fine(SERVER, STRANGER_ID, STRANGER, 9)
+    ledger.debit(SERVER, STRANGER_ID, STRANGER, 9)
 
     assert ledger.topic(SERVER) == f"{ELI}: 0"
 
@@ -199,13 +210,13 @@ def test_somebody_off_the_roster_is_still_fined(ledger):
     """Ineligible for the board is not the same as unwatched."""
     ledger.enroll(SERVER, {ELI_ID: ELI})
 
-    ledger.fine(SERVER, STRANGER_ID, STRANGER, 9)
+    ledger.debit(SERVER, STRANGER_ID, STRANGER, 9)
 
     assert ledger.total(SERVER, STRANGER_ID) == -9
 
 
 def test_somebody_added_to_the_roster_joins_the_board(ledger):
-    ledger.fine(SERVER, STRANGER_ID, STRANGER, 2)
+    ledger.debit(SERVER, STRANGER_ID, STRANGER, 2)
 
     ledger.enroll(SERVER, {STRANGER_ID: STRANGER})
 
@@ -219,8 +230,8 @@ def test_the_board_of_a_server_nobody_has_enrolled_is_empty(ledger):
 def test_the_board_holds_only_its_own_server(ledger):
     ledger.enroll(SERVER, {ELI_ID: ELI})
     ledger.enroll(OTHER_SERVER, {ERIK_ID: ERIK})
-    ledger.fine(SERVER, ELI_ID, ELI, 1)
-    ledger.fine(OTHER_SERVER, ERIK_ID, ERIK, 1)
+    ledger.debit(SERVER, ELI_ID, ELI, 1)
+    ledger.debit(OTHER_SERVER, ERIK_ID, ERIK, 1)
 
     assert ledger.topic(SERVER) == f"{ELI}: -1"
 
@@ -254,16 +265,16 @@ def test_nothing_has_happened_to_a_fresh_ledger(ledger):
 
 
 def test_a_fine_bumps_the_revision(ledger):
-    ledger.fine(SERVER, ELI_ID, ELI, 1)
+    ledger.debit(SERVER, ELI_ID, ELI, 1)
 
     assert ledger.revision > UNWRITTEN
 
 
 def test_a_revision_belongs_to_the_server_that_changed(ledger):
-    ledger.fine(SERVER, ELI_ID, ELI, 1)
+    ledger.debit(SERVER, ELI_ID, ELI, 1)
     revision = ledger.revision_for(SERVER)
 
-    ledger.fine(OTHER_SERVER, ELI_ID, ELI, 1)
+    ledger.debit(OTHER_SERVER, ELI_ID, ELI, 1)
 
     assert ledger.revision_for(SERVER) == revision
     assert ledger.revision_for(OTHER_SERVER) > revision
@@ -273,7 +284,7 @@ def test_a_revision_belongs_to_the_server_that_changed(ledger):
 
 
 def test_a_saved_tally_is_loaded_again(ledger, path):
-    ledger.fine(SERVER, ELI_ID, ELI, 3)
+    ledger.debit(SERVER, ELI_ID, ELI, 3)
     ledger.save()
 
     assert CreditLedger(path).total(SERVER, ELI_ID) == -3
@@ -282,7 +293,7 @@ def test_a_saved_tally_is_loaded_again(ledger, path):
 def test_a_loaded_tally_is_not_on_the_board_until_a_roster_is_enrolled(ledger, path):
     """The roster says who may be shown, and no tool has been built to supply one."""
     ledger.enroll(SERVER, {ELI_ID: ELI})
-    ledger.fine(SERVER, ELI_ID, ELI, 3)
+    ledger.debit(SERVER, ELI_ID, ELI, 3)
     ledger.save()
 
     assert CreditLedger(path).topic(SERVER) == ""
@@ -290,7 +301,7 @@ def test_a_loaded_tally_is_not_on_the_board_until_a_roster_is_enrolled(ledger, p
 
 def test_enrolling_puts_a_loaded_balance_back_on_the_board(ledger, path):
     ledger.enroll(SERVER, {ELI_ID: ELI})
-    ledger.fine(SERVER, ELI_ID, ELI, 3)
+    ledger.debit(SERVER, ELI_ID, ELI, 3)
     ledger.save()
 
     reloaded = CreditLedger(path)
@@ -303,7 +314,7 @@ def test_saving_creates_the_directory(tmp_path):
     path = tmp_path / "nested" / LEDGER_NAME
     ledger = CreditLedger(path)
 
-    ledger.fine(SERVER, ELI_ID, ELI, 1)
+    ledger.debit(SERVER, ELI_ID, ELI, 1)
     ledger.save()
 
     assert path.is_file()
@@ -354,7 +365,7 @@ def test_an_unwritable_path_costs_the_persistence_not_the_counting(tmp_path, cap
     blocked.write_text("not a directory", encoding="utf-8")
     ledger = CreditLedger(blocked / LEDGER_NAME)
 
-    ledger.fine(SERVER, ELI_ID, ELI, 1)
+    ledger.debit(SERVER, ELI_ID, ELI, 1)
     with caplog.at_level("ERROR"):
         ledger.save()
 
@@ -363,7 +374,7 @@ def test_an_unwritable_path_costs_the_persistence_not_the_counting(tmp_path, cap
 
 
 def test_a_save_leaves_no_partial_file_behind(ledger, path):
-    ledger.fine(SERVER, ELI_ID, ELI, 1)
+    ledger.debit(SERVER, ELI_ID, ELI, 1)
     ledger.save()
 
     assert [found.name for found in path.parent.iterdir()] == [LEDGER_NAME]
@@ -371,7 +382,7 @@ def test_a_save_leaves_no_partial_file_behind(ledger, path):
 
 def test_the_file_is_readable_by_a_human(ledger, path):
     """It is a tally of imaginary money; somebody will want to edit it by hand."""
-    ledger.fine(SERVER, ELI_ID, ELI, 3)
+    ledger.debit(SERVER, ELI_ID, ELI, 3)
     ledger.save()
 
     assert json.loads(path.read_text(encoding="utf-8")) == {

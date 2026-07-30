@@ -2,10 +2,13 @@
 The Verbal Morality Bot, after Demolition Man.
 
 Listens for words the server has decided against and, on hearing one, announces
-the fine out loud in the channel it was said in. The credits are imaginary but
-they are counted: a fine comes off a balance that starts at nothing, the four
-deepest in the red go in the voice channel topic, and `ledger.credits` keeps it
-across restarts.
+the fine out loud in the channel it was said in.
+
+The credits are imaginary but they are counted, by somebody else: the fine is
+handed to the server's `scoreboard`, which is what keeps a balance, writes it
+down, and puts the worst of it in the voice channel topic. A server that has not
+enabled one gets the announcement and no tally, which is said once at startup
+rather than left to be noticed.
 
 A repeat offender is announced more and more quietly. Being fined is the joke,
 and a joke told fifteen times in five minutes is a denial of service on the
@@ -38,12 +41,18 @@ from __future__ import annotations
 
 import re
 import time
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
-from miss_quote.config import PERCENT, UNITY_VOLUME, morality_cfg, tts_cfg
-from miss_quote.ledger.credits import shared_ledger
-from miss_quote.tools.base import Speaker, Tool
+from miss_quote.config import (
+    PERCENT,
+    UNITY_VOLUME,
+    morality_cfg,
+    scoreboard_cfg,
+    tts_cfg,
+)
+from miss_quote.tools.base import Tool, ToolContext
+from miss_quote.tools.scoreboard import Scoreboard
 from miss_quote.transcript.writer import TranscriptSession, Utterance
 from miss_quote.tts.cache import shared_cache
 from miss_quote.utils.logging import get_logger
@@ -92,6 +101,9 @@ WORD_BOUNDARY = r"\b"
 ALTERNATION = "|"
 
 SINGLE_CREDIT = 1
+
+# What the log says instead of a balance where no scoreboard is keeping one.
+UNCOUNTED = "uncounted"
 
 SINGLE_OFFENCE = 1
 SINGLE_VIOLATION = "a violation"
@@ -211,15 +223,10 @@ class VerbalMorality(Tool):
 
     name = "verbal-morality"
 
-    def __init__(
-        self,
-        server: str,
-        config: Mapping[str, Any],
-        speaker: Speaker,
-        users: Mapping[int, str] | None = None,
-    ) -> None:
-        super().__init__(server, config, speaker, users)
+    def __init__(self, context: ToolContext) -> None:
+        super().__init__(context)
 
+        config = self.config
         self._vocabulary = _vocabulary(config.get(WORDS_KEY))
         self._forbidden = _pattern(self._vocabulary)
         self._announcement = _checked(
@@ -233,12 +240,6 @@ class VerbalMorality(Tool):
         self._chime = self._located(config.get(CHIME_KEY))
         self._recent = RecentViolations()
         self._announcing = False
-
-        # Enrolled at construction so the topic reads `Eli: 0 Erik: 0` before
-        # anybody has sworn, rather than filling in one name at a time as each
-        # person earns their first fine.
-        self._credits = shared_ledger()
-        self._credits.enroll(self.server, self.users)
 
         logger.debug(
             "[%s] Listening for %d words: %s",
@@ -293,6 +294,15 @@ class VerbalMorality(Tool):
         asked for a hundred phrases at once is a synthesizer not answering
         whoever is speaking right now.
         """
+        if self._scoreboard() is None:
+            # The first moment at which every tool on the server exists, so the
+            # first at which the absence of one means anything.
+            logger.warning(
+                "[%s] No scoreboard is enabled, so fines will be announced and not "
+                "counted. Enable the 'scoreboard' tool to keep a tally.",
+                self.server,
+            )
+
         names = sorted(set(self.users.values()))
         if not names:
             logger.debug(
@@ -354,31 +364,29 @@ class VerbalMorality(Tool):
         self._recent.record(utterance.user_id, len(offences))
 
         fine = _fine(len(offences))
-        balance = self._credits.fine(
-            self.server, utterance.user_id, utterance.user, len(offences)
-        )
+        standing = self._charge(utterance.user_id, utterance.user, len(offences))
         said = OFFENCE_SEPARATOR.join(f"'{offence}'" for offence in offences)
 
         if self._announcing:
             logger.info(
                 "🚨 [%s] %s said %s; fined %s while an announcement was already "
-                "playing, so this one goes unsaid (balance %d).",
+                "playing, so this one goes unsaid (%s).",
                 self.server,
                 utterance.user,
                 said,
                 fine,
-                balance,
+                standing,
             )
             return
 
         logger.info(
-            "🚨 [%s] %s said %s; announcing a fine of %s at %d%% volume (balance %d).",
+            "🚨 [%s] %s said %s; announcing a fine of %s at %d%% volume (%s).",
             self.server,
             utterance.user,
             said,
             fine,
             round(scale * PERCENT),
-            balance,
+            standing,
         )
 
         self._announcing = True
@@ -390,6 +398,29 @@ class VerbalMorality(Tool):
             )
         finally:
             self._announcing = False
+
+    def _scoreboard(self) -> Scoreboard | None:
+        """
+        The server's board, if it keeps one.
+
+        Looked for on the way past rather than held, because a tool's neighbours
+        are only all built once every one of them is; see `Toolbox`.
+        """
+        return self.tools.find(Scoreboard)
+
+    def _charge(self, user_id: int, user: str, offences: int) -> str:
+        """
+        Take the fine off whoever earned it, as the log would put it.
+
+        A server with no scoreboard is fined at and not charged, which is a whole
+        working configuration rather than a failure: announcing the fine is this
+        tool's job, and keeping score is somebody else's.
+        """
+        board = self._scoreboard()
+        if board is None:
+            return UNCOUNTED
+
+        return f"balance {board.debit(user_id, user, offences)}"
 
     def _wording(self, user: str, offences: int, repeat: bool = FIRST_FINE) -> str:
         """
@@ -517,7 +548,7 @@ def _fine(offences: int) -> str:
     pointing this at reads as a number; the noun does not get the same treatment
     — "1 credits" is wrong in a way a listener hears.
     """
-    currency = morality_cfg.currency
+    currency = scoreboard_cfg.currency
     noun = currency if offences == SINGLE_CREDIT else plural(currency)
 
     return f"{offences} {noun}"

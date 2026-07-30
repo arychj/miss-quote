@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from miss_quote.config import quotes_cfg
-from miss_quote.tools.base import Speaker, Tool
+from miss_quote.tools.base import Tool, ToolContext
 from miss_quote.transcript.writer import TranscriptSession, Utterance
 from miss_quote.tts.cache import shared_cache
 from miss_quote.utils.logging import get_logger
@@ -142,14 +142,8 @@ class Quotes(Tool):
 
     name = "quotes"
 
-    def __init__(
-        self,
-        server: str,
-        config: Mapping[str, Any],
-        speaker: Speaker,
-        users: Mapping[int, str] | None = None,
-    ) -> None:
-        super().__init__(server, config, speaker, users)
+    def __init__(self, context: ToolContext) -> None:
+        super().__init__(context)
 
         self._quotes = _load(quotes_cfg.file)
         self._triggers = _pattern(self._quotes)

@@ -321,17 +321,17 @@ class ProcessConfig:
 
 
 # ──────────────────────────────────────────────
-# Verbal morality
+# Scoreboard
 # ──────────────────────────────────────────────
 @dataclass(frozen=True)
-class MoralityConfig:
+class ScoreboardConfig:
     """
-    The standing tally of fines, and how quiet a repeat offender gets.
+    The standing tally: where it is kept, what it counts in, and how often it
+    reaches disk and the channel.
 
-    Where the rest of the tool's settings are per server and live in the mounted
-    file, these are per deployment: where the tally is kept, what it is counted
-    in, how often it is published, and how the backoff behaves, none of which one
-    server should be able to set differently from another.
+    Per deployment rather than per server, unlike the decision to keep a
+    scoreboard at all: there is one file behind every server's board, and how
+    often it is written is a property of the file rather than of any one server.
     """
 
     # The tally, as JSON, kept across restarts. Mount a volume here; an
@@ -340,9 +340,9 @@ class MoralityConfig:
         default_factory=lambda: Path(_env_str("CREDITS_FILE", "/credits/credits.json"))
     )
 
-    # What a fine is denominated in, in the singular. The plural is grown from
+    # What a balance is denominated in, in the singular. The plural is grown from
     # it by the same spelling rules the word list uses, so a deployment that
-    # fines in something other than credits sets one variable rather than
+    # counts in something other than credits sets one variable rather than
     # rewriting every server's announcement.
     currency: str = field(default_factory=lambda: _env_str("CREDIT_CURRENCY", "credit"))
 
@@ -354,14 +354,28 @@ class MoralityConfig:
     )
 
     # How often a changed tally is published to the voice channel topic — the
-    # line the client shows under the channel's name, which `bot.scoreboard` sets
-    # as the channel status because a voice channel has no topic. Discord's
-    # bucket for it is roughly six a second, so this is a question of how often a
-    # tally is worth reading rather than of what the API will tolerate. Any value
-    # at or below zero keeps the tally off the channel, and still saves it.
+    # line the client shows under the channel's name, which `bot.topic` sets as
+    # the channel status because a voice channel has no topic. Discord's bucket
+    # for it is roughly six a second, so this is a question of how often a tally
+    # is worth reading rather than of what the API will tolerate. Any value at or
+    # below zero keeps the tally off the channel, and still saves it.
     topic_interval_seconds: float = field(
         default_factory=lambda: _env_float("CREDITS_TOPIC_SECONDS", 10.0)
     )
+
+
+# ──────────────────────────────────────────────
+# Verbal morality
+# ──────────────────────────────────────────────
+@dataclass(frozen=True)
+class MoralityConfig:
+    """
+    How soon a fine is a repeat, and how quiet a repeat offender gets.
+
+    Where the rest of the tool's settings are per server and live in the mounted
+    file, these are per deployment. What a fine costs and where that is written
+    down belong to the scoreboard rather than here; see `ScoreboardConfig`.
+    """
 
     # How soon after being fined a speaker is announced as being fined *again*,
     # which is a second wording rather than a second announcement. Short, and
@@ -400,15 +414,6 @@ class MoralityConfig:
             max(SILENT_VOLUME, _env_float("VIOLATION_VOLUME_FLOOR", 0.25)),
         )
     )
-
-    @property
-    def counting_enabled(self) -> bool:
-        """Whether anything happens between startup and shutdown."""
-        return self.save_interval_seconds > 0
-
-    @property
-    def publishing_enabled(self) -> bool:
-        return self.topic_interval_seconds > 0
 
 
 # ──────────────────────────────────────────────
@@ -690,6 +695,7 @@ stt_cfg = STTConfig()
 tts_cfg = TTSConfig()
 transcript_cfg = TranscriptConfig()
 process_cfg = ProcessConfig()
+scoreboard_cfg = ScoreboardConfig()
 morality_cfg = MoralityConfig()
 quotes_cfg = QuotesConfig()
 log_cfg = LogConfig()

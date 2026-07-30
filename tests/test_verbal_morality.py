@@ -14,10 +14,13 @@ from miss_quote.config import (
     ServerConfig,
     ToolSettings,
     morality_cfg,
+    scoreboard_cfg,
     tts_cfg,
 )
 from miss_quote.ledger.credits import CreditLedger
+from miss_quote.tools.base import ToolContext, Toolbox
 from miss_quote.tools.runner import ToolRunner
+from miss_quote.tools.scoreboard import Scoreboard
 from miss_quote.tools.verbal_morality import (
     DEFAULT_ANNOUNCEMENT,
     DEFAULT_REPEAT_ANNOUNCEMENT,
@@ -173,12 +176,12 @@ def credits(monkeypatch, tmp_path) -> CreditLedger:
     """
     A ledger of its own per test, in place of the process-wide one.
 
-    Autouse because every tool built here enrolls its roster on construction, and
-    a tool reaching the real ledger would read whatever the deployment has on
+    Autouse because every board built here enrolls its roster on construction,
+    and one reaching the real ledger would read whatever the deployment has on
     disk — and, worse, count into it.
     """
     ledger = CreditLedger(tmp_path / "credits.json")
-    monkeypatch.setattr("miss_quote.tools.verbal_morality.shared_ledger", lambda: ledger)
+    monkeypatch.setattr("miss_quote.tools.scoreboard.shared_ledger", lambda: ledger)
 
     return ledger
 
@@ -195,14 +198,36 @@ def speaker() -> RecordingSpeaker:
     return RecordingSpeaker()
 
 
-def _tool(speaker, config=None, users=None) -> VerbalMorality:
-    # `is None` rather than a falsy check: an empty config is a case under test.
-    return VerbalMorality(
-        server=SERVER_ALIAS,
+def _tool(
+    speaker,
+    config=None,
+    users=None,
+    server: str = SERVER_ALIAS,
+    counted: bool = True,
+) -> VerbalMorality:
+    """
+    The tool, with its server's board beside it in one box.
+
+    Which is what the runner builds: the fine reaches the tally because both
+    tools are that server's, not because either knows about the other's
+    settings. `counted=False` is the server that enabled no board.
+    """
+    context = ToolContext(
+        server=server,
+        # `is None` rather than a falsy check: an empty config is a case under test.
         config={"words": WORDS} if config is None else config,
         speaker=speaker,
-        users=users,
+        users=users or {},
+        tools=Toolbox(),
     )
+
+    if counted:
+        context.tools.add(Scoreboard(replace(context, config={})))
+
+    tool = VerbalMorality(context)
+    context.tools.add(tool)
+
+    return tool
 
 
 def _utterance(
@@ -375,8 +400,9 @@ async def test_the_credits_are_available_to_a_custom_announcement(speech, speake
 
 
 def _denominated(monkeypatch, currency: str) -> None:
+    """What a fine is counted in belongs to the board that keeps the count."""
     monkeypatch.setattr(
-        verbal_morality, "morality_cfg", replace(morality_cfg, currency=currency)
+        verbal_morality, "scoreboard_cfg", replace(scoreboard_cfg, currency=currency)
     )
 
 
@@ -497,6 +523,28 @@ async def test_a_fine_comes_off_the_tally(speech, speaker, credits):
     assert credits.total(SERVER_ALIAS, SPEAKER_ID) == -1
 
 
+async def test_a_fine_is_still_announced_where_nothing_is_counting(speech, speaker):
+    """Announcing the fine is this tool's job; keeping score is somebody else's."""
+    await _hear(_tool(speaker, counted=False), FORBIDDEN)
+
+    assert speech.asked == [_wording(SPEAKER, "1 credit", "a violation")]
+
+
+async def test_a_server_with_no_scoreboard_is_told_at_startup(speech, speaker, caplog):
+    """Rather than left to be discovered by wondering why the topic is empty."""
+    with caplog.at_level("WARNING"):
+        await _tool(speaker, counted=False).prewarm()
+
+    assert any("No scoreboard is enabled" in record.message for record in caplog.records)
+
+
+async def test_a_server_with_a_scoreboard_is_not_told_anything(speech, speaker, caplog):
+    with caplog.at_level("WARNING"):
+        await _tool(speaker).prewarm()
+
+    assert caplog.records == []
+
+
 async def test_the_tally_accumulates_across_utterances(speech, speaker, credits):
     tool = _tool(speaker)
 
@@ -556,12 +604,7 @@ async def test_somebody_off_the_roster_is_still_announced(speech, speaker):
 async def test_two_servers_keep_their_own_tallies(speech, speaker, credits):
     """A server's words are its own, and so is what they cost."""
     here = _tool(speaker, users=ROSTER)
-    elsewhere = VerbalMorality(
-        server=OTHER_SERVER_ALIAS,
-        config={"words": WORDS},
-        speaker=speaker,
-        users=ROSTER,
-    )
+    elsewhere = _tool(speaker, users=ROSTER, server=OTHER_SERVER_ALIAS)
 
     await _hear(here, FORBIDDEN)
     await _hear(elsewhere, f"{FORBIDDEN} {ALSO_FORBIDDEN}")
@@ -1087,3 +1130,28 @@ async def test_the_runner_warms_a_configured_server(speech, speaker):
 
     assert runner.problems == []
     assert len(speech.warmed) == len(ROSTER) * WARMED_PER_SPEAKER
+
+async def test_the_runner_wires_a_fine_to_the_board(speech, speaker, credits):
+    """
+    The other seam: two tools on one server, and a fine that reaches the tally.
+
+    Built the way a deployment builds them — from the config file, in the order
+    it happens to list them — rather than handed to each other by a test.
+    """
+    servers = {
+        SOURCE.guild_id: ServerConfig(
+            alias=SERVER_ALIAS,
+            users=ROSTER,
+            tools={
+                VerbalMorality.name: ToolSettings(enabled=True, config={"words": WORDS}),
+                Scoreboard.name: ToolSettings(enabled=True, config={}),
+            },
+        )
+    }
+    registry = {VerbalMorality.name: VerbalMorality, Scoreboard.name: Scoreboard}
+    runner = ToolRunner(servers, registry, speaker)
+
+    await runner.dispatch_utterance(FakeSession(SOURCE), _utterance(FORBIDDEN))
+
+    assert runner.problems == []
+    assert credits.total(SERVER_ALIAS, SPEAKER_ID) == -1

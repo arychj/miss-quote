@@ -1,9 +1,9 @@
 """
 What everybody has left, per server.
 
-Fines used to be announced and forgotten. They are now subtracted from a balance,
-kept on disk, and published to the voice channel topic as `Eli: -9 Erik: -2` —
-which makes the topic the scoreboard, visible without asking the bot anything.
+Balances are kept on disk and published to the voice channel topic as
+`Eli: -9 Erik: -2` — which makes the topic the scoreboard, visible without asking
+the bot anything.
 
 A fine is a debit. Everybody starts at nothing and goes down from there, so the
 number beside a name reads as what swearing has cost them rather than as points
@@ -18,21 +18,22 @@ get rewritten, and neither should hand somebody else's debt to whoever inherited
 their nickname; the name stored beside a total is the one to print, refreshed
 each time its owner earns something.
 
-Nothing here touches Discord or the event loop. Changes bump a revision, and
-whoever is publishing or persisting compares that against what it last wrote
-out; see `bot.scoreboard`. That is what keeps a tally that changed four times
-between two ticks to one topic edit and one write.
+Nothing here touches Discord. Changes bump a revision, and whoever is publishing
+compares that against what it last put up; see `tools.scoreboard`. That is what
+keeps a tally that changed four times between two ticks to one topic edit and one
+write.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from miss_quote.config import morality_cfg
+from miss_quote.config import scoreboard_cfg
 from miss_quote.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -86,11 +87,13 @@ class CreditLedger:
     """
 
     def __init__(self, path: Path | None = None) -> None:
-        self._path = Path(morality_cfg.credits_file if path is None else path)
+        self._path = Path(scoreboard_cfg.credits_file if path is None else path)
         self._servers: dict[str, dict[int, Account]] = {}
         self._rosters: dict[str, frozenset[int]] = {}
         self._revision = UNWRITTEN
         self._changed: dict[str, int] = {}
+        self._saved = UNWRITTEN
+        self._writing = asyncio.Lock()
 
         self._load()
 
@@ -129,7 +132,12 @@ class CreditLedger:
         """
         accounts = self._servers.setdefault(server, {})
         roster = frozenset(users)
-        changed = self._rosters.get(server) != roster
+
+        # Against an empty set rather than None, so a server that enrolls nobody
+        # is not a change: there is no roster to be eligible for, so nothing
+        # about the board can have come out differently, and the alternative is
+        # a write and a topic edit at every startup that say the same nothing.
+        changed = self._rosters.get(server, frozenset()) != roster
 
         self._rosters[server] = roster
 
@@ -146,18 +154,32 @@ class CreditLedger:
         if changed:
             self._bump(server)
 
-    def fine(self, server: str, user_id: int, name: str, credits: int) -> int:
+    def debit(self, server: str, user_id: int, name: str, credits: int) -> int:
         """
-        Take a fine off what somebody has left, and report the new balance.
+        Take credits off what somebody has left, and report the new balance.
 
-        A debit rather than a credit: what the number beside a name says is what
-        swearing has cost them, so it starts at nothing and goes down. The
-        balance is returned as it now stands, which is negative for anybody who
-        has ever been fined.
+        What a fine is. The number beside a name says what swearing has cost
+        them, so it starts at nothing and goes down; the balance comes back as it
+        now stands, which is negative for anybody who has ever been fined.
+        """
+        return self._adjust(server, user_id, name, -credits)
+
+    def credit(self, server: str, user_id: int, name: str, credits: int) -> int:
+        """
+        Put credits back on what somebody has left, and report the new balance.
+
+        The other direction, for whatever a deployment decides is worth being
+        paid for. Nothing about the board assumes a balance is negative.
+        """
+        return self._adjust(server, user_id, name, credits)
+
+    def _adjust(self, server: str, user_id: int, name: str, credits: int) -> int:
+        """
+        Move one balance, opening an account for a stranger.
 
         The name is refreshed on the way past: it is what the topic prints, and
-        the one that arrived with the fine is the most recent thing anybody knows
-        about what to call them.
+        the one that arrived with the change is the most recent thing anybody
+        knows about what to call them.
         """
         accounts = self._servers.setdefault(server, {})
         account = accounts.get(user_id)
@@ -167,7 +189,7 @@ class CreditLedger:
             accounts[user_id] = account
 
         account.name = name
-        account.credits -= credits
+        account.credits += credits
         self._bump(server)
 
         return account.credits
@@ -269,13 +291,40 @@ class CreditLedger:
 
         return accounts
 
+    async def flush(self) -> None:
+        """
+        Write the tally out if it has changed since the last time it was written.
+
+        The revision is read before the write rather than after, so a change
+        landing while the file is being written is left looking unsaved and is
+        picked up by the next flush, rather than being marked as written and
+        lost.
+
+        The mark belongs to the file rather than to whoever is calling: there is
+        one tally on disk and a board per server, so two boards ticking a moment
+        apart would otherwise rewrite the whole thing twice for one change. The
+        lock is what keeps the second from starting while the first is still
+        going, which the mark alone would not.
+
+        On a thread, because this is the event loop the audio arrives on and a
+        volume that has gone away can make a small write take a long time.
+        """
+        async with self._writing:
+            revision = self._revision
+            if revision == self._saved:
+                return
+
+            await asyncio.to_thread(self.save)
+            self._saved = revision
+
     def save(self) -> None:
         """
         Write the tally out whole, or not at all.
 
-        Synchronous, and small: the caller is expected to hand it to a thread.
-        Written through a temporary file and a rename, so a process killed
-        mid-write leaves the previous tally rather than half of this one.
+        Synchronous, and small: `flush` is what hands it to a thread, and what
+        decides whether it is worth writing at all. Written through a temporary
+        file and a rename, so a process killed mid-write leaves the previous
+        tally rather than half of this one.
         """
         payload = {
             server: {

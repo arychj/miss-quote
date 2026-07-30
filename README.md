@@ -127,6 +127,8 @@ servers:
     users:
       234567890123456789: Speaker One
     tools:
+      scoreboard:
+        enabled: true
       verbal-morality:
         enabled: true
         config:
@@ -148,13 +150,13 @@ On startup the bot reconciles the file against the servers it is actually in, an
 
 `users` replaces the display name Discord reports for a speaker. Discord nicknames are freely editable and often not a name at all, which makes them poor labels in a transcript that a summarizer will later read. The roster is per server because the same person can be known differently in two places. IDs may be quoted or bare; both are read as integers.
 
-`tools` elects the server into the tools listed under it — see below.
+`tools` elects the server into the tools listed under it — see below. Each is opted into on its own, including the ones others depend on: `verbal-morality` hands its fines to `scoreboard`, and a server that enables the first and not the second gets the announcements without the tally.
 
 ---
 
 ## Tools
 
-A tool reads a server's transcripts and does something with them. Configuration decides only **which servers a tool applies to** and **what settings it is handed**; the tool itself decides when it runs, by defining either handler or both:
+A tool reads a server's transcripts and does something with them. Configuration decides only **which servers a tool applies to** and **what settings it is handed**; the tool itself decides when it runs, by defining any of three methods:
 
 ```python
 class Example(Tool):
@@ -165,20 +167,32 @@ class Example(Tool):
 
     async def handle_finished(self, transcript) -> None:
         """Called once the session is sealed."""
+
+    async def run(self) -> None:
+        """Started once the bot has connected, and left going."""
 ```
 
-A tool is also handed a `speaker`, which is how it answers out loud — see **Speech** below — and its server's `users` roster, which is the only thing knowable about who might speak before anybody does.
+A tool is also handed a `speaker`, which is how it answers out loud — see **Speech** below — a `topic`, which is somewhere to put one line where the channel can read it, its server's `users` roster, which is the only thing knowable about who might speak before anybody does, and a `tools` box holding the other tools that server has enabled.
 
-Neither method exists on the base class, so their absence is meaningful: the runner inspects each instance once at startup and files it under the moments it handles. A tool that defines neither is reported as configured-but-inert rather than silently doing nothing.
+None of the three exists on the base class, so their absence is meaningful: the runner inspects each instance once at startup and files it under the moments it handles. A tool that defines none of them is reported as configured-but-inert rather than silently doing nothing.
 
 - **`handle_utterance`** is dispatched after the line is on disk, so a tool that reads the file sees the same thing it was handed. It is not called for an empty transcription.
 - **`handle_finished`** is dispatched once the resume window has passed without a reconnect, so a tool sees one whole conversation rather than a fragment per disconnect. On shutdown, open sessions are sealed immediately rather than waiting the window out.
+- **`run`** is the tool's own, started once after the bot connects and left going for the life of the process. A tool that only runs never sees a transcript, which is fine — it is still that server's tool, built with that server's settings and roster. `scoreboard` is the one that exists, publishing a tally on an interval.
 
-Both are coroutines running on the bot's event loop; anything blocking is the tool's own business to push onto a thread. A tool is constructed **once per server** that elects into it, so it may hold state, but its handlers can be entered concurrently — utterances are transcribed in parallel and dispatched as they land, not in the order they were spoken.
+All three are coroutines running on the bot's event loop; anything blocking is the tool's own business to push onto a thread. A tool is constructed **once per server** that elects into it, so it may hold state, but its handlers can be entered concurrently — utterances are transcribed in parallel and dispatched as they land, not in the order they were spoken.
 
-A tool may also define **`async def prewarm(self)`**, which the runner calls once per process in the background, just after the bot connects. It is for work a tool can do before anybody asks anything of it; rendering what it already knows it will have to say is the use that exists. This is not a third moment: a tool defining only `prewarm` handles nothing and is still reported as inert, and nothing is prepared for a tool that can never run. Warming is **serial** across tools, unlike dispatch, because nothing is waiting on it and the tools with anything to warm are all talking to one synthesizer.
+A tool may also define **`async def prewarm(self)`**, which the runner calls once per process in the background just after the bot connects, and **`async def close(self)`**, which it calls on the way down once every `run` has been cancelled. `prewarm` is for work a tool can do before anybody asks anything of it — rendering what it already knows it will have to say is the use that exists — and, being the first moment at which every tool on a server exists, is also where to complain about one that is missing. `close` is for whatever has to outlive the process. Neither is a moment: a tool defining only these handles nothing and is still reported as inert, and nothing is prepared for, or awaited on behalf of, a tool that can never run. Warming is **serial** across tools, unlike dispatch, because nothing is waiting on it and the tools with anything to warm are all talking to one synthesizer.
 
-Failures are contained. A tool that raises is logged and otherwise invisible: it cannot cost an utterance, delay a disconnect, or stop another tool from running. A tool that will not construct is reported at startup and skipped.
+**One tool can call another.** Every tool a server has enabled shares one box, and a tool reaches its neighbour by class:
+
+```python
+board = self.tools.find(Scoreboard)
+```
+
+Look **at the moment you need it, not in `__init__`**. The box is handed over before any of the server's tools exist and fills as each is built, so a tool that resolves a neighbour at construction finds it or does not depending on the order the config file happens to list them in; by the time anybody has spoken they are all there. Lookup is by class rather than by name so that what a tool depends on is an import a reader can follow, and a tool that is missing comes back as `None` rather than as an error — `verbal-morality` without a `scoreboard` announces fines and does not count them, which is a whole working configuration. A tool that can never run is not in the box at all, so a neighbour never settles for one that will never do anything.
+
+Failures are contained. A tool that raises is logged and otherwise invisible: it cannot cost an utterance, delay a disconnect, or stop another tool from running, warming, or closing. A tool whose `run` raises is logged too, since nothing awaits that task and the exception would otherwise never be collected. A tool that will not construct is reported at startup and skipped.
 
 A tool is only reachable from configuration once it is registered in `tools/registry.py`, which keeps the set of names a config file can switch on a closed list rather than whatever happens to be importable. A name nothing answers to is reported at startup and skipped.
 
@@ -221,9 +235,52 @@ Matching is **whole words, case-insensitive**, so `real` does not fire inside `r
 
 **The whole list is rendered at startup.** Unlike a fine, a quote is knowable in full before anybody speaks: the triggers are a closed set and so are the answers, so on the way up the tool synthesizes every line in the file and leaves the results in the speech cache. A callback that arrives four seconds after the line it answers is not a callback. The exception is a line naming whoever set it off, which is rendered once per name on the roster; somebody the server has not written down waits for the synthesizer the first time, and nobody waits again. Warming happens in the background, one phrase at a time, and anything already cached is left alone.
 
+### scoreboard
+
+Keeps a running balance per person, writes it down, and puts the standings under the name of whatever voice channel the bot is in. It hears nothing and says nothing out loud; what it does is count for the tools that ask it to.
+
+```yaml
+scoreboard:
+  enabled: true
+```
+
+There is nothing to configure per server. Where the tally lives, what it is counted in, and how often it is written and published are the `CREDITS_*` variables, because there is one file behind every server's board and how often it is written is a property of the file rather than of any one server.
+
+**It is enabled separately from whatever is counting.** A server that wants fines announced but not tallied enables `verbal-morality` and not this; the fines are announced and nothing is kept, and the log says so once at startup rather than leaving it to be discovered by wondering why the channel topic is empty.
+
+**Other tools count through it.** `credit` and `debit` are the whole interface, and they are what a tool calls when it has decided somebody owes something:
+
+```python
+board = self.tools.find(Scoreboard)
+if board is not None:
+    balance = board.debit(user_id, name, offences)
+```
+
+The name arrives with the change rather than being looked up, because the caller has just heard from whoever it is and the board prints whatever it was last told. Where the balance is kept, when it is written, and who is eligible for the board are the scoreboard's business and not the caller's.
+
+**The standings go in the voice channel topic**, as `Eli: -9 Erik: -2 Luke: -1 Ryan: 0`, which makes the topic the scoreboard — visible without asking the bot anything. A fine is a **debit**: everybody starts at nothing and goes down, so the number beside a name reads as what swearing has cost them rather than as points collected. Nothing assumes that direction — `credit` puts it back — but nothing today calls it.
+
+The board holds the **four furthest into the red, worst first**. A leaderboard rearranges itself every time somebody passes somebody else, which is the objection to publishing a whole roster in name order; at four places it is short enough to read at a glance, and who is winning is the thing worth reading. Ties break on the name, so two people on the same balance do not swap places between one edit and the next for no reason anybody can see.
+
+**Only `users` are eligible for the board.** Everyone on the roster starts on it at nothing spent, so a channel says who is being watched before anybody has sworn. Somebody the server never wrote down is still heard, still announced, and still counted under whatever Discord reports — they are simply not published, because a display name its owner can set to anything is not something to put in a channel topic through this. Adding them to `users` puts them on the board with whatever balance they had already run up. A board too long for Discord's 1024 characters is cut on an entry boundary rather than mid-number; four ordinary names never reach it, and the guard is there because nothing stops somebody trying. A server with no roster at all publishes nothing rather than an empty line, since setting the status to nothing would wipe whatever a person had put there.
+
+Counts are **per server**. The same person swearing in two servers owes two separate debts, because a server's words are its own business and so is what they cost. Identity is the user ID and the name is only what gets printed, so a rename does not hand somebody else's debt to whoever inherited their nickname.
+
+The tally is kept in `CREDITS_FILE` and **loaded at startup**, so a restart is not an amnesty. It is written back on the same interval it is published on, and again on shutdown — the shutdown pass writes the file but does not touch the topic, because a channel edit waiting out a rate limit would sit on `SIGTERM` until the pod was killed outright. A file that will not parse is reported and ignored rather than raised on: it is a tally of imaginary money, and the pod starting matters more. One unreadable entry costs one person's total, not the file.
+
+There is **one file behind every server's board**, so the mark for whether it has changed belongs to the file rather than to any one board; two servers ticking a moment apart would otherwise rewrite the whole thing twice for one change. A lock keeps the second write from starting while the first is still going.
+
+What it actually sets is the channel's **status**, not its topic. A voice channel has no topic: `PATCH /channels/{id}` with one is refused, and refused with `CHANNEL_TOPIC_INVALID`, *"Field contains at least one word that is not allowed"* — which reads like a profanity filter and is nothing of the kind, since it refuses a topic of `test` identically. The status is the line the client shows beneath a voice channel's name, which is what a topic looks like on a voice channel and what somebody setting one by hand would set. Settings and prose here say topic because that is what it is to everybody looking at it; only the call itself knows the difference. It needs **Set Voice Channel Status** on the channel — not Manage Channels — and without it the tool logs once per change and keeps counting.
+
+The **status is not set on every change.** Both the write and the edit are driven off a revision counter, so a tally that changed four times between two ticks costs one of each. They run on **separate intervals**, because they are limited by different things: writing a few hundred bytes is cheap and happens every `CREDITS_SAVE_SECONDS`, while a status edit is rate-limited — though not nearly as hard as a channel rename, at a bucket of roughly six a second — so `CREDITS_TOPIC_SECONDS` is a question of how often a tally is worth reading rather than of what the API will tolerate. Saving still happens first on every tick: an edit that lands in a bucket can hold the task while discord.py sleeps it out, and a pod terminated in the middle of one should still have the tally on disk from the tick before.
+
+A request Discord **refuses** — a `400`, or a missing permission — is not retried, because retrying it every interval would spend the channel's rate limit on an answer that cannot change. A tally that then changes is published anyway, since what was refused was that text and the next text is not that text. Every failure is logged with the string it was trying to set, because a rejection caused by a name in the tally cannot be diagnosed from the fact of it. A tally that reached nowhere at all — the bot is in no voice channel yet — is left unpublished rather than marked done, so it lands in the next channel the bot joins instead of waiting for somebody to swear again.
+
+The half that talks to Discord is `bot/topic.py`; the tool itself imports no discord, on the same terms as the speaker.
+
 ### verbal-morality
 
-The Verbal Morality Bot, after *Demolition Man*. It listens for words the server has decided against and, on hearing one, announces the fine out loud in the channel it was said in. The credits are imaginary but they are counted: a fine comes off a balance that starts at nothing, the standings go in the voice channel topic, and they survive a restart.
+The Verbal Morality Bot, after *Demolition Man*. It listens for words the server has decided against and, on hearing one, announces the fine out loud in the channel it was said in. The credits are imaginary but they are counted, by somebody else: the fine is handed to the server's [`scoreboard`](#scoreboard), which is what keeps a balance, writes it down, and publishes the standings. **With no `scoreboard` enabled the fine is announced and not counted**, which the log says once at startup.
 
 ```yaml
 verbal-morality:
@@ -257,22 +314,6 @@ Matching is **whole words, case-insensitive**. A substring match fines the innoc
 What does not scale is the number of announcements. Three violations in one utterance earn one, because three announcements over the top of each other is a denial of service on the channel. **A violation earned while an announcement is playing is counted and not announced at all** — the speaker plays one clip at a time and returns when it is finished, so the alternative is a queue, and a channel where three people swear over each other would spend the next minute being read fines for things it has moved on from. The tally is charged either way: what somebody owes is not a function of whether they were told about it.
 
 **Being fined twice in a row is worded differently.** A speaker fined again inside `REPEAT_FINE_SECONDS` gets `repeat_announcement` — "you are *also* fined" — because reading the whole sentence out again sounds like a bot that has lost track of what it just said. It is per speaker: somebody else swearing in the meantime does not make their first fine a repeat. Both wordings are pre-rendered, so the second one does not cost a synthesizer round trip at the moment it is needed.
-
-**The standings go in the voice channel topic**, as `Eli: -9 Erik: -2 Luke: -1 Ryan: 0`, which makes the topic the scoreboard — visible without asking the bot anything. A fine is a **debit**: everybody starts at nothing and goes down, so the number beside a name reads as what swearing has cost them rather than as points collected.
-
-The board holds the **four furthest into the red, worst first**. A leaderboard rearranges itself every time somebody passes somebody else, which is the objection to publishing a whole roster in name order; at four places it is short enough to read at a glance, and who is winning is the thing worth reading. Ties break on the name, so two people on the same balance do not swap places between one edit and the next for no reason anybody can see.
-
-**Only `users` are eligible for the board.** Everyone on the roster starts on it at nothing spent, so a channel says who is being watched before anybody has sworn. Somebody the server never wrote down is still heard, still announced, and still fined under whatever Discord reports — they are simply not published, because a display name its owner can set to anything is not something to put in a channel topic through this. Adding them to `users` puts them on the board with whatever balance they had already run up. A board too long for Discord's 1024 characters is cut on an entry boundary rather than mid-number; four ordinary names never reach it, and the guard is there because nothing stops somebody trying.
-
-Counts are **per server**. The same person swearing in two servers owes two separate debts, because a server's words are its own business and so is what they cost. Identity is the user ID and the name is only what gets printed, so a rename does not hand somebody else's debt to whoever inherited their nickname.
-
-The tally is kept in `CREDITS_FILE` and **loaded at startup**, so a restart is not an amnesty. It is written back on the same interval it is published on, and again on shutdown — the shutdown pass writes the file but does not touch the topic, because a channel edit waiting out a rate limit would sit on `SIGTERM` until the pod was killed outright. A file that will not parse is reported and ignored rather than raised on: it is a tally of imaginary money, and the pod starting matters more. One unreadable entry costs one person's total, not the file.
-
-What it actually sets is the channel's **status**, not its topic. A voice channel has no topic: `PATCH /channels/{id}` with one is refused, and refused with `CHANNEL_TOPIC_INVALID`, *"Field contains at least one word that is not allowed"* — which reads like a profanity filter and is nothing of the kind, since it refuses a topic of `test` identically. The status is the line the client shows beneath a voice channel's name, which is what a topic looks like on a voice channel and what somebody setting one by hand would set. Settings and prose here say topic because that is what it is to everybody looking at it; only the call itself knows the difference. It needs **Set Voice Channel Status** on the channel — not Manage Channels — and without it the tool logs once per change and keeps counting.
-
-The **status is not set on every fine.** Both the write and the edit are driven off a revision counter, so a tally that changed four times between two ticks costs one of each. They run on **separate intervals**, because they are limited by different things: writing a few hundred bytes is cheap and happens every `CREDITS_SAVE_SECONDS`, while a status edit is rate-limited — though not nearly as hard as a channel rename, at a bucket of roughly six a second — so `CREDITS_TOPIC_SECONDS` is a question of how often a tally is worth reading rather than of what the API will tolerate. Saving still happens first on every tick: an edit that lands in a bucket can hold the task while discord.py sleeps it out, and a pod terminated in the middle of one should still have the tally on disk from the tick before.
-
-A request Discord **refuses** — a `400`, or a missing permission — is not retried, because retrying it every interval would spend the channel's rate limit on an answer that cannot change. A tally that then changes is published anyway, since what was refused was that text and the next text is not that text. Every failure is logged with the string it was trying to set, because a rejection caused by a name in the tally cannot be diagnosed from the fact of it.
 
 **A repeat offender is announced more quietly.** Being fined is the joke, and the joke told fifteen times in five minutes is a denial of service on the conversation. Every violation inside a sliding `VOLUME_BACKOFF_DURATION` takes `VOLUME_BACKOFF_PERCENT` off the next announcement, down to `VIOLATION_VOLUME_FLOOR` — at the defaults, 5% a violation over five minutes, floored at a quarter of `PLAYBACK_VOLUME`, so fifteen of them reach the bottom. `0` for the percent takes nothing off and turns the backoff off; `0` for the floor silences a repeat offender outright. The first swear in a window is announced at full volume: the backoff is for saying it again. Each forbidden word counts, on the same terms as the fine, so four in a sentence is four steps down however few announcements it took to say so. The window is per speaker and per server, held in memory only — a `VOLUME_BACKOFF_DURATION` after their last violation somebody is back to full volume, and a restart forgives whatever backoff they had earned. What it does **not** affect is the tally: what somebody owes is not a function of how loudly they were told about it.
 
@@ -366,14 +407,21 @@ Only used by `quotes`. A deployment with it disabled never opens the file.
 
 ### Credits
 
-Only used by `verbal-morality`, which is the only thing that fines anybody. A deployment with it disabled never reads or writes the file, and never touches a channel topic.
+Only used by `scoreboard`. A deployment with it enabled nowhere never reads or writes the file, and never touches a channel topic.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CREDITS_FILE` | `/credits/credits.json` | The running tally, as JSON. Mount a volume at its directory to keep what everybody owes across restarts |
-| `CREDIT_CURRENCY` | `credit` | What a fine is denominated in, in the singular. The plural is grown from it by the spelling, so `penny` announces as `2 pennies`. Wording only — it changes nothing about what is counted |
-| `CREDITS_SAVE_SECONDS` | `5.0` | How often a changed tally is written to disk. `0`, or any value below it, keeps the tally in memory and writes it only on shutdown |
+| `CREDITS_FILE` | `/credits/credits.json` | The running tally, as JSON. One file behind every server's board. Mount a volume at its directory to keep what everybody owes across restarts |
+| `CREDIT_CURRENCY` | `credit` | What a balance is denominated in, in the singular. The plural is grown from it by the spelling, so `penny` announces as `2 pennies`. Wording only — it changes nothing about what is counted |
+| `CREDITS_SAVE_SECONDS` | `5.0` | How often a changed tally is written to disk. `0`, or any value below it, stops the loop: the tally is kept in memory and written only on shutdown |
 | `CREDITS_TOPIC_SECONDS` | `10.0` | How often a changed tally is published to the voice channel topic — set as the channel **status**, a voice channel having no topic. `0`, or any value below it, keeps the tally off the channel entirely |
+
+### Fines
+
+Only used by `verbal-morality`. What a fine is *worth* is the scoreboard's, above; these are how it is said.
+
+| Variable | Default | Purpose |
+|---|---|---|
 | `REPEAT_FINE_SECONDS` | `5.0` | How soon after being fined the same speaker is told they are "also fined" rather than hearing the whole sentence again. `0`, or any value below it, turns the second wording off |
 | `VOLUME_BACKOFF_DURATION` | `300.0` | The sliding window a violation counts for against how loudly the next one is announced |
 | `VOLUME_BACKOFF_PERCENT` | `5` | How much each violation inside that window takes off the next announcement. `0` takes nothing off, turning the backoff off; anything above `100` reaches the floor on the first repeat, and anything negative is treated as `0` rather than made louder |
@@ -451,7 +499,7 @@ miss-quote/
 │       │   ├── client.py      # Bot setup, voice lifecycle, auto-join policy
 │       │   ├── audio_sink.py  # AudioSink + resampling bridge
 │       │   ├── speaker.py     # Playback into a voice channel, fed while it plays
-│       │   └── scoreboard.py  # The tally, to disk and to the channel topic
+│       │   └── topic.py       # A line under the name of the channel the bot is in
 │       ├── audio/
 │       │   ├── resampler.py   # soxr, both directions
 │       │   ├── gain.py        # Playback loudness
@@ -468,10 +516,11 @@ miss-quote/
 │       ├── resources/
 │       │   └── quotes.csv     # Triggers and the film lines they answer with
 │       ├── tools/
-│       │   ├── base.py        # What a tool is: the optional handlers, and a speaker
+│       │   ├── base.py        # What a tool is: its moments, and what it is handed
 │       │   ├── registry.py    # Tool names a config file can switch on
 │       │   ├── runner.py      # Per-server instances, dispatch, failure isolation
 │       │   ├── quotes.py      # Answers a trigger phrase with the line it belongs to
+│       │   ├── scoreboard.py  # The tally, to disk and to the channel topic
 │       │   └── verbal_morality.py  # Fines a speaker, out loud, for the wrong thing
 │       ├── transcript/
 │       │   └── writer.py      # Per-session JSONL appender + retention
@@ -526,7 +575,7 @@ Runtime requirements:
 
 - **A reachable Wyoming ASR server** — set `WYOMING_HOST` and `WYOMING_PORT`. There is no default that will work out of the box.
 - **A writable volume at `TRANSCRIPT_DIR`.** Use a shared (`ReadWriteMany`) volume if anything else will need to read the transcripts; a single-writer volume locks them to this pod and forces an export step later.
-- **A writable volume at the directory holding `CREDITS_FILE`**, if `verbal-morality` is enabled anywhere. Without one the tally is forgiven at every restart, which costs the accounting rather than the feature. **Set Voice Channel Status** on each voice channel is what lets the tally reach it; without it the bot keeps counting and says so in the log.
+- **A writable volume at the directory holding `CREDITS_FILE`**, if `scoreboard` is enabled anywhere. Without one the tally is forgiven at every restart, which costs the accounting rather than the feature. **Set Voice Channel Status** on each voice channel is what lets the tally reach it; without it the bot keeps counting and says so in the log.
 - **A single replica.** Two instances would double-join the voice channel and double-write the transcript.
 - **No GPU and no node constraints** — transcription is a network call.
 

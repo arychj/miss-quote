@@ -5,7 +5,7 @@ Discord bot client setup, voice lifecycle, and command handling.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from enum import Enum
 from typing import Any
 
@@ -14,10 +14,9 @@ import discord.ext.voice_recv
 from discord.ext import commands
 
 from miss_quote.bot.audio_sink import STTAudioSink
-from miss_quote.bot.scoreboard import Scoreboard
 from miss_quote.bot.speaker import DiscordSpeaker
-from miss_quote.config import discord_cfg, file_cfg, morality_cfg, transcript_cfg
-from miss_quote.ledger.credits import shared_ledger
+from miss_quote.bot.topic import DiscordTopic
+from miss_quote.config import discord_cfg, file_cfg, transcript_cfg
 from miss_quote.stt.processor import STTProcessor
 from miss_quote.tools.runner import ToolRunner
 from miss_quote.transcript.writer import Source, TranscriptSession, TranscriptWriter, slugify
@@ -127,13 +126,11 @@ class STTBot:
     def __init__(self) -> None:
         self._writer = TranscriptWriter()
         self._speaker = DiscordSpeaker(self._guild)
-        self._tools = ToolRunner(speaker=self._speaker)
+        self._topic = DiscordTopic(self._guild)
+        self._tools = ToolRunner(speaker=self._speaker, topic=self._topic)
         self._processor = STTProcessor(self._tools)
         self._sessions: dict[int, TranscriptSession] = {}
         self._expiries: dict[int, asyncio.Task] = {}
-
-        # After the tools, which are what enroll a server's roster in the tally.
-        self._scoreboard = Scoreboard(shared_ledger(), self._guild)
 
         intents = discord.Intents.default()
         intents.message_content = True
@@ -148,7 +145,7 @@ class STTBot:
         )
         self._watchdog: asyncio.Task | None = None
         self._prewarm: asyncio.Task | None = None
-        self._tally: asyncio.Task | None = None
+        self._services: Sequence[asyncio.Task] = ()
 
         self._register_events()
         self._register_commands()
@@ -185,7 +182,7 @@ class STTBot:
             self._processor.start(asyncio.get_running_loop())
             self._start_listen_watchdog()
             self._start_prewarm()
-            self._start_scoreboard()
+            self._start_tools()
             if discord_cfg.autojoin:
                 await self._join_active_channels()
 
@@ -356,39 +353,23 @@ class STTBot:
         self._prewarm = asyncio.create_task(self._tools.prewarm())
         self._bot.background_tasks.append(self._prewarm)
 
-    def _start_scoreboard(self) -> None:
+    def _start_tools(self) -> None:
         """
-        Start publishing the credit tally, if anything is counting.
+        Set going every tool that has something of its own to do.
 
-        Nothing to publish is the ordinary case for a deployment that has enabled
-        no tool that fines anybody, and a task waking on an interval to look at an
-        empty ledger is a task worth not starting. A server enrolls its roster
-        when its tools are built, which is before this runs.
+        Registered as background tasks, which is what gets them cancelled before
+        the tools are asked to close: a tool writing itself out while its own
+        loop is still going would be racing itself for the file.
+
+        Once per process, however many readies the gateway sends. The runner
+        starts them once either way; what a second pass would add is the same
+        tasks in the cancellation list twice.
         """
-        if self._tally is not None or not self._ledger_worth_publishing():
+        if self._services:
             return
 
-        self._tally = asyncio.create_task(self._scoreboard.run())
-        self._bot.background_tasks.append(self._tally)
-
-    @staticmethod
-    def _ledger_worth_publishing() -> bool:
-        if not morality_cfg.counting_enabled:
-            logger.info(
-                "CREDITS_SAVE_SECONDS is %s; the credit tally will be kept in memory "
-                "and written only on shutdown.",
-                morality_cfg.save_interval_seconds,
-            )
-            return False
-
-        if not morality_cfg.publishing_enabled:
-            logger.info(
-                "CREDITS_TOPIC_SECONDS is %s; the credit tally will be kept and "
-                "written, but never published to a channel topic.",
-                morality_cfg.topic_interval_seconds,
-            )
-
-        return bool(shared_ledger().servers())
+        self._services = self._tools.start()
+        self._bot.background_tasks.extend(self._services)
 
     async def _join_active_channels(self) -> None:
         """Pick up channels that already had people in them when the bot started."""
@@ -580,15 +561,14 @@ class STTBot:
 
     async def _shutdown(self) -> None:
         """
-        Seal the transcripts and write the tally down before the loop goes away.
+        Seal the transcripts and let the tools finish, before the loop goes away.
 
-        The tally is only saved here, not published: the interval task has been
-        cancelled by now, and a channel edit that lands in a rate-limit bucket
-        would sit on SIGTERM until the pod is killed outright. What matters at
-        this point is the file, which is nobody's rate limit.
+        The tools last, and after their own tasks have been cancelled: a tool
+        handed a finished transcript may well have something new to write down,
+        and closing it before that arrived would lose it.
         """
         await self._close_all_sessions()
-        await self._scoreboard.persist()
+        await self._tools.close()
 
     # ── commands ──────────────────────────────────
 

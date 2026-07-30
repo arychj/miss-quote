@@ -165,7 +165,7 @@ def test_the_currency_defaults_to_credits(monkeypatch) -> None:
 
     import miss_quote.config as config
 
-    assert importlib.reload(config).morality_cfg.currency == "credit"
+    assert importlib.reload(config).scoreboard_cfg.currency == "credit"
 
 
 def test_the_currency_can_be_something_else(monkeypatch) -> None:
@@ -173,16 +173,16 @@ def test_the_currency_can_be_something_else(monkeypatch) -> None:
 
     import miss_quote.config as config
 
-    assert importlib.reload(config).morality_cfg.currency == "buck"
+    assert importlib.reload(config).scoreboard_cfg.currency == "buck"
 
 
 def test_the_topic_is_published_less_often_than_the_tally_is_saved() -> None:
     """A topic edit is rate limited to a couple per ten minutes; a write is not."""
     import miss_quote.config as config
 
-    morality = config.morality_cfg
+    scoreboard = config.scoreboard_cfg
 
-    assert morality.topic_interval_seconds > morality.save_interval_seconds
+    assert scoreboard.topic_interval_seconds > scoreboard.save_interval_seconds
 
 
 def test_publishing_stops_at_a_topic_interval_of_zero(monkeypatch) -> None:
@@ -193,8 +193,8 @@ def test_publishing_stops_at_a_topic_interval_of_zero(monkeypatch) -> None:
 
     reloaded = importlib.reload(config)
 
-    assert not reloaded.morality_cfg.publishing_enabled
-    assert reloaded.morality_cfg.counting_enabled
+    assert reloaded.scoreboard_cfg.topic_interval_seconds == 0
+    assert reloaded.scoreboard_cfg.save_interval_seconds > 0
 
 
 def test_counting_stops_at_a_save_interval_of_zero(monkeypatch) -> None:
@@ -203,7 +203,7 @@ def test_counting_stops_at_a_save_interval_of_zero(monkeypatch) -> None:
 
     import miss_quote.config as config
 
-    assert not importlib.reload(config).morality_cfg.counting_enabled
+    assert importlib.reload(config).scoreboard_cfg.save_interval_seconds == 0
 
 
 def test_invalid_integer_config_fails_fast(monkeypatch) -> None:

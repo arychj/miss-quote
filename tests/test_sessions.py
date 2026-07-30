@@ -135,7 +135,9 @@ def bot(monkeypatch, tmp_path):
     monkeypatch.setattr(
         client_module,
         "ToolRunner",
-        lambda speaker: ToolRunner(config.servers, {TOOL_NAME: Collector}, speaker),
+        lambda speaker, topic: ToolRunner(
+            config.servers, {TOOL_NAME: Collector}, speaker, topic
+        ),
     )
     monkeypatch.setattr(client_module, "STTProcessor", FakeProcessor)
     monkeypatch.setattr(client_module, "STTAudioSink", lambda processor, session: session)

@@ -13,6 +13,7 @@ from miss_quote.config import (
     ToolSettings,
     quotes_cfg,
 )
+from miss_quote.tools.base import ToolContext
 from miss_quote.tools.quotes import Quote, Quotes, RecentQuotes, _load
 from miss_quote.tools.runner import ToolRunner
 from miss_quote.transcript.writer import Source, Utterance
@@ -146,7 +147,9 @@ def _pointed_at(monkeypatch, path: Path) -> None:
 
 
 def _tool(speaker, users=None) -> Quotes:
-    return Quotes(server=SERVER_ALIAS, config={}, speaker=speaker, users=users)
+    return Quotes(
+        ToolContext(server=SERVER_ALIAS, speaker=speaker, users=users or {})
+    )
 
 
 def _utterance(text: str, user: str = SPEAKER, user_id: int = SPEAKER_ID) -> Utterance:
@@ -402,7 +405,7 @@ async def test_the_backoff_is_the_trigger_rather_than_the_speaker(
 async def test_two_servers_cool_down_separately(quotes_file, speech, speaker):
     """Two channels arriving at the same line have each made the joke once."""
     here = _tool(speaker)
-    elsewhere = Quotes(server="second-server", config={}, speaker=speaker, users=None)
+    elsewhere = Quotes(ToolContext(server="second-server", speaker=speaker))
 
     await _hear(here, TRIGGER)
     await _hear(elsewhere, TRIGGER)
