@@ -47,6 +47,13 @@ servers:
       # The words below are placeholders. What a server objects to is its own
       # business and belongs in the mounted ConfigMap, not in this repository.
       #
+      # What everybody owes is added up per server, kept in CREDITS_FILE, and
+      # published to the voice channel topic as `Eli: 0 Erik: 0`, which needs
+      # Manage Channels on the channel. Everyone in `users` above starts on the
+      # board at nothing owed. A repeat offender is announced more quietly, down
+      # to VIOLATION_VOLUME_FLOOR; none of that is per server, so it is set in
+      # the environment rather than here.
+      #
       # Every name in `users` above is rendered at startup, against one, two,
       # and three violations, so the fine lands while the offence is still what
       # the channel is talking about.

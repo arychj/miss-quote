@@ -35,6 +35,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Mapping
 from typing import Any, Protocol, runtime_checkable
 
+from config import UNITY_VOLUME
 from transcript.writer import Source, Transcript, TranscriptSession, Utterance
 from utils.logging import get_logger
 
@@ -45,12 +46,19 @@ logger = get_logger(__name__)
 class Speaker(Protocol):
     """Somewhere a tool can play audio."""
 
-    async def play(self, source: Source, audio: AsyncIterator[bytes]) -> None:
+    async def play(
+        self, source: Source, audio: AsyncIterator[bytes], scale: float = UNITY_VOLUME
+    ) -> None:
         """
         Play one clip of 48 kHz stereo PCM back where it came from.
 
         Returns once the clip has finished, so a tool that plays two in a row
         gets them in that order rather than on top of each other.
+
+        `scale` is relative to the deployment's own loudness rather than
+        absolute: 1.0 is however loud the channel asked to be interrupted, and
+        0.5 is half of that. A tool with a reason to be quieter than usual has
+        no business knowing what usual is.
         """
         ...
 
@@ -64,7 +72,9 @@ class SilentSpeaker:
     would pay a synthesizer to render something nobody can hear.
     """
 
-    async def play(self, source: Source, audio: AsyncIterator[bytes]) -> None:
+    async def play(
+        self, source: Source, audio: AsyncIterator[bytes], scale: float = UNITY_VOLUME
+    ) -> None:
         logger.debug("Nothing to play through for %s; dropping a clip.", source.channel)
 
 

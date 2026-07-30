@@ -14,8 +14,10 @@ import discord.ext.voice_recv
 from discord.ext import commands
 
 from bot.audio_sink import STTAudioSink
+from bot.scoreboard import Scoreboard
 from bot.speaker import DiscordSpeaker
-from config import discord_cfg, file_cfg, transcript_cfg
+from config import discord_cfg, file_cfg, morality_cfg, transcript_cfg
+from ledger.credits import shared_ledger
 from stt.processor import STTProcessor
 from tools.runner import ToolRunner
 from transcript.writer import Source, TranscriptSession, TranscriptWriter, slugify
@@ -130,6 +132,9 @@ class STTBot:
         self._sessions: dict[int, TranscriptSession] = {}
         self._expiries: dict[int, asyncio.Task] = {}
 
+        # After the tools, which are what enroll a server's roster in the tally.
+        self._scoreboard = Scoreboard(shared_ledger(), self._guild)
+
         intents = discord.Intents.default()
         intents.message_content = True
         intents.voice_states = True
@@ -137,12 +142,13 @@ class STTBot:
 
         self._bot = _Bot(
             self._processor,
-            self._close_all_sessions,
+            self._shutdown,
             command_prefix=discord_cfg.command_prefix,
             intents=intents,
         )
         self._watchdog: asyncio.Task | None = None
         self._prewarm: asyncio.Task | None = None
+        self._tally: asyncio.Task | None = None
 
         self._register_events()
         self._register_commands()
@@ -179,6 +185,7 @@ class STTBot:
             self._processor.start(asyncio.get_running_loop())
             self._start_listen_watchdog()
             self._start_prewarm()
+            self._start_scoreboard()
             if discord_cfg.autojoin:
                 await self._join_active_channels()
 
@@ -348,6 +355,40 @@ class STTBot:
 
         self._prewarm = asyncio.create_task(self._tools.prewarm())
         self._bot.background_tasks.append(self._prewarm)
+
+    def _start_scoreboard(self) -> None:
+        """
+        Start publishing the credit tally, if anything is counting.
+
+        Nothing to publish is the ordinary case for a deployment that has enabled
+        no tool that fines anybody, and a task waking on an interval to look at an
+        empty ledger is a task worth not starting. A server enrolls its roster
+        when its tools are built, which is before this runs.
+        """
+        if self._tally is not None or not self._ledger_worth_publishing():
+            return
+
+        self._tally = asyncio.create_task(self._scoreboard.run())
+        self._bot.background_tasks.append(self._tally)
+
+    @staticmethod
+    def _ledger_worth_publishing() -> bool:
+        if not morality_cfg.counting_enabled:
+            logger.info(
+                "CREDITS_SAVE_SECONDS is %s; the credit tally will be kept in memory "
+                "and written only on shutdown.",
+                morality_cfg.save_interval_seconds,
+            )
+            return False
+
+        if not morality_cfg.publishing_enabled:
+            logger.info(
+                "CREDITS_TOPIC_SECONDS is %s; the credit tally will be kept and "
+                "written, but never published to a channel topic.",
+                morality_cfg.topic_interval_seconds,
+            )
+
+        return bool(shared_ledger().servers())
 
     async def _join_active_channels(self) -> None:
         """Pick up channels that already had people in them when the bot started."""
@@ -534,6 +575,20 @@ class STTBot:
         for channel_id in list(self._sessions):
             self._cancel_expiry(channel_id)
             await self._finalize(self._sessions.pop(channel_id))
+
+    # ── shutdown ──────────────────────────────────
+
+    async def _shutdown(self) -> None:
+        """
+        Seal the transcripts and write the tally down before the loop goes away.
+
+        The tally is only saved here, not published: the interval task has been
+        cancelled by now, and a channel edit that lands in a rate-limit bucket
+        would sit on SIGTERM until the pod is killed outright. What matters at
+        this point is the file, which is nobody's rate limit.
+        """
+        await self._close_all_sessions()
+        await self._scoreboard.persist()
 
     # ── commands ──────────────────────────────────
 

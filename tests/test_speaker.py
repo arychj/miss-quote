@@ -2,10 +2,13 @@
 
 import asyncio
 import threading
+from dataclasses import replace
 
 import numpy as np
 import pytest
 
+import bot.speaker as speaker_module
+from audio.gain import scaled
 from bot.speaker import PCMStream, DiscordSpeaker
 from config import audio_cfg
 from transcript.writer import Source
@@ -192,6 +195,27 @@ async def test_nothing_is_played_when_the_bot_has_moved_on():
     await _speaker(voice_client).play(SOURCE, _audio(LOUD))
 
     assert voice_client.frames == []
+
+
+async def test_a_scale_is_applied_on_top_of_the_deployment_volume(monkeypatch):
+    """A tool says how much quieter than usual, not how loud."""
+    monkeypatch.setattr(
+        speaker_module, "audio_cfg", replace(audio_cfg, playback_volume=HALF_VOLUME)
+    )
+    voice_client = FakeVoiceClient()
+
+    await _speaker(voice_client).play(SOURCE, _audio(LOUD), HALF_VOLUME)
+
+    frame = np.frombuffer(voice_client.frames[0], dtype=SAMPLE_DTYPE)
+    assert list(frame) == list(np.frombuffer(LOUD, dtype=SAMPLE_DTYPE) // 4)
+
+
+async def test_a_clip_with_no_scale_is_played_at_the_deployment_volume():
+    voice_client = FakeVoiceClient()
+
+    await _speaker(voice_client).play(SOURCE, _audio(LOUD))
+
+    assert voice_client.frames == [scaled(LOUD, audio_cfg.playback_volume)]
 
 
 async def test_nothing_is_played_without_a_voice_client():

@@ -184,7 +184,7 @@ A tool is only reachable from configuration once it is registered in `tools/regi
 
 ### verbal-morality
 
-The Verbal Morality Bot, after *Demolition Man*. It listens for words the server has decided against and, on hearing one, announces the fine out loud in the channel it was said in. The credits are imaginary and no tally is kept — the point is being caught, not the accounting.
+The Verbal Morality Bot, after *Demolition Man*. It listens for words the server has decided against and, on hearing one, announces the fine out loud in the channel it was said in. The credits are imaginary but they are added up: the tally goes in the voice channel topic, and survives a restart.
 
 ```yaml
 verbal-morality:
@@ -205,13 +205,23 @@ verbal-morality:
 
 The name is the one the transcript uses — the roster name from `users` where a server has set one, the Discord display name otherwise — so nothing has to be configured twice.
 
-**`words` are stems.** Each is expanded once at startup into the endings it is said with — a plural, a past tense, a gerund with and without its `g`, someone who does it, and something that is like it — so `fiddlestick` also catches `fiddlesticks`, `fiddlesticked`, `fiddlesticking`, `fiddlestickin`, `fiddlesticker`, `fiddlestickers`, and `fiddlesticky`. A list that has to spell out every ending is a list somebody gets around a week after writing it.
+**`words` are stems.** Each is expanded once at startup into the endings it is said with — a plural, a past tense, a gerund with and without its `g`, someone who does it, something that is like it, and the three that make it a noun again — so `fiddlestick` also catches `fiddlesticks`, `fiddlesticked`, `fiddlesticking`, `fiddlestickin`, `fiddlesticker`, `fiddlestickers`, `fiddlesticky`, `fiddlestickity`, `fiddlestickery`, and `fiddlestickiness`. A list that has to spell out every ending is a list somebody gets around a week after writing it.
 
-Expansion is English spelling rather than a dictionary: a final consonant doubles after a short vowel (`shit` grows a `shitter`, not a `shiter`), a silent `e` drops before a vowel, a `y` after a consonant becomes an `i`, and a sibilant takes `es`. Nothing checks whether the result is a word anybody says, and it does not need to — a form nobody utters costs a few bytes in an alternation, while a missing one costs the tool the thing it exists to catch. Note that expansion can reach a word that is innocent on its own; a stem whose endings collide with ordinary speech is worth checking before it goes in the list.
+Expansion is English spelling rather than a dictionary: a final consonant doubles after a short vowel (`shit` grows a `shitter`, not a `shiter`), a silent `e` drops before a vowel, a sibilant takes `es`, and a `y` after a consonant becomes an `i` — except before an ending that already starts with one, where it goes without being replaced, so it is `shittiness` and not `shittyiness`. The `-ity`, `-ery`, and `-iness` endings are there because the words they reach are ones people say: `fuckery`, `buggery`, `shittiness`. Nothing checks whether the result is a word anybody says, and it does not need to — a form nobody utters costs a few bytes in an alternation, while a missing one costs the tool the thing it exists to catch. Note that expansion can reach a word that is innocent on its own; a stem whose endings collide with ordinary speech is worth checking before it goes in the list.
 
 Matching is **whole words, case-insensitive**. A substring match fines the innocent, and the canonical example, Scunthorpe, is a place people live.
 
 **The fine scales with the utterance**: one credit per forbidden word in it, so three of them is `3 credits` and one is `1 credit`. The count is filled into `{credits}` already pluralized, as a numeral — every synthesizer worth pointing this at reads `3` as a number, and `1 credits` is wrong in a way a listener hears. `{violations}` agrees with it, reading `a violation` for one and `multiple violations` for more, so the sentence is not left saying "fined 3 credits for a violation". It is a phrase rather than a second count: the number is already in the fine, and saying it twice makes the announcement sound like an invoice. What does not scale is the number of announcements: three violations earn one, because three announcements over the top of each other is a denial of service on the channel. Two people swearing at once are fined one after the other.
+
+**The tally goes in the voice channel topic**, as `Eli: 0 Erik: 0 Luke: 0 Ryan: 0`, which makes the topic the scoreboard — visible without asking the bot anything. Everyone in `users` starts on it at nothing owed, so a channel says who is being watched before anybody has sworn; somebody not on the roster is added under whatever Discord reports the first time they earn something. It is ordered by name rather than by what is owed: a leaderboard is the more natural read but rearranges itself every time somebody passes somebody else, and a topic that moves is one nobody can scan to find themselves. A tally too long for Discord's 1024 characters is cut on an entry boundary rather than mid-number.
+
+Counts are **per server**. The same person swearing in two servers owes two separate debts, because a server's words are its own business and so is what they cost. Identity is the user ID and the name is only what gets printed, so a rename does not hand somebody else's debt to whoever inherited their nickname.
+
+The tally is kept in `CREDITS_FILE` and **loaded at startup**, so a restart is not an amnesty. It is written back on the same interval it is published on, and again on shutdown — the shutdown pass writes the file but does not touch the topic, because a channel edit waiting out a rate limit would sit on `SIGTERM` until the pod was killed outright. A file that will not parse is reported and ignored rather than raised on: it is a tally of imaginary money, and the pod starting matters more. One unreadable entry costs one person's total, not the file.
+
+The **topic is not edited on every fine.** Both the write and the edit are driven off a revision counter, so a tally that changed four times between two ticks costs one of each. They run on **separate intervals**, because they are limited by different things: writing a few hundred bytes is cheap and happens every `CREDITS_SAVE_SECONDS`, while a channel topic edit is rate-limited to roughly a couple per ten minutes per channel — discord.py answers a 429 by sleeping until it clears — so `CREDITS_TOPIC_SECONDS` defaults to five minutes, which is as fast as that ceiling honestly allows. The topic therefore **converges on** the tally rather than tracking it. Saving happens first on every tick for the same reason: an edit waiting out a bucket can hold the task for minutes, and a pod terminated in the middle of one should still have the tally on disk from the tick before. Editing a topic needs **Manage Channels**; without it the tool logs once per change and keeps counting.
+
+**A repeat offender is announced more quietly.** Being fined is the joke, and the joke told fifteen times in five minutes is a denial of service on the conversation. Every violation inside a five-minute sliding window takes 5% off the next announcement, down to `VIOLATION_VOLUME_FLOOR` — a quarter of `PLAYBACK_VOLUME` by default, or silence if a server sets it to `0`. The first swear in five minutes is announced at full volume: the backoff is for saying it again. Each forbidden word counts, on the same terms as the fine, so four in a sentence is four steps down however few announcements it took to say so. The window is per speaker and per server, held in memory only — five minutes after their last violation somebody is back to full volume, and a restart forgives whatever backoff they had earned. What it does **not** affect is the tally: what somebody owes is not a function of how loudly they were told about it.
 
 **The announcements are rendered at startup.** The roster is known before anybody speaks and so is the shape of the sentence, so on the way up the tool synthesizes every name in `users` against one, two, and three violations and leaves the results in the speech cache. Synthesis is the slow part of answering; paying for it before anyone is waiting is what lets the fine land while the offence is still what the channel is talking about. It happens in the background, one phrase at a time — the bot is in the channel and listening while it runs, and a synthesizer asked for a hundred phrases at once is one that is not answering whoever is speaking right now.
 
@@ -292,6 +302,17 @@ Only used by tools that answer out loud. A deployment with no such tool enabled 
 | `TTS_CACHE_ENTRIES` | `256` | Clips held in memory before the least recently used is retired |
 | `TTS_CACHE_RETENTION_DAYS` | `90` | Days a rendered clip survives on disk without being played, counted from the last time it was. Any value below `1` keeps them forever; clips left there by hand are never reaped |
 
+### Credits
+
+Only used by `verbal-morality`, which is the only thing that fines anybody. A deployment with it disabled never reads or writes the file, and never touches a channel topic.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `CREDITS_FILE` | `/credits/credits.json` | The running tally, as JSON. Mount a volume at its directory to keep what everybody owes across restarts |
+| `CREDITS_SAVE_SECONDS` | `5.0` | How often a changed tally is written to disk. `0`, or any value below it, keeps the tally in memory and writes it only on shutdown |
+| `CREDITS_TOPIC_SECONDS` | `300.0` | How often a changed tally is published to the voice channel topic. Five minutes is as fast as Discord's rate limit on topic edits allows. `0`, or any value below it, keeps the tally off the topic entirely |
+| `VIOLATION_VOLUME_FLOOR` | `0.25` | The quietest a fine is announced, as a fraction of `PLAYBACK_VOLUME`, once a speaker has earned the full backoff. `0` silences a repeat offender entirely; `1` turns the backoff off |
+
 ### Transcripts
 
 | Variable | Default | Purpose |
@@ -341,7 +362,7 @@ Removed outright: the multiprocessing layer and its queues, the STT health-check
 
 Kept intact because they are the non-obvious part: `stt/user_state.py`'s per-user VAD state machine with stale-speech flushing, and `audio/ring_buffer.py`'s pre-roll buffer, which is what stops the first syllable being clipped.
 
-Added: `AUTOJOIN`, `RETENTION_DAYS`, `TRANSCRIPT_DIR`, `TZ`, `SESSION_RESUME_SECONDS`, `WYOMING_HOST`, `WYOMING_PORT`, `MAX_CONCURRENT_TRANSCRIPTIONS`, `PLAYBACK_VOLUME`, and every `TTS_*`.
+Added: `AUTOJOIN`, `RETENTION_DAYS`, `TRANSCRIPT_DIR`, `TZ`, `SESSION_RESUME_SECONDS`, `WYOMING_HOST`, `WYOMING_PORT`, `MAX_CONCURRENT_TRANSCRIPTIONS`, `PLAYBACK_VOLUME`, `CREDITS_FILE`, `CREDITS_SAVE_SECONDS`, `CREDITS_TOPIC_SECONDS`, `VIOLATION_VOLUME_FLOOR`, and every `TTS_*`.
 
 > **Note on the vendored VAD model.** Silero v5's ONNX graph scores the current frame *together with* the trailing 64 samples of the previous one. Fed a bare 512-sample frame it does not error — it silently returns near-zero probability on unmistakable speech, and the bot transcribes nothing. `stt/vad.py` carries that context between calls, and `tests/test_vad.py` guards it with real speech; silence-based tests pass either way and will not catch a regression.
 
@@ -356,6 +377,7 @@ miss-quote/
 ├── bot/
 │   ├── client.py              # Bot setup, voice lifecycle, auto-join policy
 │   ├── audio_sink.py          # AudioSink + resampling bridge
+│   ├── scoreboard.py          # The tally, to disk and to the channel topic
 │   └── speaker.py             # Playback into a voice channel, fed while it plays
 ├── audio/
 │   ├── resampler.py           # soxr, both directions
@@ -368,6 +390,8 @@ miss-quote/
 │   ├── wyoming_client.py      # Per-utterance Wyoming round-trip
 │   └── models/
 │       └── silero_vad.onnx    # Vendored (~2 MB)
+├── ledger/
+│   └── credits.py             # What everybody owes, per server
 ├── tools/
 │   ├── base.py                # What a tool is: the two optional handlers, and a speaker
 │   ├── registry.py            # Tool names a config file can switch on
@@ -419,6 +443,7 @@ Runtime requirements:
 
 - **A reachable Wyoming ASR server** — set `WYOMING_HOST` and `WYOMING_PORT`. There is no default that will work out of the box.
 - **A writable volume at `TRANSCRIPT_DIR`.** Use a shared (`ReadWriteMany`) volume if anything else will need to read the transcripts; a single-writer volume locks them to this pod and forces an export step later.
+- **A writable volume at the directory holding `CREDITS_FILE`**, if `verbal-morality` is enabled anywhere. Without one the tally is forgiven at every restart, which costs the accounting rather than the feature. **Manage Channels** on each voice channel is what lets the tally reach the topic; without it the bot keeps counting and says so in the log.
 - **A single replica.** Two instances would double-join the voice channel and double-write the transcript.
 - **No GPU and no node constraints** — transcription is a network call.
 
