@@ -26,23 +26,18 @@ COPY --from=builder /install /usr/local
 
 WORKDIR /app
 
-COPY audio/ audio/
-COPY bot/ bot/
-COPY ledger/ ledger/
-COPY resources/ resources/
-COPY stt/ stt/
-COPY tools/ tools/
-COPY transcript/ transcript/
-COPY tts/ tts/
-COPY utils/ utils/
-COPY config.py main.py ./
+COPY src/ src/
 
+# The package is on the path rather than installed: an install step would want
+# the dependencies resolved a second time, and they are already in the layer
+# above. `python -m miss_quote` runs the same entry point either way.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app/src \
     TRANSCRIPT_DIR=/transcripts \
     TTS_CACHE_DIR=/cache/tts \
     CREDITS_FILE=/credits/credits.json \
-    QUOTES_FILE=/app/resources/quotes.csv
+    QUOTES_FILE=/app/src/miss_quote/resources/quotes.csv
 
 # The cache and the credits directory are created either way. Mounting a volume
 # over each is what makes rendered speech and the tally outlive the pod; without
@@ -54,4 +49,4 @@ RUN useradd --create-home --uid 1000 bot \
 
 USER bot
 
-CMD ["python", "main.py"]
+CMD ["python", "-m", "miss_quote"]

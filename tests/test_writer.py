@@ -4,8 +4,8 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-import transcript.writer as writer_module
-from transcript.writer import Source, TranscriptWriter, slugify
+import miss_quote.transcript.writer as writer_module
+from miss_quote.transcript.writer import Source, TranscriptWriter, slugify
 
 TIMEZONE = "America/Los_Angeles"
 KEEP_FOREVER = -1

@@ -56,17 +56,31 @@ servers:
       quotes:
         enabled: false
 
+      # Keeps this server's running tally and publishes it to the voice channel
+      # topic as `Eli: -9 Erik: -2`, which needs Set Voice Channel Status on the
+      # channel.
+      #
+      # It hears nothing on its own. Other tools count through it — today that
+      # is verbal-morality, which fines people — so a server that enables one of
+      # those and not this one gets everything except the tally. Nothing else is
+      # configured per server: where the file lives, what it counts in, and how
+      # often it is written and published are CREDITS_* in the environment.
+      #
+      # Everyone in `users` above starts on the board at nothing spent, and only
+      # they are eligible for it: somebody the server has not written down is
+      # still heard and still fined, but a Discord nickname does not go in a
+      # topic. The four furthest into the red are what fits.
+      scoreboard:
+        enabled: false
+
       # Announces a fine, out loud, when someone says one of `words`.
       #
       # The words below are placeholders. What a server objects to is its own
       # business and belongs in the mounted ConfigMap, not in this repository.
       #
-      # A fine is a debit, counted per server and kept in CREDITS_FILE. The four
-      # people furthest into the red are published to the voice channel topic as
-      # `Eli: -9 Erik: -2`, which needs Manage Channels on the channel. Everyone
-      # in `users` above starts on the board at nothing spent, and only they are
-      # eligible for it: somebody the server has not written down is still heard
-      # and still fined, but a Discord nickname does not go in a topic.
+      # The fine is handed to `scoreboard` above, which is what keeps it. With
+      # no scoreboard enabled the fine is announced and not counted, which is
+      # said once at startup rather than left to be noticed.
       #
       # A repeat offender is announced more quietly, down to
       # VIOLATION_VOLUME_FLOOR; none of that is per server, so it is set in the

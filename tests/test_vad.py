@@ -5,8 +5,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from config import audio_cfg, vad_cfg, MILLISECONDS_PER_SECOND
-from stt.vad import SileroVAD
+from miss_quote.config import audio_cfg, vad_cfg, MILLISECONDS_PER_SECOND
+from miss_quote.stt.vad import SileroVAD
 
 SPEECH_FIXTURE = Path(__file__).parent / "fixtures" / "speech_16k_mono.wav"
 

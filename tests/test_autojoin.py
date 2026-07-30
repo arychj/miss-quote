@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from bot.client import VoiceAction, humans_in, plan_voice_action
+from miss_quote.bot.client import VoiceAction, humans_in, plan_voice_action
 
 AUTOJOIN_ON = True
 AUTOJOIN_OFF = False

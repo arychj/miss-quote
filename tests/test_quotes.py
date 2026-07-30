@@ -6,10 +6,17 @@ from pathlib import Path
 
 import pytest
 
-from config import UNITY_VOLUME, ServerConfig, ToolSettings, quotes_cfg
-from tools.quotes import Quote, Quotes, RecentQuotes, _load
-from tools.runner import ToolRunner
-from transcript.writer import Source, Utterance
+from miss_quote.config import (
+    BUNDLED_QUOTES,
+    UNITY_VOLUME,
+    ServerConfig,
+    ToolSettings,
+    quotes_cfg,
+)
+from miss_quote.tools.base import ToolContext
+from miss_quote.tools.quotes import Quote, Quotes, RecentQuotes, _load
+from miss_quote.tools.runner import ToolRunner
+from miss_quote.transcript.writer import Source, Utterance
 
 SERVER_ALIAS = "first-server"
 SPEAKER = "Speaker One"
@@ -51,7 +58,8 @@ ROWS = (
     f"{OTHER_MOVIE},{OTHER_TRIGGER},{OTHER_QUOTE}",
 )
 
-BUNDLED = Path(__file__).resolve().parent.parent / "resources" / "quotes.csv"
+# Taken from the config rather than rebuilt here, so a moved file is one edit.
+BUNDLED = BUNDLED_QUOTES
 
 # A window of its own, so a test about the backoff is not also a test of what the
 # deployment set it to.
@@ -104,7 +112,7 @@ class FakeSession:
 def speech(monkeypatch) -> FakeSpeech:
     """Replace the process-wide cache so nothing reaches a synthesizer."""
     fake = FakeSpeech()
-    monkeypatch.setattr("tools.quotes.shared_cache", lambda: fake)
+    monkeypatch.setattr("miss_quote.tools.quotes.shared_cache", lambda: fake)
     return fake
 
 
@@ -135,11 +143,13 @@ def _pointed_at(monkeypatch, path: Path) -> None:
     The environment is read at import, so the settings object is replaced rather
     than the variable behind it.
     """
-    monkeypatch.setattr("tools.quotes.quotes_cfg", replace(quotes_cfg, file=path))
+    monkeypatch.setattr("miss_quote.tools.quotes.quotes_cfg", replace(quotes_cfg, file=path))
 
 
 def _tool(speaker, users=None) -> Quotes:
-    return Quotes(server=SERVER_ALIAS, config={}, speaker=speaker, users=users)
+    return Quotes(
+        ToolContext(server=SERVER_ALIAS, speaker=speaker, users=users or {})
+    )
 
 
 def _utterance(text: str, user: str = SPEAKER, user_id: int = SPEAKER_ID) -> Utterance:
@@ -395,7 +405,7 @@ async def test_the_backoff_is_the_trigger_rather_than_the_speaker(
 async def test_two_servers_cool_down_separately(quotes_file, speech, speaker):
     """Two channels arriving at the same line have each made the joke once."""
     here = _tool(speaker)
-    elsewhere = Quotes(server="second-server", config={}, speaker=speaker, users=None)
+    elsewhere = Quotes(ToolContext(server="second-server", speaker=speaker))
 
     await _hear(here, TRIGGER)
     await _hear(elsewhere, TRIGGER)
@@ -449,7 +459,7 @@ def test_a_trigger_that_has_aged_out_is_forgotten_entirely():
 def test_the_window_comes_from_the_deployment(monkeypatch):
     """Nothing carries a five-minute default of its own past the settings."""
     monkeypatch.setattr(
-        "tools.quotes.quotes_cfg", replace(quotes_cfg, backoff_seconds=SHORT_WINDOW)
+        "miss_quote.tools.quotes.quotes_cfg", replace(quotes_cfg, backoff_seconds=SHORT_WINDOW)
     )
 
     assert RecentQuotes().window == SHORT_WINDOW

@@ -3,11 +3,11 @@ import json
 
 import pytest
 
-import stt.processor as processor_module
-from config import vad_cfg
-from stt.processor import STTProcessor
-from tools.runner import ToolRunner
-from transcript.writer import Source, TranscriptSession, TranscriptWriter
+import miss_quote.stt.processor as processor_module
+from miss_quote.config import vad_cfg
+from miss_quote.stt.processor import STTProcessor
+from miss_quote.tools.runner import ToolRunner
+from miss_quote.transcript.writer import Source, TranscriptSession, TranscriptWriter
 
 TIMEZONE = "America/Los_Angeles"
 KEEP_FOREVER = -1
@@ -250,8 +250,8 @@ async def test_forced_flush_resets_the_vad(build, transcripts):
 
 async def test_a_written_utterance_reaches_the_tools(build, tmp_path, transcripts):
     """A tool that reads the file rather than the utterance must see the same thing."""
-    from config import ServerConfig, ToolSettings
-    from tools.base import Tool
+    from miss_quote.config import ServerConfig, ToolSettings
+    from miss_quote.tools.base import Tool
 
     seen = []
 
@@ -284,8 +284,8 @@ async def test_a_written_utterance_reaches_the_tools(build, tmp_path, transcript
 
 
 async def test_an_empty_transcription_reaches_no_tool(build, tmp_path, transcripts):
-    from config import ServerConfig, ToolSettings
-    from tools.base import Tool
+    from miss_quote.config import ServerConfig, ToolSettings
+    from miss_quote.tools.base import Tool
 
     seen = []
 

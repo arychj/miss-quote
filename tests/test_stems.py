@@ -1,6 +1,6 @@
 """What a stem grows into, and how it is spelled on the way."""
 
-from utils.stems import expand
+from miss_quote.utils.stems import expand
 
 STEM = "fiddlestick"
 

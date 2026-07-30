@@ -6,11 +6,11 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-import bot.client as client_module
-from config import FileConfig, ServerConfig, ToolSettings, transcript_cfg
-from tools.base import Tool
-from tools.runner import ToolRunner
-from transcript.writer import TranscriptWriter
+import miss_quote.bot.client as client_module
+from miss_quote.config import FileConfig, ServerConfig, ToolSettings, transcript_cfg
+from miss_quote.tools.base import Tool
+from miss_quote.tools.runner import ToolRunner
+from miss_quote.transcript.writer import TranscriptWriter
 
 SERVER = 123456789012345678
 ALIAS = "first-server"
@@ -135,7 +135,9 @@ def bot(monkeypatch, tmp_path):
     monkeypatch.setattr(
         client_module,
         "ToolRunner",
-        lambda speaker: ToolRunner(config.servers, {TOOL_NAME: Collector}, speaker),
+        lambda speaker, topic: ToolRunner(
+            config.servers, {TOOL_NAME: Collector}, speaker, topic
+        ),
     )
     monkeypatch.setattr(client_module, "STTProcessor", FakeProcessor)
     monkeypatch.setattr(client_module, "STTAudioSink", lambda processor, session: session)

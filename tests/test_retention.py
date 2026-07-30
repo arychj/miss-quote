@@ -3,8 +3,8 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from config import transcript_cfg
-from transcript.writer import Source, TranscriptWriter
+from miss_quote.config import transcript_cfg
+from miss_quote.transcript.writer import Source, TranscriptWriter
 
 TIMEZONE = "America/Los_Angeles"
 KEEP_FOREVER = -1

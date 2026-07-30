@@ -13,6 +13,8 @@ assets/
 design/
 tests/
 pytest.ini
+pyproject.toml
+setup.cfg
 requirements-dev.txt
 
 .env

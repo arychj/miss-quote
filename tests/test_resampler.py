@@ -1,6 +1,6 @@
 import numpy as np
 
-from audio.resampler import AudioResampler, PlaybackResampler
+from miss_quote.audio.resampler import AudioResampler, PlaybackResampler
 
 INPUT_RATE = 48_000
 OUTPUT_RATE = 16_000

@@ -2,7 +2,7 @@ import pytest
 from discord.ext.voice_recv.opus import PacketDecoder, VoiceData
 from discord.opus import OpusError
 
-from bot import voice_patches
+from miss_quote.bot import voice_patches
 
 CORRUPTED_STREAM = -4
 SPEAKER_ID = 4242

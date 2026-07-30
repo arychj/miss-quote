@@ -4,10 +4,10 @@ from pathlib import Path
 
 import pytest
 
-from config import ServerConfig, ToolSettings
-from tools.base import Tool
-from tools.runner import ToolRunner
-from transcript.writer import Source, Transcript, Utterance
+from miss_quote.config import ServerConfig, ToolSettings
+from miss_quote.tools.base import Tool
+from miss_quote.tools.runner import ToolRunner
+from miss_quote.transcript.writer import Source, Transcript, Utterance
 
 FIRST_SERVER = 123456789012345678
 SECOND_SERVER = 876543210987654321
@@ -20,6 +20,8 @@ OTHER_TOOL_NAME = "second-recorder"
 WARMING_TOOL_NAME = "warming-recorder"
 
 ROSTER = {234567890123456789: "Speaker One"}
+
+PATIENCE_SECONDS = 2.0
 
 FIRST_SOURCE = Source(
     guild_id=FIRST_SERVER, guild_alias=FIRST_ALIAS, channel_id=1, channel="general-voice"
@@ -34,8 +36,8 @@ class Recorder(Tool):
 
     name = TOOL_NAME
 
-    def __init__(self, server, config, speaker, users=None):
-        super().__init__(server, config, speaker, users)
+    def __init__(self, context):
+        super().__init__(context)
         self.utterances = []
         self.transcripts = []
 
@@ -49,8 +51,8 @@ class Recorder(Tool):
 class UtteranceOnly(Tool):
     name = "utterance-only"
 
-    def __init__(self, server, config, speaker, users=None):
-        super().__init__(server, config, speaker, users)
+    def __init__(self, context):
+        super().__init__(context)
         self.calls = 0
 
     async def handle_utterance(self, utterance, session) -> None:
@@ -60,8 +62,8 @@ class UtteranceOnly(Tool):
 class FinishedOnly(Tool):
     name = "finished-only"
 
-    def __init__(self, server, config, speaker, users=None):
-        super().__init__(server, config, speaker, users)
+    def __init__(self, context):
+        super().__init__(context)
         self.calls = 0
 
     async def handle_finished(self, transcript) -> None:
@@ -73,8 +75,8 @@ class Warming(Recorder):
 
     name = WARMING_TOOL_NAME
 
-    def __init__(self, server, config, speaker, users=None):
-        super().__init__(server, config, speaker, users)
+    def __init__(self, context):
+        super().__init__(context)
         self.warmed = 0
 
     async def prewarm(self) -> None:
@@ -86,8 +88,8 @@ class WarmingInert(Tool):
 
     name = "warming-inert"
 
-    def __init__(self, server, config, speaker, users=None):
-        super().__init__(server, config, speaker, users)
+    def __init__(self, context):
+        super().__init__(context)
         self.warmed = 0
 
     async def prewarm(self) -> None:
@@ -98,6 +100,38 @@ class Inert(Tool):
     """A tool that handles nothing. Configured, but it can never run."""
 
     name = "inert"
+
+
+class Serving(Tool):
+    """A tool with something of its own to do and nothing to be told."""
+
+    name = "serving"
+
+    def __init__(self, context):
+        super().__init__(context)
+        self.running = asyncio.Event()
+        self.closed = 0
+
+    async def run(self) -> None:
+        self.running.set()
+        await asyncio.Event().wait()
+
+    async def close(self) -> None:
+        self.closed += 1
+
+
+class Neighbourly(Recorder):
+    """A tool that reaches for another one when something is said."""
+
+    name = "neighbourly"
+
+    def __init__(self, context):
+        super().__init__(context)
+        self.found: list[Tool | None] = []
+
+    async def handle_utterance(self, utterance, session) -> None:
+        await super().handle_utterance(utterance, session)
+        self.found.append(self.tools.find(Serving))
 
 
 class Exploding(Tool):
@@ -116,7 +150,7 @@ class Exploding(Tool):
 class Unbuildable(Tool):
     name = "unbuildable"
 
-    def __init__(self, server, config, speaker, users=None):
+    def __init__(self, context):
         raise ValueError("missing something it needed")
 
 
@@ -445,3 +479,198 @@ async def test_cancellation_is_not_swallowed():
 
     with pytest.raises(asyncio.CancelledError):
         await runner.dispatch_utterance(FakeSession(FIRST_SOURCE), _utterance())
+
+
+# ── running ───────────────────────────────────────
+
+
+async def test_a_tool_that_only_runs_is_not_inert():
+    """It hears nothing and says nothing, which is not the same as doing nothing."""
+    runner = ToolRunner(_servers(first={Serving.name: _enabled()}), {Serving.name: Serving})
+
+    assert runner.describe() == {FIRST_ALIAS: (Serving.name,)}
+    assert runner.problems == []
+
+
+async def test_a_tool_with_something_to_do_is_set_going():
+    runner = ToolRunner(_servers(first={Serving.name: _enabled()}), {Serving.name: Serving})
+    tool = runner._serving[0]
+
+    tasks = runner.start()
+
+    async with asyncio.timeout(PATIENCE_SECONDS):
+        await tool.running.wait()
+
+    for task in tasks:
+        task.cancel()
+
+
+async def test_each_servers_tool_is_set_going():
+    runner = ToolRunner(
+        _servers(first={Serving.name: _enabled()}, second={Serving.name: _enabled()}),
+        {Serving.name: Serving},
+    )
+
+    tasks = runner.start()
+
+    assert len(tasks) == 2
+    for task in tasks:
+        task.cancel()
+
+
+async def test_nothing_is_set_going_twice():
+    """However many readies the gateway sends."""
+    runner = ToolRunner(_servers(first={Serving.name: _enabled()}), {Serving.name: Serving})
+    started = runner.start()
+
+    assert runner.start() is started
+    for task in started:
+        task.cancel()
+
+
+async def test_a_tool_whose_run_raises_is_logged(caplog):
+    """Nothing awaits the task, so the exception would otherwise never be collected."""
+
+    class Failing(Tool):
+        name = "failing"
+
+        async def run(self) -> None:
+            raise RuntimeError("it fell over")
+
+    runner = ToolRunner(_servers(first={TOOL_NAME: _enabled()}), {TOOL_NAME: Failing})
+
+    with caplog.at_level("ERROR"):
+        await asyncio.gather(*runner.start())
+
+    assert any("it fell over" in record.message for record in caplog.records)
+
+
+# ── closing ───────────────────────────────────────
+
+
+async def test_a_tool_with_something_to_finish_is_closed():
+    runner = ToolRunner(_servers(first={Serving.name: _enabled()}), {Serving.name: Serving})
+    tool = runner._serving[0]
+
+    await runner.close()
+
+    assert tool.closed == 1
+
+
+async def test_a_tool_that_does_not_close_is_not_asked_to():
+    runner = ToolRunner(_servers(first={TOOL_NAME: _enabled()}), {TOOL_NAME: Recorder})
+
+    await runner.close()
+
+    assert runner._closing == []
+
+
+async def test_a_tool_that_can_never_run_is_not_closed():
+    """Nothing should be finished on behalf of a tool that never started."""
+    runner = ToolRunner(_servers(first={Inert.name: _enabled()}), {Inert.name: Inert})
+
+    await runner.close()
+
+    assert runner._closing == []
+
+
+async def test_a_raising_close_does_not_stop_the_others(caplog):
+    class Stubborn(Serving):
+        name = "stubborn"
+
+        async def close(self) -> None:
+            raise RuntimeError("it will not lie down")
+
+    registry = {Serving.name: Serving, Stubborn.name: Stubborn}
+    runner = ToolRunner(
+        _servers(first={Stubborn.name: _enabled(), Serving.name: _enabled()}), registry
+    )
+    closing = next(tool for tool in runner._closing if type(tool) is Serving)
+
+    with caplog.at_level("ERROR"):
+        await runner.close()
+
+    assert closing.closed == 1
+    assert any("will not lie down" in record.message for record in caplog.records)
+
+
+# ── one tool reaching another ─────────────────────
+
+
+async def test_a_tool_can_reach_another_on_its_server():
+    registry = {Neighbourly.name: Neighbourly, Serving.name: Serving}
+    runner = ToolRunner(
+        _servers(first={Neighbourly.name: _enabled(), Serving.name: _enabled()}), registry
+    )
+    tool = _only_tool(runner, FIRST_SERVER, "_on_utterance")
+
+    await runner.dispatch_utterance(FakeSession(FIRST_SOURCE), _utterance())
+
+    assert isinstance(tool.found[0], Serving)
+
+
+async def test_a_tool_reaches_one_built_after_it():
+    """
+    Which is why a tool looks when it needs something rather than when it is made.
+
+    The box is handed over before either exists and fills as they are built, so
+    the order the config file lists them in cannot decide what is reachable.
+    """
+    registry = {Neighbourly.name: Neighbourly, Serving.name: Serving}
+    runner = ToolRunner(
+        _servers(first={Neighbourly.name: _enabled(), Serving.name: _enabled()}), registry
+    )
+
+    assert list(runner._serving[0].tools._tools) == [
+        _only_tool(runner, FIRST_SERVER, "_on_utterance"),
+        runner._serving[0],
+    ]
+
+
+async def test_a_tool_that_is_not_enabled_is_not_reachable():
+    runner = ToolRunner(
+        _servers(first={Neighbourly.name: _enabled()}), {Neighbourly.name: Neighbourly}
+    )
+    tool = _only_tool(runner, FIRST_SERVER, "_on_utterance")
+
+    await runner.dispatch_utterance(FakeSession(FIRST_SOURCE), _utterance())
+
+    assert tool.found == [None]
+
+
+async def test_one_servers_tool_never_reaches_anothers():
+    """A tool holds per-server state; finding the wrong one would cross the two."""
+    registry = {Neighbourly.name: Neighbourly, Serving.name: Serving}
+    runner = ToolRunner(
+        _servers(
+            first={Neighbourly.name: _enabled()},
+            second={Neighbourly.name: _enabled(), Serving.name: _enabled()},
+        ),
+        registry,
+    )
+    here = _only_tool(runner, FIRST_SERVER, "_on_utterance")
+
+    await runner.dispatch_utterance(FakeSession(FIRST_SOURCE), _utterance())
+
+    assert here.found == [None]
+
+
+async def test_a_tool_that_can_never_run_is_not_reachable():
+    """It will never do anything; it should not be what a neighbour settles for."""
+    registry = {Neighbourly.name: Neighbourly, Inert.name: Inert}
+    runner = ToolRunner(
+        _servers(first={Neighbourly.name: _enabled(), Inert.name: _enabled()}), registry
+    )
+    tool = _only_tool(runner, FIRST_SERVER, "_on_utterance")
+
+    assert tool.tools.find(Inert) is None
+
+
+async def test_closing_stops_a_running_tool_first():
+    """A tool writing itself out mid-loop would be racing itself for the file."""
+    runner = ToolRunner(_servers(first={Serving.name: _enabled()}), {Serving.name: Serving})
+    tasks = runner.start()
+
+    await runner.close()
+
+    assert all(task.done() for task in tasks)
