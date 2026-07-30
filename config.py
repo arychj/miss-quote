@@ -338,13 +338,14 @@ class MoralityConfig:
         default_factory=lambda: _env_float("CREDITS_SAVE_SECONDS", 5.0)
     )
 
-    # How often a changed tally is published to the voice channel topic, which is
-    # its own, much longer interval: Discord rate-limits a topic edit to a couple
-    # per ten minutes per channel, and discord.py answers a 429 by sleeping until
-    # it clears. Five minutes is as fast as that ceiling allows. Any value at or
-    # below zero keeps the tally off the topic entirely, and still saves it.
+    # How often a changed tally is published to the voice channel topic — the
+    # line the client shows under the channel's name, which `bot.scoreboard` sets
+    # as the channel status because a voice channel has no topic. Discord's
+    # bucket for it is roughly six a second, so this is a question of how often a
+    # tally is worth reading rather than of what the API will tolerate. Any value
+    # at or below zero keeps the tally off the channel, and still saves it.
     topic_interval_seconds: float = field(
-        default_factory=lambda: _env_float("CREDITS_TOPIC_SECONDS", 300.0)
+        default_factory=lambda: _env_float("CREDITS_TOPIC_SECONDS", 10.0)
     )
 
     # The quietest an announcement gets, as a fraction of PLAYBACK_VOLUME, once
