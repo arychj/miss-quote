@@ -198,14 +198,30 @@ A tool is only reachable from configuration once it is registered in `tools/regi
 
 ### quotes
 
-Answers the channel with the film line it just walked into. It listens for a trigger phrase and, on hearing one, says the associated quote out loud where it was said.
+Answers the channel with the film line it just walked into. It listens for a trigger phrase and, on hearing one, says the associated quote out loud where it was said — and then asks where the line came from.
 
 ```yaml
 quotes:
   enabled: true
+  config:
+    answer_seconds: 5
+    tie_seconds: 1
+    remarks:
+      - having watched it more recently than is respectable.
 ```
 
-There is nothing to configure per server. The pairs come from a CSV at `QUOTES_FILE` — a film, the phrase that sets it off, and the line — so adding a quote is a row rather than a deployment, and a film everybody in one channel has seen is one everybody in the next has too. The image ships the list in `resources/quotes.csv`; mount your own over that path to say something it does not.
+| Setting | Required | Purpose |
+|---|---|---|
+| `answer_seconds` | no, `5` | How long the channel has to name the title once the line has finished playing. `0` stops the tool asking at all |
+| `tie_seconds` | no, `1` | How long after the first correct answer a second one is still paid. `0` pays only whoever was first |
+| `penalize_self_answers` | no, `true` | Whether whoever set a line off is barred from naming it. `false` lets them answer like anybody else |
+| `self_answer_penalty` | no, `5` | What an attempt costs them, in credits. Floored at `0` |
+| `remarks` | no | Endings the announcement draws from, **added** to the ones the tool ships with. A lone one may be written unquoted rather than as a list |
+| `announcement` | no | What the winner is told. `{user}`, `{credits}`, and `{remark}` |
+| `tie_announcement` | no | What anyone paid on a tie is told. The same placeholders |
+| `self_answer_announcement` | no | What somebody naming their own line is told. The same placeholders, where `{credits}` is what it cost |
+
+Everything else is per deployment. The pairs come from a CSV at `QUOTES_FILE` — a film, the phrase that sets it off, and the line — so adding a quote is a row rather than a deployment, and a film everybody in one channel has seen is one everybody in the next has too. The image ships the list in `resources/quotes.csv`; mount your own over that path to say something it does not.
 
 ```csv
 movie,trigger,quote
@@ -217,7 +233,7 @@ Project Hail Mary,question,{user} question is dumb.
 
 | Column | Purpose |
 |---|---|
-| `movie` | Where the line is from. Never spoken; it is what makes the log and the file readable |
+| `movie` | Where the line is from. Never spoken; it is what the round asks about, and what makes the log and the file readable |
 | `trigger` | The phrase that sets the line off. Matched whole and case-insensitively, however the file writes it |
 | `quote` | What gets said. `{user}` is the only placeholder, and names whoever set it off |
 
@@ -235,6 +251,68 @@ Matching is **whole words, case-insensitive**, so `real` does not fire inside `r
 
 **The whole list is rendered at startup.** Unlike a fine, a quote is knowable in full before anybody speaks: the triggers are a closed set and so are the answers, so on the way up the tool synthesizes every line in the file and leaves the results in the speech cache. A callback that arrives four seconds after the line it answers is not a callback. The exception is a line naming whoever set it off, which is rendered once per name on the roster; somebody the server has not written down waits for the synthesizer the first time, and nobody waits again. Warming happens in the background, one phrase at a time, and anything already cached is left alone.
 
+#### Naming it
+
+**A line that has been said is also a question.** For `answer_seconds` afterwards the channel can say where it came from — `what is Firefly` — and whoever does is paid a credit through [`scoreboard`](#scoreboard), the same board `verbal-morality` takes them off, and told so out loud.
+
+The window opens when the line has **finished playing**, not when the trigger was heard. Transcription and synthesis take as long as they take, and a window that started at the trigger could be over before the channel had heard the question.
+
+**The first correct answer takes the round, and anyone inside `tie_seconds` of it is paid as well.** Two people arriving at the same title half a second apart both knew it, and which of them the transcriber happened to return first is not a fact about who was faster. Anything later has been beaten to it. Nobody is paid twice for the same title however many times they say it, and the speaker who set the line off is as eligible as anybody else.
+
+Answers are matched forgivingly, because an ASR transcript is not punctuated the way a poster is:
+
+| The file says | So the channel may say |
+|---|---|
+| `Firefly` | `what is Firefly`, `what's Firefly`, `What is Firefly?` |
+| `The Matrix` | `what is the matrix`, `what is matrix` — a leading `the`, `a`, or `an` is optional either way |
+| `Hitchhiker's Guide to the Galaxy` | `what is hitchhikers guide to the galaxy` — apostrophes are dropped from both sides |
+| `Tucker and Dale vs Evil` | `...vs Evil`, `...vs. Evil`, `...versus Evil` |
+
+The answer may sit anywhere in the sentence: somebody who has it has said so whether or not they said anything else in the same breath. A row with an empty `movie` asks nothing, there being no question in it. A title carrying a **numeral** is matched as a numeral — `Apollo 13` answers to `what is apollo 13` and not to `what is apollo thirteen`, which is what an ASR is likelier to return; write the title the way it will be transcribed if that matters.
+
+**Two rounds can be open at once**, since an answer names its own title and cannot be mistaken for an answer to the other. An utterance that answers an open round is an answer and nothing else, whatever trigger it also contains — otherwise a channel naming a title could set off the line that asks about the next one, which is a loop the tool would be driving rather than following.
+
+Rounds are held in memory, per server, and dropped as they run out. A server with no `scoreboard` asks the question and pays nothing, which is said once at startup rather than left to be noticed; `answer_seconds: 0` stops it asking at all.
+
+#### The announcement
+
+The award is said out loud, with **no chime in front of it**. A fine opens with one because it interrupts a conversation that was about something else; an award answers a question the channel is already sitting in, and a flourish ahead of it would be announcing what everybody is waiting for.
+
+```
+Correct! Erik, you are awarded 1 credit for quoting along at home.
+```
+
+**The ending is drawn fresh each time**, from the list the tool ships with plus whatever `remarks` adds to it. One fixed sentence is a joke told once and then endured, and this plays every time anybody gets one right. The shipped endings are:
+
+- `knowing exactly where that came from, which explains a great deal.`
+- `quoting along at home.`
+- `a display of recall that has never once been useful.`
+- `having excellent taste and nothing better to do.`
+- `being the sort of person who knows that.`
+- `spending your formative years exactly as you did.`
+
+`remarks` **adds** to those rather than replacing them, so saying one extra thing costs one line instead of writing out the whole list again. None of the shipped endings says "film" — the CSV column is called `movie` because it started that way, but a trigger answers for a series, a game, or a book as often as a picture, and an announcement that guesses wrong guesses wrong out loud. Write your own the same way.
+
+Somebody paid on a **tie** gets the second wording — `Eli, you are also awarded 1 credit, for getting there at the same time.` — because the whole sentence again reads as though the bot had lost track of what it just said.
+
+**Nothing this tool says is dropped for landing while something else is playing**, which is the one place it parts company with `verbal-morality`. A fine interrupts a conversation that was about something else, so a backlog of them is a channel being read things it has moved on from, and `verbal-morality` drops any fine earned mid-announcement. Everything `quotes` says is an answer to something it just said itself: the line, the award, the tie, the rebuke. Announcements wait their turn on the speaker's per-server lock and come out in the order they were earned.
+
+**Every wording is rendered at startup**, alongside the quotes: every template the server can hear, for every name on the roster, against every ending it can take. Which one comes up is decided when somebody answers; that all of them are already in the cache is decided on the way up. A template with a placeholder nothing fills stops the tool from starting, rather than being discovered at the moment there is a credit to explain.
+
+#### Naming your own line
+
+**Whoever set a line off cannot name it.** They have the trigger and the title in front of them and had to recall neither, so a round they could win is one anybody can farm by reading the quote file out loud. An attempt is refused out loud and **costs them `self_answer_penalty` credits**, taken through the same board:
+
+```
+Nuh uh uh. Erik, you set it off, so you do not get to name it. You are fined 5 credits for being a dick.
+```
+
+Refused rather than quietly ignored, because a rule nobody is told about is one everybody keeps testing. The penalty is deliberately larger than the single credit the attempt was worth, so gaming the round is a losing trade however many times it is tried — and it is taken **once per round** however many times they say it.
+
+An attempt **neither wins the round nor spoils it**: it does not claim the round and does not start the tie window, so whoever names it next is the first answer and is paid in full. The bar is per round, not per person — setting one line off does not disqualify you from naming the next one.
+
+`penalize_self_answers: false` drops the rule entirely. The trigger's speaker becomes an answerer like anybody else, the rebuke is never said, and it is not rendered at startup either.
+
 ### scoreboard
 
 Keeps a running balance per person, writes it down, and puts the standings under the name of whatever voice channel the bot is in. It hears nothing and says nothing out loud; what it does is count for the tools that ask it to.
@@ -246,7 +324,7 @@ scoreboard:
 
 There is nothing to configure per server. Where the tally lives, what it is counted in, and how often it is written and published are the `CREDITS_*` variables, because there is one file behind every server's board and how often it is written is a property of the file rather than of any one server.
 
-**It is enabled separately from whatever is counting.** A server that wants fines announced but not tallied enables `verbal-morality` and not this; the fines are announced and nothing is kept, and the log says so once at startup rather than leaving it to be discovered by wondering why the channel topic is empty.
+**It is enabled separately from whatever is counting.** A server that wants fines announced but not tallied enables `verbal-morality` and not this; the fines are announced and nothing is kept, and the log says so once at startup rather than leaving it to be discovered by wondering why the channel topic is empty. The same goes for `quotes`, which asks the channel to name what a line came from and pays for it here.
 
 **Other tools count through it.** `credit` and `debit` are the whole interface, and they are what a tool calls when it has decided somebody owes something:
 
@@ -258,7 +336,7 @@ if board is not None:
 
 The name arrives with the change rather than being looked up, because the caller has just heard from whoever it is and the board prints whatever it was last told. Where the balance is kept, when it is written, and who is eligible for the board are the scoreboard's business and not the caller's.
 
-**The standings go in the voice channel topic**, as `Eli: -9 Erik: -2 Luke: -1 Ryan: 0`, which makes the topic the scoreboard — visible without asking the bot anything. A fine is a **debit**: everybody starts at nothing and goes down, so the number beside a name reads as what swearing has cost them rather than as points collected. Nothing assumes that direction — `credit` puts it back — but nothing today calls it.
+**The standings go in the voice channel topic**, as `Eli: -9 Erik: -2 Luke: -1 Ryan: 0`, which makes the topic the scoreboard — visible without asking the bot anything. A fine is a **debit**: everybody starts at nothing and goes down, so the number beside a name reads as what swearing has cost them rather than as points collected. Nothing assumes that direction, and `quotes` calls `credit` to pay for a title named in time, so a balance can climb back toward nothing and past it.
 
 The board holds the **four furthest into the red, worst first**. A leaderboard rearranges itself every time somebody passes somebody else, which is the objection to publishing a whole roster in name order; at four places it is short enough to read at a glance, and who is winning is the thing worth reading. Ties break on the name, so two people on the same balance do not swap places between one edit and the next for no reason anybody can see.
 

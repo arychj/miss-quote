@@ -11,14 +11,41 @@ minute does not want "Shiny." four times back. The backoff is per trigger rather
 than per speaker: what wears out is the line, not the person who set it off. See
 `RecentQuotes`.
 
+A line that has just been said is also a question. For a few seconds afterwards
+the channel can name the title it came from — "what is Firefly" — and whoever
+does is paid a credit through the server's `scoreboard`, which is the same board
+`verbal-morality` takes them off. The first correct answer takes the round, and a
+second inside the tie window is paid as well: two people arriving at the same
+title half a second apart both knew it. See `Round`.
+
+Whoever set the line off is barred from their own round. They have the trigger
+and the title in front of them and had to recall neither, so a round they could
+win is one anybody can farm by reading the quote file out loud. An attempt costs
+them credits and is said so out loud, because a rule nobody is told about is one
+everybody keeps testing.
+
+Every one of those is announced, and unlike a fine none of them opens with a
+chime: a flourish is for an interruption, and these answer a question the channel
+was already being asked. Somebody paid on a tie gets the second wording — "you
+are also awarded".
+
+Nothing said here is dropped for landing while something else is playing, which
+is the other difference from a fine. A fine interrupts a conversation that was
+about something else, so a backlog of them is a channel being read things it has
+moved on from; everything this tool says is an answer to something it just said
+itself, and a round that pays somebody without saying so reads as having missed
+them. Announcements wait their turn on the speaker and come out in the order they
+were earned.
+
 Because both the triggers and the lines are a closed set known before anybody
 speaks, the whole list can be rendered at startup rather than while the channel
-waits for it. See `prewarm`.
+waits for it, and so can both wordings for everybody on the roster. See `prewarm`.
 """
 
 from __future__ import annotations
 
 import csv
+import random
 import re
 import time
 from collections.abc import Iterable, Mapping, Sequence
@@ -26,11 +53,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from miss_quote.config import quotes_cfg
+from miss_quote.config import quotes_cfg, scoreboard_cfg
 from miss_quote.tools.base import Tool, ToolContext
+from miss_quote.tools.scoreboard import Scoreboard
 from miss_quote.transcript.writer import TranscriptSession, Utterance
 from miss_quote.tts.cache import shared_cache
 from miss_quote.utils.logging import get_logger
+from miss_quote.utils.stems import plural
 
 logger = get_logger(__name__)
 
@@ -62,6 +91,127 @@ WORD_BOUNDARY = r"\b"
 ALTERNATION = "|"
 
 TRIGGER_SEPARATOR = ", "
+
+# What a server may say about the round, and what it gets for saying nothing.
+# The defaults live here rather than in the config file so that electing into
+# the tool is the whole decision a server has to make.
+ANSWER_SECONDS_KEY = "answer_seconds"
+TIE_SECONDS_KEY = "tie_seconds"
+DEFAULT_ANSWER_SECONDS = 5.0
+DEFAULT_TIE_SECONDS = 1.0
+
+# A window of this or less is off rather than instantaneous: no answer window is
+# a deployment that wants the lines and not the game, and no tie window is one
+# where being second is being late.
+NEVER = 0.0
+
+# What naming it is worth. One, because the round is a few seconds of recall
+# rather than a wager, and it is the same credit a fine takes off.
+SINGLE_CREDIT = 1
+NO_CREDITS = 0
+
+# The three things that can be said about an answer. A wording is known by the
+# setting it comes from, so nothing has to keep a second set of names in step
+# with the config file.
+ANNOUNCEMENT_KEY = "announcement"
+TIE_ANNOUNCEMENT_KEY = "tie_announcement"
+SELF_ANSWER_ANNOUNCEMENT_KEY = "self_answer_announcement"
+
+# The defaults live here rather than in the config file so a server electing
+# into the tool only has to say that it wants it.
+DEFAULT_ANNOUNCEMENT = "Correct! {user}, you are awarded {credits} for {remark}"
+
+# What somebody paid on a tie is told. The whole sentence again reads as though
+# the bot had lost track of what it just said, where "also" is what a person
+# would say — and "at the same time" is the only part of the round worth
+# remarking on, since being second is otherwise being late.
+DEFAULT_TIE_ANNOUNCEMENT = (
+    "{user}, you are also awarded {credits}, for getting there at the same time."
+)
+
+# What somebody naming their own line is told. It is the one answer nobody has
+# to know anything to give — the trigger and the title are both in front of
+# them — so it is the one worth being rude about.
+DEFAULT_SELF_ANSWER_ANNOUNCEMENT = (
+    "Nuh uh uh. {user}, you set it off, so you do not get to name it. "
+    "You are fined {credits} for being a dick."
+)
+
+DEFAULT_ANNOUNCEMENTS = {
+    ANNOUNCEMENT_KEY: DEFAULT_ANNOUNCEMENT,
+    TIE_ANNOUNCEMENT_KEY: DEFAULT_TIE_ANNOUNCEMENT,
+    SELF_ANSWER_ANNOUNCEMENT_KEY: DEFAULT_SELF_ANSWER_ANNOUNCEMENT,
+}
+
+# Whether naming your own line is worth taking credits off somebody for, and how
+# many. On by default: the whole round is a few seconds of recall, and somebody
+# answering the question they just asked has recalled nothing.
+PENALIZE_SELF_ANSWERS_KEY = "penalize_self_answers"
+SELF_ANSWER_PENALTY_KEY = "self_answer_penalty"
+PENALIZE_SELF_ANSWERS = True
+
+# Enough to be worth more than the credit it was an attempt to win, so gaming
+# the round is a losing trade however many times it is tried.
+DEFAULT_SELF_ANSWER_PENALTY = 5
+
+# What a round is told to bar nobody from answering it.
+ANYBODY = None
+
+# How the announcement ends, chosen afresh each time. One fixed sentence is a
+# joke told once and then endured, and the tool says this every time anybody
+# gets one right.
+#
+# None of them says "film". The column is called `movie` because it was, but
+# what a row points at is a series, a game, or a book as often as not, and an
+# announcement that gets that wrong is wrong out loud in front of everybody.
+REMARKS_KEY = "remarks"
+REMARK_FIELD = "remark"
+REMARK_PLACEHOLDER = f"{{{REMARK_FIELD}}}"
+
+DEFAULT_REMARKS = (
+    "knowing exactly where that came from, which explains a great deal.",
+    "quoting along at home.",
+    "a display of recall that has never once been useful.",
+    "having excellent taste and nothing better to do.",
+    "being the sort of person who knows that.",
+    "spending your formative years exactly as you did.",
+)
+
+CREDITS_FIELD = "credits"
+FIELD_SEPARATOR = ", "
+
+# What the log says instead of a balance where no scoreboard is keeping one.
+UNCOUNTED = "uncounted"
+
+# Naming the title the way the game show does. The apostrophe in "what's" is
+# gone by the time this is matched, so the contraction is spelled without one.
+QUESTION = r"what(?:s|\s+is)"
+
+# An article in front of a title is optional in both directions. The file writes
+# the title the way the poster does — "The Matrix", "Hitchhiker's Guide" — and a
+# channel says whichever of the two sounds right out loud. Stripped from the
+# title and allowed back in the answer, so "The Matrix" answers to both.
+ARTICLE = r"(?:the|an?)"
+LEADING_ARTICLE = re.compile(rf"^{ARTICLE}\s+")
+
+# Words a poster writes one way and a channel says another. The abbreviation is
+# what a title carries and the word is what comes out of somebody's mouth, and
+# an answer should not turn on which of the two the transcriber wrote down.
+VERSUS = r"(?:vs|versus)"
+SAID_ALIKE = {"vs": VERSUS, "versus": VERSUS}
+
+# Everything that is not a letter or a digit, for the normalizing that lets a
+# title be written with the punctuation it deserves. An apostrophe closes the
+# gap rather than opening one, so "what's" is "whats" and a possessive title
+# answers to a transcript that dropped the mark: "hitchhikers guide".
+ELIDED = re.compile(r"['‘’ʼ`]+")
+UNSPOKEN = re.compile(r"[^a-z0-9]+")
+SPACE = " "
+NOTHING = ""
+
+# What holds the words of a title apart in the pattern built from it. Whitespace
+# rather than a literal space, so the pattern reads the same as the rest of them.
+WORD_SEPARATOR = r"\s+"
 
 
 @dataclass(frozen=True)
@@ -137,6 +287,126 @@ class RecentQuotes:
         self._fired[trigger] = time.monotonic() if now is None else now
 
 
+@dataclass(frozen=True)
+class Answer:
+    """
+    One utterance that named the title, and what it has coming.
+
+    The wording is the setting it will be read from, settled inside the round
+    rather than worked out afterwards: whether an answer was second by half a
+    second, or came from whoever set the line off, is known to the round and to
+    nothing else.
+    """
+
+    movie: str
+    wording: str
+
+    @property
+    def penalized(self) -> bool:
+        """Whether this is somebody naming their own line rather than winning it."""
+        return self.wording == SELF_ANSWER_ANNOUNCEMENT_KEY
+
+
+class Round:
+    """
+    One line put to the channel as a question, and who has answered it.
+
+    Opened when the quote has finished playing rather than when the trigger was
+    heard. The window is for the channel to answer in, and until the line has
+    been said there is nothing to answer: transcription and synthesis take as
+    long as they take, and a window that started at the trigger could be over
+    before anybody had heard the question.
+
+    The first correct answer takes the round. A second inside `tie` is paid as
+    well, because two people arriving at the same title half a second apart both
+    knew it, and which of them the transcriber happened to return first is not a
+    fact about who was faster. Anything after that has been beaten to it.
+
+    `asker` is whoever set the line off, and is barred from answering. They have
+    the trigger and the title in front of them and had to recall neither, so a
+    round they could win is one anybody can farm by reading the quote file out
+    loud. They are not merely ignored — an attempt costs them, and is said so out
+    loud — because a rule nobody is told about is one everybody keeps testing.
+    `ANYBODY` leaves the round open to them, for a server that would rather not
+    police it.
+
+    Nobody is paid, or charged, twice for the same title, however many times they
+    say it.
+    """
+
+    def __init__(
+        self,
+        movie: str,
+        window: float,
+        tie: float,
+        asker: int | None = ANYBODY,
+        opened: float | None = None,
+    ) -> None:
+        self._movie = movie
+        self._naming = _naming(movie)
+        self._window = window
+        self._tie = tie
+        self._asker = asker
+        self._opened = time.monotonic() if opened is None else opened
+        self._claimed: float | None = None
+        self._settled: set[int] = set()
+
+    @property
+    def movie(self) -> str:
+        """The title being asked about, for whoever has to read the log."""
+        return self._movie
+
+    def expired(self, now: float | None = None) -> bool:
+        """Whether the window has passed, so nothing said now can earn anything."""
+        moment = time.monotonic() if now is None else now
+
+        # Monotonic rather than wall clock, so a clock correction cannot park a
+        # round in the future and leave it open until the clock arrives.
+        return moment - self._opened > self._window
+
+    def answered_by(self, utterance: Utterance, now: float | None = None) -> Answer | None:
+        """
+        What an utterance has coming for naming the title in time, or None.
+
+        The claim is recorded on the way past, so the tie window is measured
+        from the answer that arrived first rather than from the moment the
+        question was asked, and whoever comes in behind it is told they tied
+        rather than having to work it out from a round that has moved on.
+
+        Whoever set the line off is settled before any of that. They cannot
+        claim the round and cannot start the tie window, so an attempt of theirs
+        neither wins anything nor spoils it for the channel — it costs them, and
+        the round goes on being open to everybody else.
+        """
+        if not self._naming.search(_normalized(utterance.text)):
+            return None
+
+        moment = time.monotonic() if now is None else now
+        if self.expired(moment):
+            return None
+
+        if utterance.user_id in self._settled:
+            return None
+
+        if utterance.user_id == self._asker:
+            self._settled.add(utterance.user_id)
+
+            return Answer(movie=self._movie, wording=SELF_ANSWER_ANNOUNCEMENT_KEY)
+
+        tied = self._claimed is not None
+        if not tied:
+            self._claimed = moment
+        elif moment - self._claimed > self._tie:
+            return None
+
+        self._settled.add(utterance.user_id)
+
+        return Answer(
+            movie=self._movie,
+            wording=TIE_ANNOUNCEMENT_KEY if tied else ANNOUNCEMENT_KEY,
+        )
+
+
 class Quotes(Tool):
     """Answers a trigger phrase with the film line it belongs to."""
 
@@ -145,10 +415,31 @@ class Quotes(Tool):
     def __init__(self, context: ToolContext) -> None:
         super().__init__(context)
 
+        config = self.config
         self._quotes = _load(quotes_cfg.file)
         self._triggers = _pattern(self._quotes)
         self._speech = shared_cache()
         self._recent = RecentQuotes()
+        self._window = _seconds(
+            ANSWER_SECONDS_KEY, config.get(ANSWER_SECONDS_KEY), DEFAULT_ANSWER_SECONDS
+        )
+        self._tie = _seconds(
+            TIE_SECONDS_KEY, config.get(TIE_SECONDS_KEY), DEFAULT_TIE_SECONDS
+        )
+        self._announcements = {
+            key: _checked(key, config.get(key) or default)
+            for key, default in DEFAULT_ANNOUNCEMENTS.items()
+        }
+        self._remarks = _remarks(config.get(REMARKS_KEY))
+        self._policing = bool(
+            config.get(PENALIZE_SELF_ANSWERS_KEY, PENALIZE_SELF_ANSWERS)
+        )
+        self._penalty = _credits(
+            SELF_ANSWER_PENALTY_KEY,
+            config.get(SELF_ANSWER_PENALTY_KEY),
+            DEFAULT_SELF_ANSWER_PENALTY,
+        )
+        self._rounds: dict[str, Round] = {}
 
         logger.debug(
             "[%s] Listening for %d triggers: %s",
@@ -170,27 +461,52 @@ class Quotes(Tool):
         once per name on the roster. Somebody the server has not written down
         waits for the synthesizer the first time, and nobody waits again.
 
+        What a round says is knowable in the same way, and on the same terms:
+        every wording the server can hear, for every name on the roster, against
+        every remark it can end with. What a round pays and what it costs are
+        both fixed, and the endings are a list rather than something composed on
+        the spot. Which one comes up is decided when somebody answers; that all
+        of them are already rendered is decided here.
+
         Serial, and unhurried. Nothing is waiting on this, and a synthesizer
         asked for fifty phrases at once is one not answering whoever is speaking
         right now.
         """
-        names = sorted(set(self.users.values()))
-        rendered = 0
-        wanted = 0
+        if self._asking() and self._scoreboard() is None:
+            # The first moment at which every tool on the server exists, so the
+            # first at which the absence of one means anything.
+            logger.warning(
+                "[%s] No scoreboard is enabled, so naming a title will earn nothing. "
+                "Enable the 'scoreboard' tool to pay for it, or set '%s' to 0 to stop "
+                "asking.",
+                self.server,
+                ANSWER_SECONDS_KEY,
+            )
 
-        for quote in self._quotes.values():
-            for wording in self._wordings(quote, names):
-                wanted += 1
-                if await self._speech.warm(wording):
-                    rendered += 1
+        names = sorted(set(self.users.values()))
+        wordings = [
+            wording
+            for quote in self._quotes.values()
+            for wording in self._wordings(quote, names)
+        ]
+
+        if self._asking():
+            wordings += [saying for name in names for saying in self._sayings(name)]
+
+        rendered = 0
+        for wording in wordings:
+            if await self._speech.warm(wording):
+                rendered += 1
 
         logger.info(
-            "[%s] Pre-warmed %d quotes for %d speaker(s): %d rendered, %d already cached.",
+            "[%s] Pre-warmed %d phrase(s) for %d quote(s) and %d speaker(s): "
+            "%d rendered, %d already cached.",
             self.server,
+            len(wordings),
             len(self._quotes),
             len(names),
             rendered,
-            wanted - rendered,
+            len(wordings) - rendered,
         )
 
     @staticmethod
@@ -221,7 +537,15 @@ class Quotes(Tool):
         The firing is recorded before the line is played rather than after,
         because playing it waits for the channel: a phrase said twice while the
         first answer is still going out should still only be answered once.
+
+        An utterance that answers an open round is an answer and nothing else,
+        whatever trigger it also happens to contain. Otherwise a channel naming
+        a title could set off the line that asks about the next one, which is a
+        loop the tool would be driving rather than following.
         """
+        if await self._settled(utterance, session):
+            return
+
         quote = self._match(utterance.text)
         if quote is None:
             return
@@ -239,6 +563,189 @@ class Quotes(Tool):
         )
 
         await self.speaker.play(session.source, self._speech.stream(wording))
+        self._ask(quote, utterance.user_id)
+
+    # ── the round ─────────────────────────────────
+
+    def _asking(self) -> bool:
+        """Whether a line said here is also a question worth answering."""
+        return self._window > NEVER
+
+    def _ask(self, quote: Quote, asker: int) -> None:
+        """
+        Give the channel its window to name the title the line came from.
+
+        A row that names no title asks nothing: there is no question in it, and
+        the round would be one nobody could answer. Two lines said within a few
+        seconds of each other are two rounds rather than one replacing the
+        other — an answer names its own title, so neither question is made
+        ambiguous by the other being open.
+
+        Whoever set the line off is barred from their own round unless the
+        server has said not to police it, in which case the round is told
+        `ANYBODY` and they are an answerer like anybody else.
+        """
+        if not self._asking() or not _normalized(quote.movie):
+            return
+
+        self._rounds[quote.movie] = Round(
+            quote.movie,
+            self._window,
+            self._tie,
+            asker if self._policing else ANYBODY,
+        )
+
+    async def _settled(self, utterance: Utterance, session: TranscriptSession) -> bool:
+        """
+        Settle up with whoever named a title, saying whether that is what this was.
+
+        Announced with no chime in front of it. A fine opens with one because it
+        interrupts a conversation that was about something else; this answers a
+        question the channel is already sitting in, and a flourish ahead of it
+        would be announcing what everybody is waiting for.
+
+        Nothing here is dropped for arriving while something else is playing,
+        which is what a fine does. A fine interrupts a conversation that was
+        about something else, so a backlog of them is a channel being read
+        things it has moved on from; everything this tool says is an answer to
+        something it just said itself, and a round that pays somebody without
+        saying so reads as having missed them. The speaker holds one turn per
+        server, so a second announcement waits for the first and the two come
+        out in the order they were earned.
+        """
+        answer = self._answered(utterance)
+        if answer is None:
+            return False
+
+        credits = self._stake(answer.wording)
+        standing = self._settle(utterance.user_id, utterance.user, answer)
+
+        logger.info(
+            "%s [%s] %s named %s; %s %s (%s).",
+            "🚫" if answer.penalized else "🏆",
+            self.server,
+            utterance.user,
+            answer.movie,
+            "docking them" if answer.penalized else "awarding them",
+            _denominated(credits),
+            standing,
+        )
+
+        await self.speaker.play(
+            session.source,
+            self._speech.stream(self._wording(utterance.user, answer.wording)),
+        )
+
+        return True
+
+    def _wording(
+        self, user: str, key: str = ANNOUNCEMENT_KEY, remark: str | None = None
+    ) -> str:
+        """
+        One announcement as it will be said, for one person.
+
+        The remark is drawn afresh unless one is named, which is what the
+        pre-warm does to walk every ending rather than gambling on which one
+        comes up. The two render through here for exactly that reason: they must
+        agree down to the character, and a phrase that differs by a space is one
+        that was synthesized at startup and then synthesized again on the way to
+        being played.
+        """
+        return self._announcements[key].format(
+            **{
+                USER_FIELD: user,
+                CREDITS_FIELD: _denominated(self._stake(key)),
+                REMARK_FIELD: _chosen(self._remarks) if remark is None else remark,
+            }
+        )
+
+    def _stake(self, key: str) -> int:
+        """What one wording is denominated in: what a round pays, or what it costs."""
+        return (
+            self._penalty if key == SELF_ANSWER_ANNOUNCEMENT_KEY else SINGLE_CREDIT
+        )
+
+    def _sayings(self, name: str) -> tuple[str, ...]:
+        """
+        Every way an announcement can come out for one person.
+
+        Each wording the server can hear, and for whichever of them ends in a
+        remark, one phrase per ending it can take. A template carrying no remark
+        is one phrase however many the server has written.
+        """
+        return tuple(
+            self._wording(name, key, remark)
+            for key in self._sayable()
+            for remark in self._endings(key)
+        )
+
+    def _sayable(self) -> tuple[str, ...]:
+        """
+        Which wordings this server can actually hear.
+
+        A server that is not policing its rounds never says the third, and
+        rendering it at startup would be paying a synthesizer for a phrase
+        nothing can reach.
+        """
+        if self._policing:
+            return tuple(DEFAULT_ANNOUNCEMENTS)
+
+        return tuple(
+            key for key in DEFAULT_ANNOUNCEMENTS if key != SELF_ANSWER_ANNOUNCEMENT_KEY
+        )
+
+    def _endings(self, key: str) -> tuple[str, ...]:
+        """The remarks one wording can take, or a single blank where it takes none."""
+        if REMARK_PLACEHOLDER in self._announcements[key]:
+            return self._remarks
+
+        return (NOTHING,)
+
+    def _answered(self, utterance: Utterance) -> Answer | None:
+        """
+        What an utterance has coming from whichever round it answered, or None.
+
+        Rounds that have run out are dropped on the way past rather than swept:
+        nothing else reads this, and there are only ever as many of them as the
+        channel has been quoted at in the last few seconds.
+        """
+        for movie, round_ in list(self._rounds.items()):
+            if round_.expired():
+                del self._rounds[movie]
+                continue
+
+            answer = round_.answered_by(utterance)
+            if answer is not None:
+                return answer
+
+        return None
+
+    def _scoreboard(self) -> Scoreboard | None:
+        """
+        The server's board, if it keeps one.
+
+        Looked for on the way past rather than held, because a tool's neighbours
+        are only all built once every one of them is; see `Toolbox`.
+        """
+        return self.tools.find(Scoreboard)
+
+    def _settle(self, user_id: int, user: str, answer: Answer) -> str:
+        """
+        Move the balance of whoever named the title, as the log would put it.
+
+        A server with no scoreboard asks the question, says the same things, and
+        moves nothing, which is a whole working configuration rather than a
+        failure: saying the line is this tool's job, and keeping score is
+        somebody else's.
+        """
+        board = self._scoreboard()
+        if board is None:
+            return UNCOUNTED
+
+        if answer.penalized:
+            return f"balance {board.debit(user_id, user, self._penalty)}"
+
+        return f"balance {board.credit(user_id, user, SINGLE_CREDIT)}"
 
     def _match(self, text: str) -> Quote | None:
         """
@@ -266,6 +773,164 @@ class Quotes(Tool):
             )
 
         return None
+
+
+def _seconds(key: str, value: Any, default: float) -> float:
+    """
+    A window from the server's settings, or the default it did not set.
+
+    Raised on rather than defaulted past: a server that wrote a window down
+    meant something by it, and quietly ignoring a typo would leave a channel
+    wondering why naming a title pays nothing.
+    """
+    if value is None:
+        return default
+
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"'{key}' must be a number of seconds, not {value!r}: {exc}"
+        ) from exc
+
+
+def _credits(key: str, value: Any, default: int) -> int:
+    """
+    A number of credits from the server's settings, or the default it did not set.
+
+    Floored at nothing, since a penalty below zero is a reward and a server that
+    wants one of those has a flag for turning the rule off instead.
+    """
+    if value is None:
+        return default
+
+    try:
+        return max(NO_CREDITS, int(value))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"'{key}' must be a whole number of credits, not {value!r}: {exc}"
+        ) from exc
+
+
+def _denominated(credits: int) -> str:
+    """
+    A number of credits as it will be said out loud, won or lost.
+
+    What a credit is called is `CREDIT_CURRENCY`, and the plural is grown from
+    it rather than configured beside it, so a deployment counting in something
+    other than credits cannot end up awarding people "2 credit". The count stays
+    a numeral, which every synthesizer worth pointing this at reads as a number;
+    the noun does not get the same treatment — "1 credits" is wrong in a way a
+    listener hears.
+    """
+    currency = scoreboard_cfg.currency
+    noun = currency if credits == SINGLE_CREDIT else plural(currency)
+
+    return f"{credits} {noun}"
+
+
+def _checked(key: str, announcement: str) -> str:
+    """
+    An announcement template that will interpolate.
+
+    Checked at construction because the alternative is discovering a stray brace
+    at the moment somebody wins, by which point there is a credit paid and
+    nothing to say about it. The key is carried in so a server told which
+    setting is wrong does not have to work out which of them it was.
+    """
+    announcement = str(announcement)
+
+    try:
+        announcement.format(
+            **{
+                USER_FIELD: PROBE_NAME,
+                CREDITS_FIELD: _denominated(SINGLE_CREDIT),
+                REMARK_FIELD: DEFAULT_REMARKS[0],
+            }
+        )
+    except (IndexError, KeyError, ValueError) as exc:
+        available = FIELD_SEPARATOR.join(
+            f"'{{{field}}}'" for field in (USER_FIELD, CREDITS_FIELD, REMARK_FIELD)
+        )
+        raise ValueError(
+            f"'{key}' has a placeholder nothing fills: {exc}. "
+            f"Only {available} are available."
+        ) from exc
+
+    return announcement
+
+
+def _remarks(extra: Any) -> tuple[str, ...]:
+    """
+    Everything an announcement can end with: what the tool carries, and whatever
+    the server has added to it.
+
+    Added rather than replaced. A server writing a line of its own wants that
+    line as well, and a list that replaced the defaults would make saying one
+    extra thing cost writing out all of them — which is how a list ends up with
+    six of the seven and nobody remembering why.
+    """
+    if extra is None:
+        return DEFAULT_REMARKS
+
+    if isinstance(extra, str):
+        extra = [extra]
+
+    if not isinstance(extra, Sequence):
+        raise ValueError(f"'{REMARKS_KEY}' must be a list of things to say.")
+
+    added = tuple(
+        str(remark).strip() for remark in extra if str(remark).strip()
+    )
+
+    return DEFAULT_REMARKS + added
+
+
+def _chosen(remarks: Sequence[str]) -> str:
+    """
+    One ending, at random.
+
+    Its own function so a test can settle what comes up without seeding the
+    process-wide generator out from under whatever else is using it.
+    """
+    return random.choice(remarks)
+
+
+def _normalized(text: str) -> str:
+    """
+    Text as it is matched: letters and digits, lowercase, single-spaced.
+
+    Punctuation is dropped rather than escaped, which is what makes "What's
+    Firefly?" and "what is firefly" the same answer, and what lets a title be
+    written with the apostrophes and colons it deserves.
+    """
+    return UNSPOKEN.sub(SPACE, ELIDED.sub(NOTHING, text.casefold())).strip()
+
+
+def _naming(movie: str) -> re.Pattern[str]:
+    """
+    An expression matching an utterance that names one title as a question.
+
+    Matched against normalized text, so the pattern is spared having to allow
+    for punctuation an ASR transcript may or may not have supplied. A leading
+    article is optional on both sides, and the answer may be anywhere in the
+    sentence: somebody who has it has said so whether or not they said
+    anything else in the same breath.
+
+    Built a word at a time rather than escaped whole, because a few of them are
+    written one way and said another; see `SAID_ALIKE`.
+    """
+    title = LEADING_ARTICLE.sub(NOTHING, _normalized(movie))
+    spoken = WORD_SEPARATOR.join(_spoken(word) for word in title.split())
+
+    return re.compile(
+        rf"{WORD_BOUNDARY}{QUESTION}\s+(?:{ARTICLE}\s+)?{spoken}{WORD_BOUNDARY}"
+    )
+
+
+def _spoken(word: str) -> str:
+    """One word of a title, as any of the ways a channel might say it."""
+    return SAID_ALIKE.get(word, re.escape(word))
 
 
 def _load(path: Path) -> Mapping[str, Quote]:
