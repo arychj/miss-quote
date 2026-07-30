@@ -449,6 +449,12 @@ class VerbalMorality(Tool):
         """
         The chime and then the words, as one clip rather than two.
 
+        Samples rather than the packets the cache holds, and unavoidably: the
+        chime is a hand-placed WAV, a fine is usually being played quieter than
+        full volume, and both of those want audio that can be added to and
+        multiplied. The decode that costs is a few milliseconds on a clip that
+        is about to be spoken over a channel.
+
         Two calls to the speaker would play in order — it holds one lock per
         server — but each arms the player afresh, and the gap between them is
         audible. Chaining them puts the chime in front of the same stream.
@@ -460,7 +466,7 @@ class VerbalMorality(Tool):
         Waiting first spends that time before anything is playing.
         """
         chime = await self._speech.clip(self._chime) if self._chime else NO_AUDIO
-        words = self._speech.stream(announcement)
+        words = self._speech.stream(announcement).pcm()
         lead = await _lead(words, tts_cfg.lead_bytes)
 
         if chime:

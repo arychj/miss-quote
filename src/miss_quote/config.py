@@ -238,15 +238,12 @@ class TTSConfig:
     # the first chunk, as a synthesizer that streams as it renders wants.
     lead_ms: float = field(default_factory=lambda: _env_float("TTS_LEAD_MS", 500.0))
 
-    # Rendered speech, kept so a phrase is only ever synthesized once. An
-    # unwritable or unset directory costs the persistence, not the feature.
+    # Rendered speech, kept so a phrase is only ever synthesized once. The only
+    # place it is kept: an unwritable or unset directory means every phrase is
+    # synthesized again every time it is said.
     cache_directory: Path = field(
         default_factory=lambda: Path(_env_str("TTS_CACHE_DIR", "/cache/tts"))
     )
-
-    # Clips held in memory. The bound exists because what gets synthesized can
-    # include a speaker's Discord display name, and those are not a closed set.
-    cache_entries: int = field(default_factory=lambda: _env_int("TTS_CACHE_ENTRIES", 256))
 
     # How long a rendered clip survives on disk without being played. Aged by
     # mtime, which the cache refreshes on every hit, so a phrase still in use
@@ -255,10 +252,6 @@ class TTSConfig:
     cache_retention_days: int = field(
         default_factory=lambda: _env_int("TTS_CACHE_RETENTION_DAYS", 90)
     )
-
-    @property
-    def caching_enabled(self) -> bool:
-        return self.cache_entries >= 1
 
     @property
     def lead_bytes(self) -> int:

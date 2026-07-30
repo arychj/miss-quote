@@ -46,9 +46,9 @@ graph TD
     J -->|"handle_utterance"| L["Tools for this server"]
     K -.->|"handle_finished, on disconnect"| L
 
-    L -.->|"speaker.play"| M["Speech cache<br/><i>memory, then TTS_CACHE_DIR</i>"]
+    L -.->|"speaker.play"| M["Speech cache<br/><i>Ogg Opus in TTS_CACHE_DIR</i>"]
     M -.->|"on a miss"| N["Wyoming TTS<br/><i>TTS_HOST:TTS_PORT</i>"]
-    M -.->|"48 kHz stereo PCM, streamed"| A
+    M -.->|"Opus packets, sent unencoded"| A
 ```
 
 The dotted half is optional and only exists for tools that answer out loud; a deployment with none never opens a TTS connection.
@@ -152,6 +152,16 @@ On startup the bot reconciles the file against the servers it is actually in, an
 
 `tools` elects the server into the tools listed under it — see below. Each is opted into on its own, including the ones others depend on: `verbal-morality` hands its fines to `scoreboard`, and a server that enables the first and not the second gets the announcements without the tally.
 
+**A tool block holds `enabled` and `config`, and nothing else.** Every setting a tool takes goes under `config:`; written a level up, beside `enabled`, it is read by nothing. That is the one misconfiguration with no symptom — the tool starts, the log says it is enabled, and it runs on its defaults against a file that plainly asks for something else — so anything else in a tool block is named at startup alongside the other parsing problems:
+
+```yaml
+      quotes:
+        enabled: true
+        penalize_self_answers: false   # ← wrong: reported at startup, read by nothing
+        config:
+          penalize_self_answers: false # ← right
+```
+
 ---
 
 ## Tools
@@ -239,7 +249,32 @@ Project Hail Mary,question,{user} question is dumb.
 
 **One trigger per row, and a line may be reached by more than one of them.** Two rows sharing an answer is how the file says that two phrases deserve the same reply — `awesome` and `cool` both earn `Shiny.`. There is no alternation syntax inside a trigger: a trigger is matched as written, so a row meaning to catch two phrases has to be two rows.
 
-Rows are read at startup and the file **reports rather than raises**. A row with no trigger or no line, or a line carrying a placeholder nothing fills, is logged with its line number and dropped — one typo in fifty rows should cost that row. A trigger a later row repeats is dropped the same way, with the first answer kept. What *does* stop the tool from starting is a file that is missing, unreadable, has no `movie,trigger,quote` header, or holds no usable row at all: listening for nothing is enabled and useless, which is worth a line at startup instead of silence forever.
+**A trigger may also appear on more than one row, and one of its answers is drawn at random each time it fires.** That is how a phrase worth answering several ways says so: the file lists the answers and the channel gets one of them. The draw happens when the trigger fires rather than at startup, so a restart is not what decides which line a channel hears for the next week. Case is not what tells two triggers apart — the trigger is folded before it is keyed, so `Cool` and `cool` are two answers to one trigger. Every answer is rendered at startup, since which one comes up is not knowable before somebody speaks. The backoff is unchanged and still keyed on the trigger, so a trigger with four answers still fires once per window, not four times.
+
+Rows are read at startup and the file **reports rather than raises**. A row with no trigger or no line, a line carrying a placeholder nothing fills, or a row with more fields than columns — an unquoted comma in a line — is logged with its line number and dropped. One typo in fifty rows should cost that row. What *does* stop the tool from starting is a file that is missing, unreadable, has no `movie,trigger,quote` header, or holds no usable row at all: listening for nothing is enabled and useless, which is worth a line at startup instead of silence forever.
+
+The unquoted comma is dropped rather than kept because what survives it is the line **cut at the comma** — `Boy` for `Boy, that escalated quickly.` — and a film line delivered with its second half missing is worse out loud than not being said. It is the only mistake in the file that otherwise loads cleanly, since the reader files the rest of the sentence under an overflow column nothing reads.
+
+**A dropped row is a line in a log nobody reads**, which is why the file is also checked before it can be merged. `scripts/validate_quotes.py` applies the loader's rules where a broken row fails a pull request instead, plus the ones the loader has no opinion about:
+
+| Checked | Why |
+|---|---|
+| Exactly three fields per row | An unquoted comma in a line is the one mistake that loads cleanly and truncates the quote — `Boy, that escalated quickly.` becomes `Boy` |
+| Every column populated, and unpadded | The loader strips surrounding whitespace, so the file and what it produces disagree quietly |
+| `trigger` ≤ 30 characters, `quote` ≤ 150 | A trigger has to be said in passing and a line has to land before the channel moves on |
+| A trigger that could actually fire | No placeholders, no repeated whitespace, at least one letter or digit. Each compiles into the pattern happily and then matches nothing |
+| `{user}` is the only placeholder | Anything else drops the row at startup, so the symptom is a line that is never said |
+| No trigger answering twice with the same line | A repeated trigger is deliberate; a repeated *answer* is a row pasted and half-edited, and only weights the draw |
+| `movie` non-decreasing, LF endings, trailing newline | So the file stays reviewable and two branches adding a row do not collide |
+
+It is standard library only and imports nothing from `miss_quote`, so it runs on a bare checkout:
+
+```bash
+python scripts/validate_quotes.py                      # the shipped file
+python scripts/validate_quotes.py /path/to/yours.csv   # one you mount over it
+```
+
+The `Validate Quotes` workflow runs it on every push and pull request that touches the file, and takes a path as a `workflow_dispatch` input for checking a list that lives outside this repository.
 
 Matching is **whole words, case-insensitive**, so `real` does not fire inside `really`. Several triggers are phrases rather than words, and a phrase matches on a single space between its words, which is what an ASR transcript holds.
 
@@ -249,7 +284,7 @@ Matching is **whole words, case-insensitive**, so `real` does not fire inside `r
 
 `{user}` is filled with the name the transcript uses — the roster name from `users` where a server has set one, the Discord display name otherwise — so nothing has to be configured twice.
 
-**The whole list is rendered at startup.** Unlike a fine, a quote is knowable in full before anybody speaks: the triggers are a closed set and so are the answers, so on the way up the tool synthesizes every line in the file and leaves the results in the speech cache. A callback that arrives four seconds after the line it answers is not a callback. The exception is a line naming whoever set it off, which is rendered once per name on the roster; somebody the server has not written down waits for the synthesizer the first time, and nobody waits again. Warming happens in the background, one phrase at a time, and anything already cached is left alone.
+**The whole list is rendered at startup.** Unlike a fine, a quote is knowable in full before anybody speaks: the triggers are a closed set and so are the answers — every answer of every trigger, including the ones a trigger shares with another row — so on the way up the tool synthesizes every line in the file and leaves the results in the speech cache. A callback that arrives four seconds after the line it answers is not a callback. The exception is a line naming whoever set it off, which is rendered once per name on the roster; somebody the server has not written down waits for the synthesizer the first time, and nobody waits again. Warming happens in the background, one phrase at a time, and anything already cached is left alone.
 
 #### Naming it
 
@@ -383,7 +418,9 @@ The name is the one the transcript uses — the roster name from `users` where a
 
 **`words` are stems.** Each is expanded once at startup into the endings it is said with — a plural, a past tense, a gerund with and without its `g`, someone who does it, something that is like it, and the three that make it a noun again — so `fiddlestick` also catches `fiddlesticks`, `fiddlesticked`, `fiddlesticking`, `fiddlestickin`, `fiddlesticker`, `fiddlestickers`, `fiddlesticky`, `fiddlestickity`, `fiddlestickery`, and `fiddlestickiness`. A list that has to spell out every ending is a list somebody gets around a week after writing it.
 
-Expansion is English spelling rather than a dictionary: a final consonant doubles after a short vowel (`shit` grows a `shitter`, not a `shiter`), a silent `e` drops before a vowel, a sibilant takes `es`, and a `y` after a consonant becomes an `i` — except before an ending that already starts with one, where it goes without being replaced, so it is `shittiness` and not `shittyiness`. The `-ity`, `-ery`, and `-iness` endings are there because the words they reach are ones people say: `fuckery`, `buggery`, `shittiness`. Nothing checks whether the result is a word anybody says, and it does not need to — a form nobody utters costs a few bytes in an alternation, while a missing one costs the tool the thing it exists to catch. Note that expansion can reach a word that is innocent on its own; a stem whose endings collide with ordinary speech is worth checking before it goes in the list.
+Expansion is English spelling rather than a dictionary: a final consonant doubles after a short vowel (`shit` grows a `shitter`, not a `shiter`), a silent `e` drops before a vowel, a sibilant takes `es`, and a `y` after a consonant becomes an `i` — except before an ending that already starts with one, where it goes without being replaced, so it is `shittiness` and not `shittyiness`.
+
+Doubling really turns on where the **stress** falls, and nothing here knows that, so the syllable count stands in for it — right for the single-syllable words this is mostly pointed at, and wrong for a **compound**, which keeps the stress of the word it ends with. `dipshit` is two syllables and still takes `dipshitting`. Nothing structural separates that from `bugger`, which splits the same way and must stay `buggering`, so the words that carry their doubling into a compound are named in `COMPOUND_ENDINGS` in `utils/stems.py`. If a list grows a compound that conjugates wrong, that is the one line to add to. The `-ity`, `-ery`, and `-iness` endings are there because the words they reach are ones people say: `fuckery`, `buggery`, `shittiness`. Nothing checks whether the result is a word anybody says, and it does not need to — a form nobody utters costs a few bytes in an alternation, while a missing one costs the tool the thing it exists to catch. Note that expansion can reach a word that is innocent on its own; a stem whose endings collide with ordinary speech is worth checking before it goes in the list.
 
 Matching is **whole words, case-insensitive**. A substring match fines the innocent, and the canonical example, Scunthorpe, is a place people live.
 
@@ -409,28 +446,37 @@ Tools answer out loud through a `Speaker`, which the bot implements against the 
 
 Synthesis is a second Wyoming server (`TTS_HOST`, `TTS_PORT`) — recognition and synthesis are both Wyoming, but they are two servers and only one of them wants a GPU. The voice is process-wide: a bot that answers in two voices is a bot nobody can tell is one bot.
 
-**Audio streams.** The client yields chunks as the synthesizer produces them, and playback starts on the first one rather than waiting for the last. Discord's player is a thread that asks for exactly one 20 ms frame at a time and treats anything short of one as the end of the clip, so `bot/speaker.py` buffers between the two: filled from the event loop, drained a frame at a time, with the tail padded to a whole frame so the last few milliseconds of a word survive. A synthesizer that stalls mid-clip costs the rest of that clip after `TTS_STALL_SECONDS`, not a thread and a voice connection.
+**Audio streams.** The client yields chunks as the synthesizer produces them, and playback starts on the first one rather than waiting for the last — resampling and encoding both happen as the audio arrives, so a cache miss plays while it is still being rendered. Discord's player is a thread that asks for exactly one 20 ms frame at a time and treats anything short of one as the end of the clip, so `bot/speaker.py` buffers between the two: filled from the event loop, drained a frame at a time, with the tail padded to a whole frame so the last few milliseconds of a word survive. A synthesizer that stalls mid-clip costs the rest of that clip after `TTS_STALL_SECONDS`, not a thread and a voice connection.
 
 **A clip waits for a head start** (`TTS_LEAD_MS`, 500 ms by default) before the first byte of it is handed to the player. Streaming is the contract, not a promise: a synthesizer is free to render a phrase whole before sending any of it, which makes the first chunk the slow one and every chunk after it instant. That is invisible for a clip that is only speech, and audible for one that opens with a chime — the flourish plays, and then the channel sits silent until the sentence it introduced arrives. Waiting for this much speech first moves the wait to before the chime, where nobody is listening yet. A phrase that ends inside the head start is not padded out to it, and `0` starts on the first chunk, which is what a synthesizer that streams as it renders wants.
 
 **Loudness is a deployment setting** (`PLAYBACK_VOLUME`, `1.0` by default), because how loud a synthesizer renders a sentence has nothing to do with how loud a channel wants to be interrupted. It scales every sample on its way to the player, so a chime is turned down with the words behind it, and it is applied at playback rather than folded into a rendered clip — changing it does not invalidate a cache full of phrases. Above `1.0` the result is clipped at full scale rather than allowed to wrap, since int16 wraps to the opposite extreme and that is a crack in the middle of a word rather than more of the same.
 
-**No ffmpeg.** It is the usual way to play audio through discord.py, but only because it is the usual way to decode a file first. Synthesized speech is already raw PCM, so `soxr` converts it to the 48 kHz stereo Discord wants and the Opus encoder already present for receiving handles the rest.
+It is also the one thing that decides how a clip goes out. At `1.0` there is nothing to do to the audio, so cached clips are sent exactly as stored; anything lower means every clip is decoded and re-encoded on its way past. **Lowering `PLAYBACK_VOLUME` therefore has a CPU cost as well as a loudness one** — turn a channel down at the Discord end where you can.
 
-**Clips are cached**, so a phrase is only ever synthesized once, in two layers holding the form that suits each:
+**No ffmpeg.** It is the usual way to play audio through discord.py, but only because it is the usual way to decode a file first. Synthesized speech is already raw PCM, so `soxr` converts it to the 48 kHz stereo Discord wants and the libopus already present for receiving handles the rest.
 
-| Layer | Holds | Why |
-|---|---|---|
-| Memory | Playback-ready 48 kHz stereo PCM | A hit costs a dictionary lookup |
-| Disk (`TTS_CACHE_DIR`) | The synthesizer's own mono WAV | A quarter the size, and playable, so you can hear what the bot actually said |
+**Clips are cached as what Discord is sent**, so a phrase is only ever synthesized once — and, at full volume, never processed again either. One layer: Opus packets, one per 20 ms, in an Ogg container under `TTS_CACHE_DIR`. About a tenth the size of the samples they came from, and playable, so you can hear what the bot actually said.
 
-The first hit after a restart pays one resample and nothing else. Mount a volume at `TTS_CACHE_DIR` to keep clips across restarts; an unwritable or absent directory costs the persistence, not the feature. Writes go through a temporary file and a rename, because a process killed mid-write would otherwise cache a truncated clip forever, and a clip is only stored once the synthesizer says it is whole — a failure partway through plays what arrived and stores nothing.
+Storing what Discord wants rather than what the synthesizer produced is what makes a cached phrase free to play. `AudioSource.is_opus` tells discord.py the frames are ready to send, so it builds no encoder at all: **no resample, no encode, no decode, nothing per play**. Previously every play of every cached phrase re-encoded the whole clip — about 37 ms of CPU for three seconds of audio, on the player thread, every single time.
 
-The memory layer is bounded (`TTS_CACHE_ENTRIES`) because what gets synthesized can include a Discord display name, and those are not a closed set. What goes when it is full is the **least recently used** clip, not the oldest: entries do not arrive one at a time, since a whole roster is rendered at startup in no order that means anything, and evicting by arrival would retire whoever happened to be warmed first however much they talk. That puts the memory layer on the same footing as the disk layer, which ages by use for the same reason.
+The cost is that **the stored bitrate is the delivered bitrate**. Clips are encoded at 32 kbps in Opus's VoIP mode rather than the 128 kbps discord.py defaults to, which is where the tenfold saving comes from. That mode is built for exactly this content — one synthesized voice — and it is not a setting, because changing it would silently mean two bitrates in one directory.
 
-**A phrase can be rendered before it is needed.** A tool that can work out at startup what it will have to say later warms the cache with it from `prewarm`, and a phrase already in either layer costs nothing to warm. A warmed clip is deliberately **not** treated as a played one: a phrase already held is left exactly as found, neither touched on disk nor moved to the back of the memory queue, so what nobody ever earns ages out of both layers like anything else nobody plays. With no memory layer and no usable directory there is nowhere to put the result, and warming does nothing rather than paying a synthesizer for audio nobody will ever be served.
+A clip that has to be **changed** on the way out is decoded first, since a gain is a multiplication and there is nothing to multiply in an encoded packet. That is any clip below full volume — every `verbal-morality` fine past the first, and every clip in a deployment that lowered `PLAYBACK_VOLUME` — and it costs about 8 ms of decode per three seconds of audio, on top of the encode that was always there. `quotes` plays at full volume and takes the free path.
 
-**The disk layer is reaped at startup** (`TTS_CACHE_RETENTION_DAYS`, 90 by default). The directory otherwise only grows: a display name goes into the key, so everyone who has ever been announced leaves a file behind, and none of them is ever asked for again once they leave the server. Age is the **mtime**, not the filename, and every hit touches the file — including one served out of memory, which never opens it — so what is still in use stays however old it is and only what nothing plays ages out. A reaped phrase costs one synthesis the next time it is said.
+That decode does **not** delay the clip and does **not** hold the event loop. It streams, in batches of a tenth of a second handed to a thread: packets are decoded as they arrive rather than collected first, so the first frame lands about half a millisecond behind where it would at full volume — 0.89 ms against 1.34 ms on a three-second clip already on disk, where one Discord frame is 20 ms.
+
+The batch size is doing real work. Decoding each packet where it arrived put the whole clip's decode on the loop as a single **11.7 ms stall**, which is a third of the 32 ms in which every speaker's next VAD frame is due; a hop per packet would cost more in scheduling than the decode; and one hop for the whole clip would put all of it in front of the first frame. At a tenth of a second the worst stall measured is 0.21 ms, against 0.33 ms of baseline jitter with nothing playing at all.
+
+A hit is a file read — 0.85 ms end to end for a three-second clip, against a 20 ms frame. There is deliberately no memory layer in front of it: there was one, holding the same packets, and it was measured at 0.27 ms off the way to playback while not even saving a filesystem round trip (the reaper ages clips by mtime, so every hit calls `os.utime` whether or not it read the file). An eviction policy and a tuning knob for a quarter of a millisecond is a bad trade.
+
+**`TTS_CACHE_DIR` is therefore load-bearing, not an optimisation.** Mount a writable volume there. Without one, every phrase is synthesized again every time it is said and `prewarm` does nothing at all — which is a round trip to the TTS server per announcement instead of a file read, and is reported as an error at startup rather than a warning. Writes go through a temporary file and a rename, because a process killed mid-write would otherwise cache a truncated clip forever, and a clip is only stored once the synthesizer says it is whole — a failure partway through plays what arrived and stores nothing. A file that is truncated anyway, by a torn volume rather than by this process, is refused on the way in rather than played as a clip that stops early: the container's end-of-stream marker is what says the last page is the last page.
+
+> **Upgrading.** Clips written by an earlier version are `.wav` and cannot be read any more. They are not deleted on sight — they age out on the usual retention clock, since nothing touches them again — so a cache directory empties itself within `TTS_CACHE_RETENTION_DAYS` of the upgrade. Every phrase is re-synthesized once, which is what `prewarm` is for. Hand-placed clips are untouched.
+
+**A phrase can be rendered before it is needed.** A tool that can work out at startup what it will have to say later warms the cache with it from `prewarm`, and a phrase already stored costs nothing to warm. A warmed clip is deliberately **not** treated as a played one: a phrase already there is left exactly as found rather than touched, so what nobody ever earns ages out like anything else nobody plays. With no usable directory there is nowhere to put the result, and warming does nothing rather than paying a synthesizer for audio nobody will ever be served.
+
+**The cache is reaped at startup** (`TTS_CACHE_RETENTION_DAYS`, 90 by default). The directory otherwise only grows: a display name goes into the key, so everyone who has ever been announced leaves a file behind, and none of them is ever asked for again once they leave the server. Age is the **mtime**, not the filename, and every hit touches the file, so what is still in use stays however old it is and only what nothing plays ages out. A reaped phrase costs one synthesis the next time it is said.
 
 Only rendered speech is reaped, identified by name: a clip the cache wrote is a SHA-256 digest, which nothing anybody would type by hand looks like, and the scan does not descend into subdirectories. A chime is safe on both counts. Any value below `1` disables the reaper entirely, so `0` is a no-op rather than "delete everything".
 
@@ -470,9 +516,8 @@ Only used by tools that answer out loud. A deployment with no such tool enabled 
 | `TTS_STALL_SECONDS` | `10.0` | How long the player waits mid-clip for audio that never comes before ending it |
 | `TTS_LEAD_MS` | `500.0` | How much speech to have in hand before a clip starts playing, so a synthesizer that renders a phrase whole leaves no gap behind a chime. `0` starts on the first chunk |
 | `PLAYBACK_VOLUME` | `1.0` | Scales everything played into a channel, chime included. `1.0` is however loud the synthesizer rendered it, `0.8` is 20% quieter, `1.2` is 20% louder and clipped rather than wrapped. Any value below `0` is treated as silence |
-| `TTS_CACHE_DIR` | `/cache/tts` | Rendered speech. Mount a volume here to keep it across restarts |
-| `TTS_CACHE_ENTRIES` | `256` | Clips held in memory before the least recently used is retired |
-| `TTS_CACHE_RETENTION_DAYS` | `90` | Days a rendered clip survives on disk without being played, counted from the last time it was. Any value below `1` keeps them forever; clips left there by hand are never reaped |
+| `TTS_CACHE_DIR` | `/cache/tts` | Rendered speech, as Ogg Opus, and the only place it is kept. Mount a writable volume here; without one every phrase is synthesized again every time it is said |
+| `TTS_CACHE_RETENTION_DAYS` | `90` | Days a rendered clip survives on disk without being played, counted from the last time it was. Also what clears out clips an earlier version wrote as WAVs. Any value below `1` keeps them forever; clips left there by hand are never reaped |
 
 ### Quotes
 
@@ -569,6 +614,8 @@ miss-quote/
 ├── pytest.ini
 ├── requirements.txt           # What the image installs
 ├── config.yaml                # A sample of the mounted file
+├── scripts/
+│   └── validate_quotes.py     # Checks a quote file in CI; stdlib only, imports nothing
 ├── src/
 │   └── miss_quote/
 │       ├── __main__.py        # Entry point: python -m miss_quote
@@ -580,6 +627,7 @@ miss-quote/
 │       │   └── topic.py       # A line under the name of the channel the bot is in
 │       ├── audio/
 │       │   ├── resampler.py   # soxr, both directions
+│       │   ├── opus.py        # Encode to what Discord sends, and the Ogg it is kept in
 │       │   ├── gain.py        # Playback loudness
 │       │   └── ring_buffer.py # Pre-speech context buffer
 │       ├── stt/
@@ -604,7 +652,7 @@ miss-quote/
 │       │   └── writer.py      # Per-session JSONL appender + retention
 │       ├── tts/
 │       │   ├── client.py      # Streaming Wyoming synthesis
-│       │   └── cache.py       # Render a phrase once, keep it in memory and on disk
+│       │   └── cache.py       # Render a phrase once, keep it encoded on disk
 │       └── utils/
 │           ├── logging.py
 │           └── stems.py       # A stem and the endings it is said with
@@ -628,6 +676,8 @@ python3.12 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 pytest
 ```
+
+Changing the quote list needs neither of those — `python scripts/validate_quotes.py` is standard library only and is what CI runs against it.
 
 The ASR path is the riskiest integration and is worth exercising on its own, before any Discord wiring. Point `WYOMING_HOST` at any reachable Wyoming server and send the bundled speech fixture through the client:
 

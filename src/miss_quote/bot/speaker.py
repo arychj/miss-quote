@@ -3,22 +3,34 @@ Playing a tool's audio back into the voice channel it came from.
 
 Discord's player is a thread. It asks an `AudioSource` for exactly one frame
 every 20 ms and stops the moment it gets anything short of one, so a clip that
-is still being synthesized cannot simply be handed over as a file. `PCMStream`
-is the buffer between the two: filled from the event loop as chunks arrive,
-drained by the player thread a frame at a time, so playback starts on the first
-chunk rather than waiting for the last.
+is still being synthesized cannot simply be handed over as a file. The sources
+here are the buffer between the two: filled from the event loop as chunks
+arrive, drained by the player thread a frame at a time, so playback starts on
+the first chunk rather than waiting for the last.
 
-No ffmpeg is involved. The audio is already the 48 kHz stereo PCM Discord wants,
-and the Opus encoder that libopus provides for receiving encodes it on the way
-back out.
+There are two of them because there are two forms a clip can arrive in.
+`OpusStream` carries packets the cache already holds encoded, and says so
+through `is_opus`, which is discord.py's signal to send them untouched — no
+encoder is even constructed. `PCMStream` carries samples, which is what anything
+that has to be *changed* on the way out needs: a gain is a multiplication, and
+there is nothing to multiply in an encoded packet.
+
+Which one a clip gets is decided in `play` and turns on the volume alone. At
+full volume there is nothing to do to the audio, so it goes out as it was
+stored; below it, the clip is decoded, scaled, and re-encoded by discord.py as
+it always was.
+
+No ffmpeg is involved in either. The audio is already what Discord wants, and
+libopus is present for receiving regardless.
 """
 
 from __future__ import annotations
 
 import asyncio
 import threading
+from collections import deque
 from collections.abc import AsyncIterator, Callable
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 import discord
 
@@ -33,26 +45,119 @@ SILENCE = b"\x00"
 NOTHING_LEFT = b""
 
 
-class PCMStream(discord.AudioSource):
+@runtime_checkable
+class Encodable(Protocol):
     """
-    An audio source fed from the event loop while the player drains it.
+    A clip that can be had either way, so the speaker can pick.
+
+    Declared here rather than beside the cache that satisfies it, because it
+    describes what this module is willing to accept rather than what any one
+    thing produces. A plain iterator of PCM is still accepted and is what a tool
+    assembling a clip of its own hands over.
+    """
+
+    def packets(self) -> AsyncIterator[bytes]:
+        """The clip already encoded, one Opus packet per frame."""
+
+    def pcm(self) -> AsyncIterator[bytes]:
+        """The clip as playback samples."""
+
+
+class _FedSource(discord.AudioSource):
+    """
+    What the two sources share: a buffer filled on one thread and drained on
+    another.
 
     `read` is called on the player thread and blocks it when the buffer is short
     of a frame, which is the point: returning early would be read as the end of
     the clip. The block is bounded, so a synthesizer that stalls costs the tail
     of one announcement rather than a thread and a voice connection.
+    """
+
+    def __init__(self, stall_seconds: float) -> None:
+        self._stall_seconds = stall_seconds
+        self._lock = threading.Lock()
+        self._fed = threading.Event()
+        self._complete = False
+
+    def finish(self) -> None:
+        """Say that no more audio is coming, so the player can drain and stop."""
+        with self._lock:
+            self._complete = True
+        self._fed.set()
+
+    def read(self) -> bytes:
+        while True:
+            with self._lock:
+                frame = self._take()
+                if frame is not None:
+                    return frame
+
+                if self._complete:
+                    return self._drained()
+
+                # Cleared under the lock and waited on outside it, so a feed
+                # landing in between sets the event rather than being missed.
+                self._fed.clear()
+
+            if not self._fed.wait(self._stall_seconds):
+                logger.warning(
+                    "No audio for %.0fs; ending the clip early.", self._stall_seconds
+                )
+                return NOTHING_LEFT
+
+    def _take(self) -> bytes | None:
+        """One frame if there is a whole one, else None. Called holding the lock."""
+        raise NotImplementedError
+
+    def _drained(self) -> bytes:
+        """What to send once nothing more is coming. Called holding the lock."""
+        return NOTHING_LEFT
+
+
+class OpusStream(_FedSource):
+    """
+    Packets the cache already holds encoded, handed to the player as they are.
+
+    `is_opus` is what makes this worth having: discord.py builds no encoder for
+    a source that says yes, so a cached phrase costs nothing to play beyond the
+    send itself. One packet is one frame, which is what the encoder guarantees
+    and what the player assumes.
+
+    Nothing here pads or splits. A packet is atomic — half of one is not audio —
+    and the encoder has already padded the only frame that could have been
+    short.
+    """
+
+    def __init__(self, stall_seconds: float) -> None:
+        super().__init__(stall_seconds)
+        self._packets: deque[bytes] = deque()
+
+    def is_opus(self) -> bool:
+        """The clip is already encoded; discord.py sends it untouched."""
+        return True
+
+    def feed(self, packet: bytes) -> None:
+        with self._lock:
+            self._packets.append(packet)
+        self._fed.set()
+
+    def _take(self) -> bytes | None:
+        return self._packets.popleft() if self._packets else None
+
+
+class PCMStream(_FedSource):
+    """
+    Samples, for a clip that has to be changed on the way out.
 
     Volume is applied as audio is fed rather than as it is read, so the buffer
     holds what will be played and framing stays framing.
     """
 
     def __init__(self, stall_seconds: float, volume: float = UNITY_VOLUME) -> None:
-        self._stall_seconds = stall_seconds
+        super().__init__(stall_seconds)
         self._volume = volume
         self._buffer = bytearray()
-        self._lock = threading.Lock()
-        self._fed = threading.Event()
-        self._complete = False
 
     def is_opus(self) -> bool:
         """The clip is PCM; discord.py encodes it."""
@@ -65,36 +170,17 @@ class PCMStream(discord.AudioSource):
             self._buffer.extend(quietened)
         self._fed.set()
 
-    def finish(self) -> None:
-        """Say that no more audio is coming, so the player can drain and stop."""
-        with self._lock:
-            self._complete = True
-        self._fed.set()
-
-    def read(self) -> bytes:
+    def _take(self) -> bytes | None:
         frame_bytes = audio_cfg.playback_frame_bytes
+        if len(self._buffer) < frame_bytes:
+            return None
 
-        while True:
-            with self._lock:
-                if len(self._buffer) >= frame_bytes:
-                    frame = bytes(self._buffer[:frame_bytes])
-                    del self._buffer[:frame_bytes]
-                    return frame
+        frame = bytes(self._buffer[:frame_bytes])
+        del self._buffer[:frame_bytes]
 
-                if self._complete:
-                    return self._final_frame(frame_bytes)
+        return frame
 
-                # Cleared under the lock and waited on outside it, so a feed
-                # landing in between sets the event rather than being missed.
-                self._fed.clear()
-
-            if not self._fed.wait(self._stall_seconds):
-                logger.warning(
-                    "No audio for %.0fs; ending the clip early.", self._stall_seconds
-                )
-                return NOTHING_LEFT
-
-    def _final_frame(self, frame_bytes: int) -> bytes:
+    def _drained(self) -> bytes:
         """
         Whatever is left, padded out to a whole frame.
 
@@ -105,8 +191,9 @@ class PCMStream(discord.AudioSource):
         if not self._buffer:
             return NOTHING_LEFT
 
-        frame = bytes(self._buffer).ljust(frame_bytes, SILENCE)
+        frame = bytes(self._buffer).ljust(audio_cfg.playback_frame_bytes, SILENCE)
         self._buffer.clear()
+
         return frame
 
 
@@ -127,14 +214,35 @@ class DiscordSpeaker:
         self._locks: dict[int, asyncio.Lock] = {}
 
     async def play(
-        self, source: Source, audio: AsyncIterator[bytes], scale: float = UNITY_VOLUME
+        self,
+        source: Source,
+        audio: Encodable | AsyncIterator[bytes],
+        scale: float = UNITY_VOLUME,
     ) -> None:
+        """
+        Play one clip, encoded if nothing has to be done to it first.
+
+        The gain is the deployment's loudness times whatever the caller asked
+        for, and it is the whole of the decision: at unity there is nothing to
+        do to the audio, so a clip that can be had already encoded is sent as it
+        was stored. Anything quieter has to be multiplied, and multiplying means
+        samples.
+        """
         async with self._lock_for(source.guild_id):
             voice_client = self._voice_client_for(source)
             if voice_client is None:
                 return
 
-            await self._play(voice_client, audio, scale)
+            gain = audio_cfg.playback_volume * scale
+
+            if isinstance(audio, Encodable):
+                if gain == UNITY_VOLUME:
+                    await self._play_encoded(voice_client, audio.packets())
+                    return
+
+                audio = audio.pcm()
+
+            await self._play(voice_client, audio, gain)
 
     def _lock_for(self, guild_id: int) -> asyncio.Lock:
         lock = self._locks.get(guild_id)
@@ -173,21 +281,37 @@ class DiscordSpeaker:
 
         return voice_client
 
-    @staticmethod
+    @classmethod
     async def _play(
+        cls,
         voice_client: discord.VoiceClient,
         audio: AsyncIterator[bytes],
-        scale: float = UNITY_VOLUME,
+        gain: float = UNITY_VOLUME,
     ) -> None:
         """
-        Feed one clip to the player, at the deployment's loudness times `scale`.
+        Feed one clip to the player as samples, at the gain `play` settled on.
 
-        The two are multiplied here rather than anywhere a tool can see, so
-        `PLAYBACK_VOLUME` remains the only thing that says how loud a channel
-        wants to be interrupted and a tool only says how much quieter than that
-        this particular clip should be.
+        The deployment's loudness and the caller's scale are multiplied before
+        they arrive here, so `PLAYBACK_VOLUME` remains the only thing that says
+        how loud a channel wants to be interrupted and a tool only says how much
+        quieter than that this particular clip should be.
         """
-        stream = PCMStream(tts_cfg.stall_seconds, audio_cfg.playback_volume * scale)
+        await cls._drive(voice_client, PCMStream(tts_cfg.stall_seconds, gain), audio)
+
+    @classmethod
+    async def _play_encoded(
+        cls, voice_client: discord.VoiceClient, packets: AsyncIterator[bytes]
+    ) -> None:
+        """Feed one clip to the player already encoded, which it sends untouched."""
+        await cls._drive(voice_client, OpusStream(tts_cfg.stall_seconds), packets)
+
+    @staticmethod
+    async def _drive(
+        voice_client: discord.VoiceClient,
+        stream: OpusStream | PCMStream,
+        audio: AsyncIterator[bytes],
+    ) -> None:
+        """Arm the player, fill the source until the clip runs out, and wait it out."""
         finished = asyncio.Event()
         loop = asyncio.get_running_loop()
 
