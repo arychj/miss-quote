@@ -3,13 +3,23 @@ The Verbal Morality Bot, after Demolition Man.
 
 Listens for words the server has decided against and, on hearing one, announces
 the fine out loud in the channel it was said in. The credits are imaginary but
-they are added up: what everybody owes goes in the voice channel topic, and
-`ledger.credits` keeps it across restarts.
+they are counted: a fine comes off a balance that starts at nothing, the four
+deepest in the red go in the voice channel topic, and `ledger.credits` keeps it
+across restarts.
 
 A repeat offender is announced more and more quietly. Being fined is the joke,
 and a joke told fifteen times in five minutes is a denial of service on the
 conversation, so the announcement backs off toward `VIOLATION_VOLUME_FLOOR` as
 somebody keeps earning them. See `RecentViolations`.
+
+For the same reason a violation earned while an announcement is already playing
+is counted and not announced. The speaker plays one clip at a time and returns
+when it is finished, so waiting for a turn would leave the channel working
+through a backlog of fines for things said a minute ago.
+
+A speaker fined again within `REPEAT_FINE_SECONDS` gets the second wording —
+"you are also fined" — because reading the whole sentence out again sounds like
+a bot that has lost track of what it just said.
 
 What the server writes down are stems. Each is expanded at startup into the
 endings it is said with, so a list stays a list of words rather than a list of
@@ -31,25 +41,42 @@ import time
 from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Any
 
-from config import UNITY_VOLUME, morality_cfg, tts_cfg
+from config import PERCENT, UNITY_VOLUME, morality_cfg, tts_cfg
 from ledger.credits import shared_ledger
 from tools.base import Speaker, Tool
 from transcript.writer import TranscriptSession, Utterance
 from tts.cache import shared_cache
 from utils.logging import get_logger
-from utils.stems import expand
+from utils.stems import expand, plural
 
 logger = get_logger(__name__)
 
 WORDS_KEY = "words"
 ANNOUNCEMENT_KEY = "announcement"
+REPEAT_ANNOUNCEMENT_KEY = "repeat_announcement"
 CHIME_KEY = "chime"
 
-# The default lives here rather than in the config file so a server electing
+# The defaults live here rather than in the config file so a server electing
 # into the tool only has to say which words it objects to.
 DEFAULT_ANNOUNCEMENT = (
     "{user}, you are fined {credits} for {violations} of the verbal morality statute."
 )
+
+# What the same speaker is told when they have only just been fined. The whole
+# sentence again reads as though the bot lost track; "also" is what a person
+# would say, and it costs one extra rendered phrase per speaker.
+DEFAULT_REPEAT_ANNOUNCEMENT = (
+    "{user}, you are also fined {credits} for {violations} of the "
+    "verbal morality statute."
+)
+
+# Which of the two wordings a fine gets, named so neither the pre-warm nor a
+# call reads as a bare boolean.
+FIRST_FINE = False
+REPEATED_FINE = True
+
+# A repeat window of this or less turns the second wording off entirely.
+NEVER_REPEATS = 0.0
 
 USER_FIELD = "user"
 CREDITS_FIELD = "credits"
@@ -65,8 +92,6 @@ WORD_BOUNDARY = r"\b"
 ALTERNATION = "|"
 
 SINGLE_CREDIT = 1
-CREDIT_NOUN = "credit"
-CREDITS_NOUN = "credits"
 
 SINGLE_OFFENCE = 1
 SINGLE_VIOLATION = "a violation"
@@ -79,22 +104,9 @@ FORESEEN_OFFENCES = 3
 
 OFFENCE_SEPARATOR = ", "
 
-# How long a violation counts against how loudly the next one is announced, and
-# how much of the announcement each one inside that window costs. Fifteen of
-# them reaches the floor, which is a quarter of the way there by default; the
-# floor itself is a deployment setting, since a server may want a repeat
-# offender silenced rather than merely quietened.
-VIOLATION_WINDOW_SECONDS = 300.0
-BACKOFF_PER_VIOLATION = 0.05
-
-# A fraction is what the speaker is handed; a percentage is what reads in a log.
-PERCENT = 100
-
-# Stand in for a speaker and their fine while the announcement is checked at
-# startup.
+# Stands in for a speaker while the announcement is checked at startup; the fine
+# and the violation it probes with are the real wording for a single offence.
 PROBE_NAME = "someone"
-PROBE_CREDITS = f"{SINGLE_CREDIT} {CREDIT_NOUN}"
-PROBE_VIOLATIONS = SINGLE_VIOLATION
 
 
 class RecentViolations:
@@ -103,8 +115,9 @@ class RecentViolations:
 
     In memory only, and per tool instance, which is per server: one server's
     patience is not another's, and a tally that survives a restart is the
-    credits, not this. Five minutes after the last one, a speaker is back to
-    being announced at whatever loudness the channel asked for.
+    credits, not this. A `VOLUME_BACKOFF_DURATION` after their last one, a
+    speaker is back to being announced at whatever loudness the channel asked
+    for.
 
     Timestamps rather than a count, because the window slides: a count would
     have to be reset on a schedule, and the reset would land mid-argument and
@@ -114,12 +127,14 @@ class RecentViolations:
 
     def __init__(
         self,
-        window_seconds: float = VIOLATION_WINDOW_SECONDS,
-        step: float = BACKOFF_PER_VIOLATION,
+        window_seconds: float | None = None,
+        step: float | None = None,
         floor: float | None = None,
     ) -> None:
-        self._window = window_seconds
-        self._step = step
+        self._window = (
+            morality_cfg.backoff_seconds if window_seconds is None else window_seconds
+        )
+        self._step = morality_cfg.backoff_step if step is None else step
         self._floor = morality_cfg.volume_floor if floor is None else floor
         self._seen: dict[int, list[float]] = {}
 
@@ -128,13 +143,29 @@ class RecentViolations:
         How loud the next announcement for a speaker should be, as a fraction.
 
         Read before the violation being announced is recorded, so somebody's
-        first swear in five minutes is announced at full volume: the backoff is
-        for saying it again, and a floor that applied from the first word would
-        just be a quieter bot.
+        first swear in a window is announced at full volume: the backoff is for
+        saying it again, and a floor that applied from the first word would just
+        be a quieter bot.
         """
         backoff = self._step * self.count(user_id, now)
 
         return max(self._floor, UNITY_VOLUME - backoff)
+
+    def repeating(self, user_id: int, within: float, now: float | None = None) -> bool:
+        """
+        Whether a speaker's last violation was recent enough to make this another.
+
+        Read on the same terms as `scale`, before the violation being announced
+        is recorded, so what it answers is "have they only just been fined" and
+        never "are they being fined right now".
+        """
+        if within <= NEVER_REPEATS:
+            return False
+
+        moment = time.monotonic() if now is None else now
+        seen = self._seen.get(user_id)
+
+        return bool(seen) and moment - max(seen) <= within
 
     def count(self, user_id: int, now: float | None = None) -> int:
         """Violations still inside the window, dropping the ones that have aged out."""
@@ -191,10 +222,17 @@ class VerbalMorality(Tool):
 
         self._vocabulary = _vocabulary(config.get(WORDS_KEY))
         self._forbidden = _pattern(self._vocabulary)
-        self._announcement = _checked(config.get(ANNOUNCEMENT_KEY) or DEFAULT_ANNOUNCEMENT)
+        self._announcement = _checked(
+            ANNOUNCEMENT_KEY, config.get(ANNOUNCEMENT_KEY) or DEFAULT_ANNOUNCEMENT
+        )
+        self._repeat_announcement = _checked(
+            REPEAT_ANNOUNCEMENT_KEY,
+            config.get(REPEAT_ANNOUNCEMENT_KEY) or DEFAULT_REPEAT_ANNOUNCEMENT,
+        )
         self._speech = shared_cache()
         self._chime = self._located(config.get(CHIME_KEY))
         self._recent = RecentViolations()
+        self._announcing = False
 
         # Enrolled at construction so the topic reads `Eli: 0 Erik: 0` before
         # anybody has sworn, rather than filling in one name at a time as each
@@ -240,10 +278,11 @@ class VerbalMorality(Tool):
         """
         Render the fines this server can already see coming.
 
-        Every name on the roster against the first few counts of violations,
-        which between them are most of what anybody earns. Synthesis is the slow
-        part of answering: paying for it at startup is what lets the fine land
-        while the offence is still what the channel is talking about.
+        Every name on the roster against the first few counts of violations, in
+        both wordings, which between them are most of what anybody earns.
+        Synthesis is the slow part of answering: paying for it at startup is what
+        lets the fine land while the offence is still what the channel is talking
+        about.
 
         Only the roster can be warmed. A speaker the server has not named is
         announced under whatever Discord reports, which is not knowable from here
@@ -261,13 +300,17 @@ class VerbalMorality(Tool):
             )
             return
 
-        offences = range(SINGLE_OFFENCE, FORESEEN_OFFENCES + 1)
+        wordings = [
+            self._wording(name, count, repeat)
+            for name in names
+            for count in range(SINGLE_OFFENCE, FORESEEN_OFFENCES + 1)
+            for repeat in (FIRST_FINE, REPEATED_FINE)
+        ]
         rendered = 0
 
-        for name in names:
-            for count in offences:
-                if await self._speech.warm(self._wording(name, count)):
-                    rendered += 1
+        for wording in wordings:
+            if await self._speech.warm(wording):
+                rendered += 1
 
         logger.info(
             "[%s] Pre-warmed announcements for %d speaker(s): "
@@ -275,64 +318,95 @@ class VerbalMorality(Tool):
             self.server,
             len(names),
             rendered,
-            len(names) * len(offences) - rendered,
+            len(wordings) - rendered,
         )
 
     async def handle_utterance(
         self, utterance: Utterance, session: TranscriptSession
     ) -> None:
         """
-        Announce one fine for an offending utterance, and add it to the tally.
+        Announce one fine for an offending utterance, and take it off the tally.
 
         One announcement however many words were in it, and one credit for
-        each. A speaker who strings four together has earned four credits, but
-        four announcements over the top of each other is a denial of service on
-        the channel.
+        each. A speaker who strings four together has been fined four credits,
+        but four announcements over the top of each other is a denial of service
+        on the channel.
 
-        The loudness is read before the violations are recorded, so the first
-        swear in five minutes is announced at full volume and each one after it
-        is quieter. The tally is added to whether or not the announcement is
-        audible: what somebody owes is not a function of how loudly they were
-        told about it.
+        Nothing is announced at all while an announcement is already playing.
+        The speaker plays one clip at a time and returns when it is done, so the
+        alternative is a queue: a channel where three people swear over each
+        other spends the next minute being read fines for things it has moved on
+        from, which is the failure the backoff exists to prevent, arriving by a
+        different route.
+
+        The loudness and whether this is a repeat are both read before the
+        violations are recorded, so the first swear in a window is announced at
+        full volume and in the first wording. The tally is charged whether or not
+        anything is said: what somebody owes is not a function of how loudly, or
+        whether, they were told about it.
         """
         offences = self._forbidden.findall(utterance.text)
         if not offences:
             return
 
         scale = self._recent.scale(utterance.user_id)
+        repeat = self._recent.repeating(utterance.user_id, morality_cfg.repeat_seconds)
         self._recent.record(utterance.user_id, len(offences))
 
         fine = _fine(len(offences))
-        owed = self._credits.award(
+        balance = self._credits.fine(
             self.server, utterance.user_id, utterance.user, len(offences)
         )
+        said = OFFENCE_SEPARATOR.join(f"'{offence}'" for offence in offences)
+
+        if self._announcing:
+            logger.info(
+                "🚨 [%s] %s said %s; fined %s while an announcement was already "
+                "playing, so this one goes unsaid (balance %d).",
+                self.server,
+                utterance.user,
+                said,
+                fine,
+                balance,
+            )
+            return
 
         logger.info(
-            "🚨 [%s] %s said %s; announcing a fine of %s at %d%% volume (%d owed).",
+            "🚨 [%s] %s said %s; announcing a fine of %s at %d%% volume (balance %d).",
             self.server,
             utterance.user,
-            OFFENCE_SEPARATOR.join(f"'{offence}'" for offence in offences),
+            said,
             fine,
             round(scale * PERCENT),
-            owed,
+            balance,
         )
 
-        await self.speaker.play(
-            session.source,
-            self._announce(self._wording(utterance.user, len(offences))),
-            scale,
-        )
+        self._announcing = True
+        try:
+            await self.speaker.play(
+                session.source,
+                self._announce(self._wording(utterance.user, len(offences), repeat)),
+                scale,
+            )
+        finally:
+            self._announcing = False
 
-    def _wording(self, user: str, offences: int) -> str:
+    def _wording(self, user: str, offences: int, repeat: bool = FIRST_FINE) -> str:
         """
         The announcement as it will be said, for one speaker and one count.
+
+        Two templates, and the second is for a speaker who has only just been
+        fined: the whole sentence again reads as though nothing was keeping
+        track, where "you are also fined" is what a person would say.
 
         The pre-warm renders exactly this, so the two must agree down to the
         character: a phrase that differs by a space is a phrase that was
         synthesized at startup and then synthesized again on the way to being
         played.
         """
-        return self._announcement.format(
+        template = self._repeat_announcement if repeat else self._announcement
+
+        return template.format(
             **{
                 USER_FIELD: user,
                 CREDITS_FIELD: _fine(offences),
@@ -437,11 +511,14 @@ def _fine(offences: int) -> str:
     """
     The fine as it will be said out loud: one credit per forbidden word.
 
-    The count stays a numeral, which every synthesizer worth pointing this at
-    reads as a number. The noun does not get the same treatment — "1 credits"
-    is wrong in a way a listener hears.
+    What a credit is called is `CREDIT_CURRENCY`, and the plural is grown from
+    it rather than configured beside it, so a deployment cannot end up fining
+    people "2 credit". The count stays a numeral, which every synthesizer worth
+    pointing this at reads as a number; the noun does not get the same treatment
+    — "1 credits" is wrong in a way a listener hears.
     """
-    noun = CREDIT_NOUN if offences == SINGLE_CREDIT else CREDITS_NOUN
+    currency = morality_cfg.currency
+    noun = currency if offences == SINGLE_CREDIT else plural(currency)
 
     return f"{offences} {noun}"
 
@@ -456,13 +533,14 @@ def _violations(offences: int) -> str:
     return SINGLE_VIOLATION if offences == SINGLE_OFFENCE else MULTIPLE_VIOLATIONS
 
 
-def _checked(announcement: str) -> str:
+def _checked(key: str, announcement: str) -> str:
     """
     An announcement template that will interpolate.
 
     Checked at construction because the alternative is discovering a stray brace
     at the moment someone swears, by which point the tool has one job and cannot
-    do it.
+    do it. The key is carried in so a server told which setting is wrong does not
+    have to work out which of the two it was.
     """
     announcement = str(announcement)
 
@@ -470,8 +548,8 @@ def _checked(announcement: str) -> str:
         announcement.format(
             **{
                 USER_FIELD: PROBE_NAME,
-                CREDITS_FIELD: PROBE_CREDITS,
-                VIOLATIONS_FIELD: PROBE_VIOLATIONS,
+                CREDITS_FIELD: _fine(SINGLE_OFFENCE),
+                VIOLATIONS_FIELD: _violations(SINGLE_OFFENCE),
             }
         )
     except (IndexError, KeyError, ValueError) as exc:
@@ -479,7 +557,7 @@ def _checked(announcement: str) -> str:
             f"'{{{field}}}'" for field in (USER_FIELD, CREDITS_FIELD, VIOLATIONS_FIELD)
         )
         raise ValueError(
-            f"'{ANNOUNCEMENT_KEY}' has a placeholder nothing fills: {exc}. "
+            f"'{key}' has a placeholder nothing fills: {exc}. "
             f"Only {available} are available."
         ) from exc
 

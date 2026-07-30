@@ -1,9 +1,13 @@
 """
-What everybody owes, per server.
+What everybody has left, per server.
 
-Fines used to be announced and forgotten. They are now added up, kept on disk,
-and published to the voice channel topic as `Eli: 0 Erik: 0 Luke: 0 Ryan: 0` —
+Fines used to be announced and forgotten. They are now subtracted from a balance,
+kept on disk, and published to the voice channel topic as `Eli: -9 Erik: -2` —
 which makes the topic the scoreboard, visible without asking the bot anything.
+
+A fine is a debit. Everybody starts at nothing and goes down from there, so the
+number beside a name reads as what swearing has cost them rather than as points
+they have collected. The board is the four furthest into the red, worst first.
 
 The count is per server. The same person swearing in two servers owes two
 separate debts, because a server's tally is its own business and its words are
@@ -51,6 +55,10 @@ PARTIAL_SUFFIX = ".partial"
 ENTRY = "{name}: {credits}"
 ENTRY_SEPARATOR = " "
 
+# How many people the board holds. Short enough to read at a glance in a channel
+# topic, and long enough that being on it means something.
+SCOREBOARD_PLACES = 4
+
 SERVER_SEPARATOR = ", "
 NO_SERVERS = "none"
 
@@ -62,7 +70,7 @@ TOPIC_TRUNCATED = "…"
 
 @dataclass
 class Account:
-    """One person's debt to one server, and the name to announce it under."""
+    """One person's balance with one server, and the name to announce it under."""
 
     name: str
     credits: int = NO_CREDITS
@@ -80,6 +88,7 @@ class CreditLedger:
     def __init__(self, path: Path | None = None) -> None:
         self._path = Path(morality_cfg.credits_file if path is None else path)
         self._servers: dict[str, dict[int, Account]] = {}
+        self._rosters: dict[str, frozenset[int]] = {}
         self._revision = UNWRITTEN
         self._changed: dict[str, int] = {}
 
@@ -105,18 +114,24 @@ class CreditLedger:
 
     def enroll(self, server: str, users: Mapping[int, str]) -> None:
         """
-        Put a server's roster on the board at nothing owed.
+        Put a server's roster on the board at nothing spent.
 
         So a channel topic reads `Eli: 0 Erik: 0` before anybody has sworn, which
         is both the point of a scoreboard and the only way to tell the tool is
-        watching. A total already on the books survives, and a name that has been
-        rewritten in the roster since is brought up to date.
+        watching. A balance already on the books survives, and a name that has
+        been rewritten in the roster since is brought up to date.
 
-        Anybody not on the roster is added when they earn something, under
-        whatever Discord reports.
+        The roster is also who may appear on the board at all. Anybody not on it
+        is still fined and still kept, under whatever Discord reports, but is not
+        published: a name nobody wrote down is a Discord nickname, which its
+        owner can set to anything they like and would otherwise be putting in a
+        channel topic through this.
         """
         accounts = self._servers.setdefault(server, {})
-        changed = False
+        roster = frozenset(users)
+        changed = self._rosters.get(server) != roster
+
+        self._rosters[server] = roster
 
         for user_id, name in users.items():
             account = accounts.get(user_id)
@@ -131,9 +146,14 @@ class CreditLedger:
         if changed:
             self._bump(server)
 
-    def award(self, server: str, user_id: int, name: str, credits: int) -> int:
+    def fine(self, server: str, user_id: int, name: str, credits: int) -> int:
         """
-        Add to what somebody owes, and report the new total.
+        Take a fine off what somebody has left, and report the new balance.
+
+        A debit rather than a credit: what the number beside a name says is what
+        swearing has cost them, so it starts at nothing and goes down. The
+        balance is returned as it now stands, which is negative for anybody who
+        has ever been fined.
 
         The name is refreshed on the way past: it is what the topic prints, and
         the one that arrived with the fine is the most recent thing anybody knows
@@ -147,7 +167,7 @@ class CreditLedger:
             accounts[user_id] = account
 
         account.name = name
-        account.credits += credits
+        account.credits -= credits
         self._bump(server)
 
         return account.credits
@@ -159,20 +179,30 @@ class CreditLedger:
 
     def topic(self, server: str) -> str:
         """
-        One server's tally, as the line that goes in the channel topic.
+        One server's standings, as the line that goes in the channel topic.
 
-        Ordered by name rather than by what is owed. A leaderboard would be the
-        more natural read, but it reshuffles every time somebody passes somebody
-        else, and a topic that rearranges itself is one nobody can read at a
-        glance to find themselves.
+        The four furthest into the red, worst first, and only people the server
+        wrote down in `users`. A leaderboard rearranges itself every time
+        somebody passes somebody else, which is the objection to publishing a
+        whole roster in name order; at four places it is short enough to read at
+        a glance, and who is winning is the thing worth reading.
+
+        Ties break on the name, so two people on the same balance do not swap
+        places between one edit and the next for no reason anybody can see.
         """
-        accounts = sorted(
-            self._servers.get(server, {}).values(), key=lambda account: account.name.casefold()
+        roster = self._rosters.get(server, frozenset())
+        standings = sorted(
+            (
+                account
+                for user_id, account in self._servers.get(server, {}).items()
+                if user_id in roster
+            ),
+            key=lambda account: (account.credits, account.name.casefold()),
         )
 
         return _within_limit(
             ENTRY.format(name=account.name, credits=account.credits)
-            for account in accounts
+            for account in standings[:SCOREBOARD_PLACES]
         )
 
     def _bump(self, server: str) -> None:
@@ -271,9 +301,10 @@ def _within_limit(entries: Iterable[str]) -> str:
     """
     As many entries as Discord will take in a topic, and a mark if any were cut.
 
-    The limit is generous enough that reaching it takes a server with a hundred
-    people in it, all of whom swear; the alternative to cutting is an edit
-    Discord rejects, which loses the whole tally rather than the tail of it.
+    Four places do not reach 1024 characters unless the display names are longer
+    than anything a person would type, which is exactly why the guard stays:
+    nothing stops somebody trying, and the alternative to cutting is an edit
+    Discord rejects, which loses the whole board rather than the tail of it.
     """
     line = ""
 

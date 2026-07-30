@@ -72,12 +72,12 @@ def expand(stem: str) -> list[str]:
 
     forms = [
         stem,
-        _plural(stem),
+        plural(stem),
         _suffixed(stem, PAST),
         gerund,
         gerund.removesuffix(DROPPED_G),
         agent,
-        _plural(agent),
+        plural(agent),
         _suffixed(stem, QUALITY),
         _suffixed(stem, PRACTICE),
         _suffixed(stem, STATE),
@@ -96,7 +96,7 @@ def _suffixed(stem: str, suffix: str) -> str:
 
     Every suffix this is asked for begins with a vowel, which is what makes the
     three adjustments below apply at all: none of them happen before a plural
-    `s`, and `_plural` handles that ending itself.
+    `s`, and `plural` handles that ending itself.
     """
     if len(stem) > 1 and stem.endswith(SILENT_E):
         return stem[:-1] + suffix
@@ -120,7 +120,15 @@ def _suffixed(stem: str, suffix: str) -> str:
     return stem + suffix
 
 
-def _plural(word: str) -> str:
+def plural(word: str) -> str:
+    """
+    A word in the plural, by the spelling rather than by a dictionary.
+
+    Public because the same rule answers a second question: what to call more
+    than one of whatever a deployment fines people in. A currency is a noun like
+    any other, and `credits`, `bucks`, and `pennies` all fall out of the three
+    cases below.
+    """
     if word.endswith(SIBILANT_ENDINGS):
         return word + SIBILANT_PLURAL
 

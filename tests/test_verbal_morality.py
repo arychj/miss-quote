@@ -1,5 +1,6 @@
 """What the Verbal Morality Bot hears, and what it says about it."""
 
+import asyncio
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -7,13 +8,20 @@ from pathlib import Path
 import pytest
 
 import tools.verbal_morality as verbal_morality
-from config import SILENT_VOLUME, UNITY_VOLUME, ServerConfig, ToolSettings, tts_cfg
+from config import (
+    SILENT_VOLUME,
+    UNITY_VOLUME,
+    ServerConfig,
+    ToolSettings,
+    morality_cfg,
+    tts_cfg,
+)
 from ledger.credits import CreditLedger
 from tools.runner import ToolRunner
 from tools.verbal_morality import (
-    BACKOFF_PER_VIOLATION,
     DEFAULT_ANNOUNCEMENT,
-    VIOLATION_WINDOW_SECONDS,
+    DEFAULT_REPEAT_ANNOUNCEMENT,
+    REPEATED_FINE,
     RecentViolations,
     VerbalMorality,
     _lead,
@@ -37,8 +45,14 @@ STRANGER_ID = 456789012345678901
 MANY_VIOLATIONS = 100
 QUIETEST = 0.25
 
-# Announcements the pre-warm renders per speaker: one violation, two, and three.
-WARMED_PER_SPEAKER = 3
+# The backoff as the deployment has it, which is what a tool built here uses.
+BACKOFF_STEP = morality_cfg.backoff_step
+BACKOFF_WINDOW = morality_cfg.backoff_seconds
+REPEAT_WINDOW = morality_cfg.repeat_seconds
+
+# Announcements the pre-warm renders per speaker: one violation, two, and three,
+# each in both the first-fine and the repeat wording.
+WARMED_PER_SPEAKER = 6
 
 CHIME_NAME = "chime.wav"
 CHIME_AUDIO = "♪"
@@ -72,6 +86,26 @@ class RecordingSpeaker:
         spoken = "".join([chunk async for chunk in audio])
         self.played.append((source, spoken))
         self.scales.append(scale)
+
+
+class BlockingSpeaker(RecordingSpeaker):
+    """
+    A speaker that holds the channel until it is let go.
+
+    The real one returns when a clip has finished playing, which is what makes a
+    second fine arriving mid-announcement possible at all; a speaker that returns
+    immediately can never be caught busy.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.playing = asyncio.Event()
+        self.finish = asyncio.Event()
+
+    async def play(self, source, audio, scale: float = UNITY_VOLUME) -> None:
+        self.playing.set()
+        await self.finish.wait()
+        await super().play(source, audio, scale)
 
 
 class FakeSpeech:
@@ -337,6 +371,50 @@ async def test_the_credits_are_available_to_a_custom_announcement(speech, speake
     assert speech.asked == [f"{SPEAKER} owes 2 credits"]
 
 
+# ── the currency ──────────────────────────────────
+
+
+def _denominated(monkeypatch, currency: str) -> None:
+    monkeypatch.setattr(
+        verbal_morality, "morality_cfg", replace(morality_cfg, currency=currency)
+    )
+
+
+async def test_the_currency_is_what_the_deployment_calls_it(
+    speech, speaker, monkeypatch
+):
+    _denominated(monkeypatch, "buck")
+
+    await _hear(_tool(speaker), FORBIDDEN)
+
+    assert "fined 1 buck for" in speech.asked[0]
+
+
+async def test_a_renamed_currency_is_pluralized(speech, speaker, monkeypatch):
+    _denominated(monkeypatch, "buck")
+
+    await _hear(_tool(speaker), f"{FORBIDDEN} {ALSO_FORBIDDEN}")
+
+    assert "fined 2 bucks for" in speech.asked[0]
+
+
+async def test_a_currency_is_pluralized_by_the_spelling(speech, speaker, monkeypatch):
+    """The same rule the word list is grown by, so nobody is fined "2 pennys"."""
+    _denominated(monkeypatch, "penny")
+
+    await _hear(_tool(speaker), f"{FORBIDDEN} {ALSO_FORBIDDEN}")
+
+    assert "fined 2 pennies for" in speech.asked[0]
+
+
+async def test_a_sibilant_currency_takes_an_es(speech, speaker, monkeypatch):
+    _denominated(monkeypatch, "crash")
+
+    await _hear(_tool(speaker), f"{FORBIDDEN} {ALSO_FORBIDDEN}")
+
+    assert "fined 2 crashes for" in speech.asked[0]
+
+
 # ── the announcement ──────────────────────────────
 
 
@@ -412,10 +490,11 @@ async def test_two_speakers_get_their_own_announcements(speech, speaker):
 # ── the tally ─────────────────────────────────────
 
 
-async def test_a_fine_is_added_to_the_tally(speech, speaker, credits):
+async def test_a_fine_comes_off_the_tally(speech, speaker, credits):
+    """A fine is a debit; the number beside a name is what swearing has cost."""
     await _hear(_tool(speaker), FORBIDDEN)
 
-    assert credits.total(SERVER_ALIAS, SPEAKER_ID) == 1
+    assert credits.total(SERVER_ALIAS, SPEAKER_ID) == -1
 
 
 async def test_the_tally_accumulates_across_utterances(speech, speaker, credits):
@@ -424,7 +503,7 @@ async def test_the_tally_accumulates_across_utterances(speech, speaker, credits)
     await _hear(tool, FORBIDDEN)
     await _hear(tool, f"{FORBIDDEN} and {ALSO_FORBIDDEN}")
 
-    assert credits.total(SERVER_ALIAS, SPEAKER_ID) == 3
+    assert credits.total(SERVER_ALIAS, SPEAKER_ID) == -3
 
 
 async def test_a_clean_utterance_costs_nothing(speech, speaker, credits):
@@ -433,7 +512,7 @@ async def test_a_clean_utterance_costs_nothing(speech, speaker, credits):
     assert credits.total(SERVER_ALIAS, SPEAKER_ID) == 0
 
 
-async def test_the_roster_starts_on_the_board_at_nothing_owed(speech, speaker, credits):
+async def test_the_roster_starts_on_the_board_at_nothing_spent(speech, speaker, credits):
     """So the topic says who is being watched before anybody has sworn."""
     _tool(speaker, users=ROSTER)
 
@@ -445,17 +524,33 @@ async def test_the_tally_reads_as_the_channel_topic(speech, speaker, credits):
 
     await _hear(tool, f"{FORBIDDEN} {ALSO_FORBIDDEN}")
 
-    assert credits.topic(SERVER_ALIAS) == f"{SPEAKER}: 2 {OTHER_SPEAKER}: 0"
+    assert credits.topic(SERVER_ALIAS) == f"{SPEAKER}: -2 {OTHER_SPEAKER}: 0"
 
 
-async def test_somebody_off_the_roster_is_added_when_they_earn_something(
-    speech, speaker, credits
-):
+async def test_somebody_off_the_roster_is_not_on_the_board(speech, speaker, credits):
+    """A Discord nickname its owner can set to anything does not go in a topic."""
     tool = _tool(speaker, users=ROSTER)
 
     await _hear(tool, FORBIDDEN, user=STRANGER, user_id=STRANGER_ID)
 
-    assert f"{STRANGER}: 1" in credits.topic(SERVER_ALIAS)
+    assert STRANGER not in credits.topic(SERVER_ALIAS)
+
+
+async def test_somebody_off_the_roster_is_still_fined(speech, speaker, credits):
+    """Ineligible for the board is not the same as unwatched."""
+    tool = _tool(speaker, users=ROSTER)
+
+    await _hear(tool, FORBIDDEN, user=STRANGER, user_id=STRANGER_ID)
+
+    assert credits.total(SERVER_ALIAS, STRANGER_ID) == -1
+
+
+async def test_somebody_off_the_roster_is_still_announced(speech, speaker):
+    tool = _tool(speaker, users=ROSTER)
+
+    await _hear(tool, FORBIDDEN, user=STRANGER, user_id=STRANGER_ID)
+
+    assert speech.asked[0].startswith(STRANGER)
 
 
 async def test_two_servers_keep_their_own_tallies(speech, speaker, credits):
@@ -471,8 +566,8 @@ async def test_two_servers_keep_their_own_tallies(speech, speaker, credits):
     await _hear(here, FORBIDDEN)
     await _hear(elsewhere, f"{FORBIDDEN} {ALSO_FORBIDDEN}")
 
-    assert credits.total(SERVER_ALIAS, SPEAKER_ID) == 1
-    assert credits.total(OTHER_SERVER_ALIAS, SPEAKER_ID) == 2
+    assert credits.total(SERVER_ALIAS, SPEAKER_ID) == -1
+    assert credits.total(OTHER_SERVER_ALIAS, SPEAKER_ID) == -2
 
 
 # ── the backoff ───────────────────────────────────
@@ -494,8 +589,8 @@ async def test_each_violation_takes_the_next_announcement_down(speech, speaker):
     assert speaker.scales == pytest.approx(
         [
             UNITY_VOLUME,
-            UNITY_VOLUME - BACKOFF_PER_VIOLATION,
-            UNITY_VOLUME - BACKOFF_PER_VIOLATION * 2,
+            UNITY_VOLUME - BACKOFF_STEP,
+            UNITY_VOLUME - BACKOFF_STEP * 2,
         ]
     )
 
@@ -507,7 +602,7 @@ async def test_every_word_in_an_utterance_counts_toward_the_backoff(speech, spea
     await _hear(tool, f"{FORBIDDEN} {FORBIDDEN} {ALSO_FORBIDDEN}")
     await _hear(tool, FORBIDDEN)
 
-    assert speaker.scales[1] == pytest.approx(UNITY_VOLUME - BACKOFF_PER_VIOLATION * 3)
+    assert speaker.scales[1] == pytest.approx(UNITY_VOLUME - BACKOFF_STEP * 3)
 
 
 async def test_one_speaker_backing_off_does_not_quieten_another(speech, speaker):
@@ -544,7 +639,7 @@ def test_a_violation_stops_counting_once_the_window_has_passed():
 
     recent.record(SPEAKER_ID, 1, now=now)
 
-    assert recent.scale(SPEAKER_ID, now=now + VIOLATION_WINDOW_SECONDS + 1) == UNITY_VOLUME
+    assert recent.scale(SPEAKER_ID, now=now + BACKOFF_WINDOW + 1) == UNITY_VOLUME
 
 
 def test_a_violation_inside_the_window_still_counts():
@@ -553,7 +648,7 @@ def test_a_violation_inside_the_window_still_counts():
 
     recent.record(SPEAKER_ID, 1, now=now)
 
-    assert recent.count(SPEAKER_ID, now=now + VIOLATION_WINDOW_SECONDS - 1) == 1
+    assert recent.count(SPEAKER_ID, now=now + BACKOFF_WINDOW - 1) == 1
 
 
 def test_a_speaker_who_has_aged_out_is_forgotten_entirely():
@@ -562,9 +657,185 @@ def test_a_speaker_who_has_aged_out_is_forgotten_entirely():
     now = 1_000.0
     recent.record(SPEAKER_ID, 1, now=now)
 
-    recent.count(SPEAKER_ID, now=now + VIOLATION_WINDOW_SECONDS + 1)
+    recent.count(SPEAKER_ID, now=now + BACKOFF_WINDOW + 1)
 
     assert SPEAKER_ID not in recent._seen
+
+
+def test_the_backoff_reads_its_step_and_window_from_the_deployment():
+    """Both are environment settings; nothing in the tool carries a number."""
+    recent = RecentViolations()
+
+    assert recent._step == morality_cfg.backoff_step
+    assert recent._window == morality_cfg.backoff_seconds
+
+
+# ── the repeat wording ────────────────────────────
+
+
+async def test_a_first_fine_is_announced_in_full(speech, speaker):
+    await _hear(_tool(speaker), FORBIDDEN)
+
+    assert "you are fined" in speech.asked[0]
+
+
+async def test_a_second_fine_in_quick_succession_says_also(speech, speaker):
+    """Reading the whole sentence again sounds like a bot that lost track."""
+    tool = _tool(speaker)
+
+    await _hear(tool, FORBIDDEN)
+    await _hear(tool, FORBIDDEN)
+
+    assert "you are also fined" in speech.asked[1]
+
+
+async def test_the_repeat_wording_is_per_speaker(speech, speaker):
+    tool = _tool(speaker)
+
+    await _hear(tool, FORBIDDEN)
+    await _hear(tool, FORBIDDEN, user=OTHER_SPEAKER, user_id=OTHER_SPEAKER_ID)
+
+    assert "you are also fined" not in speech.asked[1]
+
+
+async def test_the_repeat_announcement_can_be_overridden(speech, speaker):
+    tool = _tool(
+        speaker,
+        {"words": WORDS, "repeat_announcement": "{user}, again? {credits}"},
+    )
+
+    await _hear(tool, FORBIDDEN)
+    await _hear(tool, FORBIDDEN)
+
+    assert speech.asked[1] == f"{SPEAKER}, again? 1 credit"
+
+
+async def test_a_repeat_announcement_with_an_unfillable_placeholder_will_not_start(
+    speech, speaker
+):
+    with pytest.raises(ValueError, match="repeat_announcement"):
+        _tool(speaker, {"words": WORDS, "repeat_announcement": "{user} owes {tally}"})
+
+
+async def test_the_repeat_announcement_is_optional(speech, speaker):
+    assert _tool(speaker)._repeat_announcement == DEFAULT_REPEAT_ANNOUNCEMENT
+
+
+def test_a_speaker_who_has_just_been_fined_is_repeating():
+    recent = RecentViolations()
+    now = 1_000.0
+
+    recent.record(SPEAKER_ID, 1, now=now)
+
+    assert recent.repeating(SPEAKER_ID, REPEAT_WINDOW, now=now + REPEAT_WINDOW - 1)
+
+
+def test_a_speaker_fined_a_while_ago_is_not_repeating():
+    """Past the window it is a fresh offence, and gets the whole sentence again."""
+    recent = RecentViolations()
+    now = 1_000.0
+
+    recent.record(SPEAKER_ID, 1, now=now)
+
+    assert not recent.repeating(SPEAKER_ID, REPEAT_WINDOW, now=now + REPEAT_WINDOW + 1)
+
+
+def test_a_speaker_who_has_never_been_fined_is_not_repeating():
+    assert not RecentViolations().repeating(SPEAKER_ID, REPEAT_WINDOW)
+
+
+def test_a_repeat_window_of_zero_turns_the_second_wording_off():
+    recent = RecentViolations()
+    now = 1_000.0
+    recent.record(SPEAKER_ID, 1, now=now)
+
+    assert not recent.repeating(SPEAKER_ID, 0.0, now=now)
+
+
+# ── the busy channel ──────────────────────────────
+
+
+async def _mid_announcement(speech) -> tuple[VerbalMorality, BlockingSpeaker, asyncio.Task]:
+    """A tool with an announcement playing and the channel held open."""
+    speaker = BlockingSpeaker()
+    tool = _tool(speaker)
+    playing = asyncio.create_task(_hear(tool, FORBIDDEN))
+    await speaker.playing.wait()
+
+    return tool, speaker, playing
+
+
+async def test_a_violation_during_an_announcement_is_not_announced(speech):
+    """Queueing them would read the channel fines for things it has moved on from."""
+    tool, speaker, playing = await _mid_announcement(speech)
+
+    await _hear(tool, FORBIDDEN, user=OTHER_SPEAKER, user_id=OTHER_SPEAKER_ID)
+
+    speaker.finish.set()
+    await playing
+
+    assert len(speaker.played) == 1
+
+
+async def test_a_violation_during_an_announcement_is_not_even_rendered(speech):
+    """Nothing is going to play it; paying a synthesizer for it would be waste."""
+    tool, speaker, playing = await _mid_announcement(speech)
+
+    await _hear(tool, FORBIDDEN, user=OTHER_SPEAKER, user_id=OTHER_SPEAKER_ID)
+
+    speaker.finish.set()
+    await playing
+
+    assert len(speech.asked) == 1
+
+
+async def test_a_violation_during_an_announcement_is_still_fined(speech, credits):
+    """What somebody owes is not a function of whether they were told about it."""
+    tool, speaker, playing = await _mid_announcement(speech)
+
+    await _hear(tool, FORBIDDEN, user=OTHER_SPEAKER, user_id=OTHER_SPEAKER_ID)
+
+    speaker.finish.set()
+    await playing
+
+    assert credits.total(SERVER_ALIAS, OTHER_SPEAKER_ID) == -1
+
+
+async def test_a_violation_during_an_announcement_still_counts_toward_the_backoff(
+    speech,
+):
+    tool, speaker, playing = await _mid_announcement(speech)
+    await _hear(tool, FORBIDDEN, user=OTHER_SPEAKER, user_id=OTHER_SPEAKER_ID)
+    speaker.finish.set()
+    await playing
+
+    await _hear(tool, FORBIDDEN, user=OTHER_SPEAKER, user_id=OTHER_SPEAKER_ID)
+
+    assert speaker.scales[-1] == pytest.approx(UNITY_VOLUME - BACKOFF_STEP)
+
+
+async def test_the_channel_is_free_again_once_an_announcement_ends(speech):
+    tool, speaker, playing = await _mid_announcement(speech)
+    speaker.finish.set()
+    await playing
+
+    await _hear(tool, FORBIDDEN, user=OTHER_SPEAKER, user_id=OTHER_SPEAKER_ID)
+
+    assert len(speaker.played) == 2
+
+
+async def test_a_speaker_that_raises_does_not_wedge_the_channel(speech, speaker):
+    """The flag has to come back down however the play went."""
+    tool = _tool(speaker)
+
+    async def refuse(source, audio, scale=UNITY_VOLUME) -> None:
+        raise RuntimeError("the channel is on fire")
+
+    speaker.play = refuse
+    with pytest.raises(RuntimeError):
+        await _hear(tool, FORBIDDEN)
+
+    assert not tool._announcing
 
 
 # ── the chime ─────────────────────────────────────
@@ -687,8 +958,12 @@ async def test_a_phrase_shorter_than_the_head_start_is_not_waited_on(speech):
 # ── the pre-warm ──────────────────────────────────
 
 
-def _wording(user: str, credits: str, violations: str) -> str:
-    return DEFAULT_ANNOUNCEMENT.format(user=user, credits=credits, violations=violations)
+def _wording(
+    user: str, credits: str, violations: str, repeat: bool = False
+) -> str:
+    template = DEFAULT_REPEAT_ANNOUNCEMENT if repeat else DEFAULT_ANNOUNCEMENT
+
+    return template.format(user=user, credits=credits, violations=violations)
 
 
 async def test_every_name_on_the_roster_is_warmed(speech, speaker):
@@ -711,9 +986,23 @@ async def test_a_speaker_is_warmed_for_one_two_and_three_violations(speech, spea
 
     assert speech.warmed == [
         _wording(SPEAKER, "1 credit", "a violation"),
+        _wording(SPEAKER, "1 credit", "a violation", REPEATED_FINE),
         _wording(SPEAKER, "2 credits", "multiple violations"),
+        _wording(SPEAKER, "2 credits", "multiple violations", REPEATED_FINE),
         _wording(SPEAKER, "3 credits", "multiple violations"),
+        _wording(SPEAKER, "3 credits", "multiple violations", REPEATED_FINE),
     ]
+
+
+async def test_the_repeat_wording_is_warmed_too(speech, speaker):
+    """A speaker who swears twice in five seconds should not wait for the second."""
+    tool = _tool(speaker, users={SPEAKER_ID: SPEAKER})
+    await tool.prewarm()
+
+    await _hear(tool, FORBIDDEN)
+    await _hear(tool, FORBIDDEN)
+
+    assert speech.asked[1] in speech.warmed
 
 
 async def test_a_warmed_announcement_is_exactly_what_gets_said(speech, speaker):
@@ -729,13 +1018,18 @@ async def test_a_warmed_announcement_is_exactly_what_gets_said(speech, speaker):
 async def test_a_custom_announcement_is_what_is_warmed(speech, speaker):
     tool = _tool(
         speaker,
-        {"words": WORDS, "announcement": "language, {user}"},
+        {
+            "words": WORDS,
+            "announcement": "language, {user}",
+            "repeat_announcement": "language again, {user}",
+        },
         users={SPEAKER_ID: SPEAKER},
     )
 
     await tool.prewarm()
 
-    assert speech.warmed == [f"language, {SPEAKER}"] * WARMED_PER_SPEAKER
+    assert len(speech.warmed) == WARMED_PER_SPEAKER
+    assert set(speech.warmed) == {f"language, {SPEAKER}", f"language again, {SPEAKER}"}
 
 
 async def test_a_speaker_who_is_not_on_the_roster_is_not_warmed(speech, speaker):

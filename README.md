@@ -184,7 +184,7 @@ A tool is only reachable from configuration once it is registered in `tools/regi
 
 ### verbal-morality
 
-The Verbal Morality Bot, after *Demolition Man*. It listens for words the server has decided against and, on hearing one, announces the fine out loud in the channel it was said in. The credits are imaginary but they are added up: the tally goes in the voice channel topic, and survives a restart.
+The Verbal Morality Bot, after *Demolition Man*. It listens for words the server has decided against and, on hearing one, announces the fine out loud in the channel it was said in. The credits are imaginary but they are counted: a fine comes off a balance that starts at nothing, the standings go in the voice channel topic, and they survive a restart.
 
 ```yaml
 verbal-morality:
@@ -192,6 +192,7 @@ verbal-morality:
   config:
     words: [fiddlestick, poppycock]
     announcement: "{user}, you are fined {credits} for {violations} of the verbal morality statute."
+    repeat_announcement: "{user}, you are also fined {credits} for {violations} of the verbal morality statute."
     chime: chime.wav
 ```
 
@@ -199,9 +200,10 @@ verbal-morality:
 |---|---|---|
 | `words` | yes | Stems of what the server objects to. A lone one may be written unquoted rather than as a list |
 | `announcement` | no | What gets said. `{user}`, `{credits}`, and `{violations}` are the placeholders |
+| `repeat_announcement` | no | Said instead when the same speaker is fined again inside `REPEAT_FINE_SECONDS`. Same placeholders |
 | `chime` | no | A WAV in the speech cache directory, played ahead of the announcement |
 
-`announcement` defaults to the line above, which the tool carries, so a server that wants the default can leave it out. A template with a placeholder nothing fills is rejected at startup rather than at the moment someone swears.
+Both templates default to the lines above, which the tool carries, so a server that wants the defaults can leave them out. A template with a placeholder nothing fills is rejected at startup rather than at the moment someone swears, and the error names which of the two it was.
 
 The name is the one the transcript uses — the roster name from `users` where a server has set one, the Discord display name otherwise — so nothing has to be configured twice.
 
@@ -211,9 +213,17 @@ Expansion is English spelling rather than a dictionary: a final consonant double
 
 Matching is **whole words, case-insensitive**. A substring match fines the innocent, and the canonical example, Scunthorpe, is a place people live.
 
-**The fine scales with the utterance**: one credit per forbidden word in it, so three of them is `3 credits` and one is `1 credit`. The count is filled into `{credits}` already pluralized, as a numeral — every synthesizer worth pointing this at reads `3` as a number, and `1 credits` is wrong in a way a listener hears. `{violations}` agrees with it, reading `a violation` for one and `multiple violations` for more, so the sentence is not left saying "fined 3 credits for a violation". It is a phrase rather than a second count: the number is already in the fine, and saying it twice makes the announcement sound like an invoice. What does not scale is the number of announcements: three violations earn one, because three announcements over the top of each other is a denial of service on the channel. Two people swearing at once are fined one after the other.
+**The fine scales with the utterance**: one credit per forbidden word in it, so three of them is `3 credits` and one is `1 credit`. The count is filled into `{credits}` already pluralized, as a numeral — every synthesizer worth pointing this at reads `3` as a number, and `1 credits` is wrong in a way a listener hears. What a credit is *called* is `CREDIT_CURRENCY`, and the plural is grown from it by the same spelling rules the word list uses, so `penny` announces as `2 pennies` and no deployment can end up fining anybody `2 pennys`. `{violations}` agrees with the count, reading `a violation` for one and `multiple violations` for more, so the sentence is not left saying "fined 3 credits for a violation". It is a phrase rather than a second count: the number is already in the fine, and saying it twice makes the announcement sound like an invoice.
 
-**The tally goes in the voice channel topic**, as `Eli: 0 Erik: 0 Luke: 0 Ryan: 0`, which makes the topic the scoreboard — visible without asking the bot anything. Everyone in `users` starts on it at nothing owed, so a channel says who is being watched before anybody has sworn; somebody not on the roster is added under whatever Discord reports the first time they earn something. It is ordered by name rather than by what is owed: a leaderboard is the more natural read but rearranges itself every time somebody passes somebody else, and a topic that moves is one nobody can scan to find themselves. A tally too long for Discord's 1024 characters is cut on an entry boundary rather than mid-number.
+What does not scale is the number of announcements. Three violations in one utterance earn one, because three announcements over the top of each other is a denial of service on the channel. **A violation earned while an announcement is playing is counted and not announced at all** — the speaker plays one clip at a time and returns when it is finished, so the alternative is a queue, and a channel where three people swear over each other would spend the next minute being read fines for things it has moved on from. The tally is charged either way: what somebody owes is not a function of whether they were told about it.
+
+**Being fined twice in a row is worded differently.** A speaker fined again inside `REPEAT_FINE_SECONDS` gets `repeat_announcement` — "you are *also* fined" — because reading the whole sentence out again sounds like a bot that has lost track of what it just said. It is per speaker: somebody else swearing in the meantime does not make their first fine a repeat. Both wordings are pre-rendered, so the second one does not cost a synthesizer round trip at the moment it is needed.
+
+**The standings go in the voice channel topic**, as `Eli: -9 Erik: -2 Luke: -1 Ryan: 0`, which makes the topic the scoreboard — visible without asking the bot anything. A fine is a **debit**: everybody starts at nothing and goes down, so the number beside a name reads as what swearing has cost them rather than as points collected.
+
+The board holds the **four furthest into the red, worst first**. A leaderboard rearranges itself every time somebody passes somebody else, which is the objection to publishing a whole roster in name order; at four places it is short enough to read at a glance, and who is winning is the thing worth reading. Ties break on the name, so two people on the same balance do not swap places between one edit and the next for no reason anybody can see.
+
+**Only `users` are eligible for the board.** Everyone on the roster starts on it at nothing spent, so a channel says who is being watched before anybody has sworn. Somebody the server never wrote down is still heard, still announced, and still fined under whatever Discord reports — they are simply not published, because a display name its owner can set to anything is not something to put in a channel topic through this. Adding them to `users` puts them on the board with whatever balance they had already run up. A board too long for Discord's 1024 characters is cut on an entry boundary rather than mid-number; four ordinary names never reach it, and the guard is there because nothing stops somebody trying.
 
 Counts are **per server**. The same person swearing in two servers owes two separate debts, because a server's words are its own business and so is what they cost. Identity is the user ID and the name is only what gets printed, so a rename does not hand somebody else's debt to whoever inherited their nickname.
 
@@ -225,11 +235,11 @@ The **status is not set on every fine.** Both the write and the edit are driven 
 
 A request Discord **refuses** — a `400`, or a missing permission — is not retried, because retrying it every interval would spend the channel's rate limit on an answer that cannot change. A tally that then changes is published anyway, since what was refused was that text and the next text is not that text. Every failure is logged with the string it was trying to set, because a rejection caused by a name in the tally cannot be diagnosed from the fact of it.
 
-**A repeat offender is announced more quietly.** Being fined is the joke, and the joke told fifteen times in five minutes is a denial of service on the conversation. Every violation inside a five-minute sliding window takes 5% off the next announcement, down to `VIOLATION_VOLUME_FLOOR` — a quarter of `PLAYBACK_VOLUME` by default, or silence if a server sets it to `0`. The first swear in five minutes is announced at full volume: the backoff is for saying it again. Each forbidden word counts, on the same terms as the fine, so four in a sentence is four steps down however few announcements it took to say so. The window is per speaker and per server, held in memory only — five minutes after their last violation somebody is back to full volume, and a restart forgives whatever backoff they had earned. What it does **not** affect is the tally: what somebody owes is not a function of how loudly they were told about it.
+**A repeat offender is announced more quietly.** Being fined is the joke, and the joke told fifteen times in five minutes is a denial of service on the conversation. Every violation inside a sliding `VOLUME_BACKOFF_DURATION` takes `VOLUME_BACKOFF_PERCENT` off the next announcement, down to `VIOLATION_VOLUME_FLOOR` — at the defaults, 5% a violation over five minutes, floored at a quarter of `PLAYBACK_VOLUME`, so fifteen of them reach the bottom. `0` for the percent takes nothing off and turns the backoff off; `0` for the floor silences a repeat offender outright. The first swear in a window is announced at full volume: the backoff is for saying it again. Each forbidden word counts, on the same terms as the fine, so four in a sentence is four steps down however few announcements it took to say so. The window is per speaker and per server, held in memory only — a `VOLUME_BACKOFF_DURATION` after their last violation somebody is back to full volume, and a restart forgives whatever backoff they had earned. What it does **not** affect is the tally: what somebody owes is not a function of how loudly they were told about it.
 
-**The announcements are rendered at startup.** The roster is known before anybody speaks and so is the shape of the sentence, so on the way up the tool synthesizes every name in `users` against one, two, and three violations and leaves the results in the speech cache. Synthesis is the slow part of answering; paying for it before anyone is waiting is what lets the fine land while the offence is still what the channel is talking about. It happens in the background, one phrase at a time — the bot is in the channel and listening while it runs, and a synthesizer asked for a hundred phrases at once is one that is not answering whoever is speaking right now.
+**The announcements are rendered at startup.** The roster is known before anybody speaks and so is the shape of the sentence, so on the way up the tool synthesizes every name in `users` against one, two, and three violations, in both the first-fine and the repeat wording, and leaves the results in the speech cache. Synthesis is the slow part of answering; paying for it before anyone is waiting is what lets the fine land while the offence is still what the channel is talking about. It happens in the background, one phrase at a time — the bot is in the channel and listening while it runs, and a synthesizer asked for a hundred phrases at once is one that is not answering whoever is speaking right now.
 
-Three violations because that is what a sentence usually holds; a fourth is remarkable enough to wait for the synthesizer. Anything already cached, from an earlier run or a real fine, is left alone rather than rendered again. What cannot be warmed is anyone **not** on the roster: they are announced under whatever Discord reports, which is not knowable at startup and not a closed set, so they pay for their first fine and nobody pays for it again. Warming also does not count as playing, so a pre-rendered announcement nobody ever earns ages out of the cache on the usual terms and is warmed again at the next startup.
+Three violations because that is what a sentence usually holds; a fourth is remarkable enough to wait for the synthesizer. Anything already cached, from an earlier run or a real fine, is left alone rather than rendered again — including the second wording where a server has set both templates to the same string. What cannot be warmed is anyone **not** on the roster: they are announced under whatever Discord reports, which is not knowable at startup and not a closed set, so they pay for their first fine and nobody pays for it again. Warming also does not count as playing, so a pre-rendered announcement nobody ever earns ages out of the cache on the usual terms and is warmed again at the next startup.
 
 `chime` is resolved **inside** `TTS_CACHE_DIR` — a bare name, or a path below it; anything that climbs out is refused at startup. It must be a **16-bit WAV**, at any sample rate and in mono or stereo, both of which are converted on the way in. WAV rather than MP3 because playing audio without ffmpeg is the point of this path, and nothing in the image can decode anything else. The clip is read once, kept for the life of the process, and never evicted to make room for a phrase. A chime that is missing or will not parse is reported and costs the chime, not the announcement.
 
@@ -313,8 +323,12 @@ Only used by `verbal-morality`, which is the only thing that fines anybody. A de
 | Variable | Default | Purpose |
 |---|---|---|
 | `CREDITS_FILE` | `/credits/credits.json` | The running tally, as JSON. Mount a volume at its directory to keep what everybody owes across restarts |
+| `CREDIT_CURRENCY` | `credit` | What a fine is denominated in, in the singular. The plural is grown from it by the spelling, so `penny` announces as `2 pennies`. Wording only — it changes nothing about what is counted |
 | `CREDITS_SAVE_SECONDS` | `5.0` | How often a changed tally is written to disk. `0`, or any value below it, keeps the tally in memory and writes it only on shutdown |
 | `CREDITS_TOPIC_SECONDS` | `10.0` | How often a changed tally is published to the voice channel topic — set as the channel **status**, a voice channel having no topic. `0`, or any value below it, keeps the tally off the channel entirely |
+| `REPEAT_FINE_SECONDS` | `5.0` | How soon after being fined the same speaker is told they are "also fined" rather than hearing the whole sentence again. `0`, or any value below it, turns the second wording off |
+| `VOLUME_BACKOFF_DURATION` | `300.0` | The sliding window a violation counts for against how loudly the next one is announced |
+| `VOLUME_BACKOFF_PERCENT` | `5` | How much each violation inside that window takes off the next announcement. `0` takes nothing off, turning the backoff off; anything above `100` reaches the floor on the first repeat, and anything negative is treated as `0` rather than made louder |
 | `VIOLATION_VOLUME_FLOOR` | `0.25` | The quietest a fine is announced, as a fraction of `PLAYBACK_VOLUME`, once a speaker has earned the full backoff. `0` silences a repeat offender entirely; `1` turns the backoff off |
 
 ### Transcripts
@@ -366,7 +380,7 @@ Removed outright: the multiprocessing layer and its queues, the STT health-check
 
 Kept intact because they are the non-obvious part: `stt/user_state.py`'s per-user VAD state machine with stale-speech flushing, and `audio/ring_buffer.py`'s pre-roll buffer, which is what stops the first syllable being clipped.
 
-Added: `AUTOJOIN`, `RETENTION_DAYS`, `TRANSCRIPT_DIR`, `TZ`, `SESSION_RESUME_SECONDS`, `WYOMING_HOST`, `WYOMING_PORT`, `MAX_CONCURRENT_TRANSCRIPTIONS`, `PLAYBACK_VOLUME`, `CREDITS_FILE`, `CREDITS_SAVE_SECONDS`, `CREDITS_TOPIC_SECONDS`, `VIOLATION_VOLUME_FLOOR`, and every `TTS_*`.
+Added: `AUTOJOIN`, `RETENTION_DAYS`, `TRANSCRIPT_DIR`, `TZ`, `SESSION_RESUME_SECONDS`, `WYOMING_HOST`, `WYOMING_PORT`, `MAX_CONCURRENT_TRANSCRIPTIONS`, `PLAYBACK_VOLUME`, `CREDITS_FILE`, `CREDIT_CURRENCY`, `CREDITS_SAVE_SECONDS`, `CREDITS_TOPIC_SECONDS`, `REPEAT_FINE_SECONDS`, `VOLUME_BACKOFF_DURATION`, `VOLUME_BACKOFF_PERCENT`, `VIOLATION_VOLUME_FLOOR`, and every `TTS_*`.
 
 > **Note on the vendored VAD model.** Silero v5's ONNX graph scores the current frame *together with* the trailing 64 samples of the previous one. Fed a bare 512-sample frame it does not error — it silently returns near-zero probability on unmistakable speech, and the bot transcribes nothing. `stt/vad.py` carries that context between calls, and `tests/test_vad.py` guards it with real speech; silence-based tests pass either way and will not catch a regression.
 
@@ -395,7 +409,7 @@ miss-quote/
 │   └── models/
 │       └── silero_vad.onnx    # Vendored (~2 MB)
 ├── ledger/
-│   └── credits.py             # What everybody owes, per server
+│   └── credits.py             # What everybody has left, per server
 ├── tools/
 │   ├── base.py                # What a tool is: the two optional handlers, and a speaker
 │   ├── registry.py            # Tool names a config file can switch on
