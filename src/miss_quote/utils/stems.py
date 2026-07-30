@@ -28,6 +28,26 @@ SYLLABLE_VOWELS = VOWELS | {"y"}
 # It is "boxed" and "flowed", never "boxxed" or "flowwed".
 NEVER_DOUBLED = frozenset("wxy")
 
+# Words that carry their doubling into a compound: "dipshit" takes
+# "dipshitting" the way "shit" takes "shitting".
+#
+# English doubles before a vowel-initial suffix when the stress falls on the
+# final syllable, and a compound keeps the stress of the word it ends with.
+# `_syllables` stands in for stress everywhere else here, and for a compound it
+# gives the wrong answer — which is why these are named rather than derived.
+#
+# Nothing structural can tell them apart. "dipshit" splits as "dip" + "shit" and
+# "bugger" splits as "bug" + "ger" with the same shape, so a rule that doubles
+# the first doubles the second and produces "buggerred". The difference is that
+# "shit" is a word and "ger" is not, which needs a dictionary this does not have.
+#
+# Add to this when a server's list grows a compound that conjugates wrong. Only
+# an entry that doubles on its own does anything, so "fuck" and "ass" would be
+# inert here: they end in a consonant cluster and never doubled to begin with.
+COMPOUND_ENDINGS = frozenset(
+    {"shit", "wit", "bag", "hat", "nut", "wad", "git", "prat", "twat"}
+)
+
 PLURAL = "s"
 SIBILANT_PLURAL = "es"
 SIBILANT_ENDINGS = ("s", "x", "z", "ch", "sh")
@@ -148,8 +168,16 @@ def _doubles(stem: str) -> bool:
     falls rather than how many syllables there are; nothing here knows, and the
     syllable count stands in for it, which is right for the single-syllable
     words this is mostly pointed at.
+
+    Where it is wrong is a compound, which keeps the stress of the word it ends
+    with however many syllables that leaves: "dipshit" is two and still takes
+    "dipshitting". Those are named in `COMPOUND_ENDINGS` rather than worked out,
+    for the reason given there.
     """
-    if len(stem) < SHORTEST_DOUBLE or _syllables(stem) != ONE_SYLLABLE:
+    if len(stem) < SHORTEST_DOUBLE:
+        return False
+
+    if _syllables(stem) != ONE_SYLLABLE and not _compound(stem):
         return False
 
     last, vowel, before = stem[-1], stem[-2], stem[-3]
@@ -160,6 +188,11 @@ def _doubles(stem: str) -> bool:
         and _vowel(vowel)
         and not _vowel(before)
     )
+
+
+def _compound(stem: str) -> bool:
+    """Whether a stem ends in a word that doubles on its own."""
+    return any(stem.endswith(ending) for ending in COMPOUND_ENDINGS)
 
 
 def _syllables(word: str) -> int:

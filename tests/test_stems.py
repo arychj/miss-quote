@@ -121,3 +121,52 @@ def test_a_sibilant_takes_es():
 
 def test_a_stem_of_two_words_is_suffixed_at_the_end():
     assert "god damning" in _expand("god damn")
+
+
+# ── compounds ─────────────────────────────────────
+
+
+def test_a_compound_doubles_the_way_the_word_it_ends_with_does():
+    """
+    "dipshit" is two syllables and still takes "dipshitting".
+
+    The syllable count stands in for stress everywhere else, and a compound is
+    where that substitution gets it wrong: the stress goes with the word on the
+    end.
+    """
+    grown = _expand("dipshit")
+
+    assert {"dipshitting", "dipshitter", "dipshitted"} <= grown
+    assert "dipshiting" not in grown
+
+
+def test_the_compound_still_pluralizes_without_doubling():
+    """Nothing doubles before a plural `s`, compound or not."""
+    assert "dipshits" in _expand("dipshit")
+    assert "dipshitts" not in _expand("dipshit")
+
+
+def test_the_word_on_the_end_is_what_decides():
+    assert "bullshitting" in _expand("bullshit")
+    assert "horseshitter" in _expand("horseshit")
+    assert "asshatting" in _expand("asshat")
+    assert "fuckwitted" in _expand("fuckwit")
+    assert "scumbagging" in _expand("scumbag")
+
+
+def test_a_longer_stem_that_is_not_a_compound_still_does_not_double():
+    """The counterexamples any fix here has to keep working."""
+    assert "buggering" in _expand("bugger")
+    assert "buggerring" not in _expand("bugger")
+
+    assert "visiting" in _expand("visit")
+    assert "visitting" not in _expand("visit")
+
+    assert "offering" in _expand("offer")
+    assert "offerring" not in _expand("offer")
+
+
+def test_a_compound_ending_that_never_doubled_alone_changes_nothing():
+    """`fuck` ends in a cluster, so a compound ending in it doubles nothing."""
+    assert "clusterfucking" in _expand("clusterfuck")
+    assert "clusterfuckking" not in _expand("clusterfuck")
