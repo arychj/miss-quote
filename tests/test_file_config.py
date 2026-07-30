@@ -274,6 +274,40 @@ def test_a_tool_whose_config_is_not_a_mapping_is_reported(monkeypatch, tmp_path)
     assert cfg.problems
 
 
+def test_a_setting_written_outside_config_is_reported(monkeypatch, tmp_path):
+    """
+    The quiet failure this catches.
+
+    A setting beside 'enabled' rather than under 'config' is read by nothing.
+    Without a line at startup the tool runs on its defaults against a file that
+    plainly asks for something else, and there is nowhere to go and look.
+    """
+    cfg = _load(
+        monkeypatch,
+        tmp_path,
+        f"servers:\n  {FIRST_SERVER}:\n    alias: first-server\n"
+        f"    tools:\n      {TOOL}:\n        enabled: true\n"
+        f"        penalize_self_answers: false\n",
+    )
+
+    assert cfg.tools_for(FIRST_SERVER)[TOOL].enabled is True
+    assert any("penalize_self_answers" in problem for problem in cfg.problems)
+    assert any("'config'" in problem for problem in cfg.problems)
+
+
+def test_a_tool_saying_only_what_it_should_is_reported_on_nothing(monkeypatch, tmp_path):
+    cfg = _load(
+        monkeypatch,
+        tmp_path,
+        f"servers:\n  {FIRST_SERVER}:\n    alias: first-server\n"
+        f"    tools:\n      {TOOL}:\n        enabled: true\n"
+        f"        config:\n          penalize_self_answers: false\n",
+    )
+
+    assert cfg.tools_for(FIRST_SERVER)[TOOL].config == {"penalize_self_answers": False}
+    assert cfg.problems == ()
+
+
 def test_a_malformed_tool_does_not_cost_the_server(monkeypatch, tmp_path):
     cfg = _load(
         monkeypatch,
