@@ -14,9 +14,11 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from tools.base import Tool
+from tools.quotes import Quotes
 from tools.verbal_morality import VerbalMorality
 
 TOOLS: Mapping[str, type[Tool]] = {
+    Quotes.name: Quotes,
     VerbalMorality.name: VerbalMorality,
 }
 

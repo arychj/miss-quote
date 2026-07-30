@@ -182,6 +182,45 @@ Failures are contained. A tool that raises is logged and otherwise invisible: it
 
 A tool is only reachable from configuration once it is registered in `tools/registry.py`, which keeps the set of names a config file can switch on a closed list rather than whatever happens to be importable. A name nothing answers to is reported at startup and skipped.
 
+### quotes
+
+Answers the channel with the film line it just walked into. It listens for a trigger phrase and, on hearing one, says the associated quote out loud where it was said.
+
+```yaml
+quotes:
+  enabled: true
+```
+
+There is nothing to configure per server. The pairs come from a CSV at `QUOTES_FILE` — a film, the phrase that sets it off, and the line — so adding a quote is a row rather than a deployment, and a film everybody in one channel has seen is one everybody in the next has too. The image ships the list in `resources/quotes.csv`; mount your own over that path to say something it does not.
+
+```csv
+movie,trigger,quote
+Firefly,cool,Shiny.
+Firefly,behave,I aim to misbehave.
+The Princess Bride,impossible,Inconceivable!
+Project Hail Mary,question,{user} question is dumb.
+```
+
+| Column | Purpose |
+|---|---|
+| `movie` | Where the line is from. Never spoken; it is what makes the log and the file readable |
+| `trigger` | The phrase that sets the line off. Matched whole and case-insensitively, however the file writes it |
+| `quote` | What gets said. `{user}` is the only placeholder, and names whoever set it off |
+
+**One trigger per row, and a line may be reached by more than one of them.** Two rows sharing an answer is how the file says that two phrases deserve the same reply — `awesome` and `cool` both earn `Shiny.`. There is no alternation syntax inside a trigger: a trigger is matched as written, so a row meaning to catch two phrases has to be two rows.
+
+Rows are read at startup and the file **reports rather than raises**. A row with no trigger or no line, or a line carrying a placeholder nothing fills, is logged with its line number and dropped — one typo in fifty rows should cost that row. A trigger a later row repeats is dropped the same way, with the first answer kept. What *does* stop the tool from starting is a file that is missing, unreadable, has no `movie,trigger,quote` header, or holds no usable row at all: listening for nothing is enabled and useless, which is worth a line at startup instead of silence forever.
+
+Matching is **whole words, case-insensitive**, so `real` does not fire inside `really`. Several triggers are phrases rather than words, and a phrase matches on a single space between its words, which is what an ASR transcript holds.
+
+**One line per utterance**, however many triggers were in the sentence: two quotes over the top of each other is a denial of service on the channel, and the pause while the second one plays has outlasted the joke either way. The one that answers is the **earliest in the sentence** rather than the first in the file, since that is the one whoever spoke arrived at. Where two triggers start at the same word the longer wins — `case of the mondays` is in the list precisely because it deserves a different answer from `monday`.
+
+**A trigger that has just fired goes quiet for `QUOTE_BACKOFF_SECONDS`**, five minutes by default. The joke is the recognition, and a channel that says "cool" four times in a minute does not want "Shiny." four times back. `0` answers every trigger every time, for a deployment that wants that. The window is keyed on the **trigger**, not the speaker and not the line: what wears out is the phrase, so two people arriving at the same word inside five minutes hear one answer, while two rows that share a line cool down separately. A trigger on backoff does not swallow a live one later in the same sentence — the earliest trigger that is still fresh is the one that answers. The window is per server and held in memory only, so two channels arriving at the same line have each made the joke once, and a restart forgives every backoff.
+
+`{user}` is filled with the name the transcript uses — the roster name from `users` where a server has set one, the Discord display name otherwise — so nothing has to be configured twice.
+
+**The whole list is rendered at startup.** Unlike a fine, a quote is knowable in full before anybody speaks: the triggers are a closed set and so are the answers, so on the way up the tool synthesizes every line in the file and leaves the results in the speech cache. A callback that arrives four seconds after the line it answers is not a callback. The exception is a line naming whoever set it off, which is rendered once per name on the roster; somebody the server has not written down waits for the synthesizer the first time, and nobody waits again. Warming happens in the background, one phrase at a time, and anything already cached is left alone.
+
 ### verbal-morality
 
 The Verbal Morality Bot, after *Demolition Man*. It listens for words the server has decided against and, on hearing one, announces the fine out loud in the channel it was said in. The credits are imaginary but they are counted: a fine comes off a balance that starts at nothing, the standings go in the voice channel topic, and they survive a restart.
@@ -316,6 +355,15 @@ Only used by tools that answer out loud. A deployment with no such tool enabled 
 | `TTS_CACHE_ENTRIES` | `256` | Clips held in memory before the least recently used is retired |
 | `TTS_CACHE_RETENTION_DAYS` | `90` | Days a rendered clip survives on disk without being played, counted from the last time it was. Any value below `1` keeps them forever; clips left there by hand are never reaped |
 
+### Quotes
+
+Only used by `quotes`. A deployment with it disabled never opens the file.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `QUOTES_FILE` | `/app/resources/quotes.csv` | The triggers and the lines they answer with, as a CSV of `movie,trigger,quote`. One list per deployment; the image ships the one in `resources/`, and mounting a file over that path replaces it |
+| `QUOTE_BACKOFF_SECONDS` | `300.0` | How long a trigger stays spent after it fires, so a channel that keeps saying the same word hears the line once. `0`, or any value below it, answers every trigger every time |
+
 ### Credits
 
 Only used by `verbal-morality`, which is the only thing that fines anybody. A deployment with it disabled never reads or writes the file, and never touches a channel topic.
@@ -380,7 +428,7 @@ Removed outright: the multiprocessing layer and its queues, the STT health-check
 
 Kept intact because they are the non-obvious part: `stt/user_state.py`'s per-user VAD state machine with stale-speech flushing, and `audio/ring_buffer.py`'s pre-roll buffer, which is what stops the first syllable being clipped.
 
-Added: `AUTOJOIN`, `RETENTION_DAYS`, `TRANSCRIPT_DIR`, `TZ`, `SESSION_RESUME_SECONDS`, `WYOMING_HOST`, `WYOMING_PORT`, `MAX_CONCURRENT_TRANSCRIPTIONS`, `PLAYBACK_VOLUME`, `CREDITS_FILE`, `CREDIT_CURRENCY`, `CREDITS_SAVE_SECONDS`, `CREDITS_TOPIC_SECONDS`, `REPEAT_FINE_SECONDS`, `VOLUME_BACKOFF_DURATION`, `VOLUME_BACKOFF_PERCENT`, `VIOLATION_VOLUME_FLOOR`, and every `TTS_*`.
+Added: `AUTOJOIN`, `RETENTION_DAYS`, `TRANSCRIPT_DIR`, `TZ`, `SESSION_RESUME_SECONDS`, `WYOMING_HOST`, `WYOMING_PORT`, `MAX_CONCURRENT_TRANSCRIPTIONS`, `PLAYBACK_VOLUME`, `CREDITS_FILE`, `CREDIT_CURRENCY`, `CREDITS_SAVE_SECONDS`, `CREDITS_TOPIC_SECONDS`, `REPEAT_FINE_SECONDS`, `VOLUME_BACKOFF_DURATION`, `VOLUME_BACKOFF_PERCENT`, `VIOLATION_VOLUME_FLOOR`, `QUOTES_FILE`, `QUOTE_BACKOFF_SECONDS`, and every `TTS_*`.
 
 > **Note on the vendored VAD model.** Silero v5's ONNX graph scores the current frame *together with* the trailing 64 samples of the previous one. Fed a bare 512-sample frame it does not error — it silently returns near-zero probability on unmistakable speech, and the bot transcribes nothing. `stt/vad.py` carries that context between calls, and `tests/test_vad.py` guards it with real speech; silence-based tests pass either way and will not catch a regression.
 
@@ -410,10 +458,13 @@ miss-quote/
 │       └── silero_vad.onnx    # Vendored (~2 MB)
 ├── ledger/
 │   └── credits.py             # What everybody has left, per server
+├── resources/
+│   └── quotes.csv             # Triggers and the film lines they answer with
 ├── tools/
 │   ├── base.py                # What a tool is: the two optional handlers, and a speaker
 │   ├── registry.py            # Tool names a config file can switch on
 │   ├── runner.py              # Per-server instances, dispatch, failure isolation
+│   ├── quotes.py              # Answers a trigger phrase with the line it belongs to
 │   └── verbal_morality.py     # Fines a speaker, out loud, for saying the wrong thing
 ├── transcript/
 │   └── writer.py              # Per-session JSONL appender + retention
