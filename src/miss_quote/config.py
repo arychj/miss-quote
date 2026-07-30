@@ -238,15 +238,12 @@ class TTSConfig:
     # the first chunk, as a synthesizer that streams as it renders wants.
     lead_ms: float = field(default_factory=lambda: _env_float("TTS_LEAD_MS", 500.0))
 
-    # Rendered speech, kept so a phrase is only ever synthesized once. An
-    # unwritable or unset directory costs the persistence, not the feature.
+    # Rendered speech, kept so a phrase is only ever synthesized once. The only
+    # place it is kept: an unwritable or unset directory means every phrase is
+    # synthesized again every time it is said.
     cache_directory: Path = field(
         default_factory=lambda: Path(_env_str("TTS_CACHE_DIR", "/cache/tts"))
     )
-
-    # Clips held in memory. The bound exists because what gets synthesized can
-    # include a speaker's Discord display name, and those are not a closed set.
-    cache_entries: int = field(default_factory=lambda: _env_int("TTS_CACHE_ENTRIES", 256))
 
     # How long a rendered clip survives on disk without being played. Aged by
     # mtime, which the cache refreshes on every hit, so a phrase still in use
@@ -255,10 +252,6 @@ class TTSConfig:
     cache_retention_days: int = field(
         default_factory=lambda: _env_int("TTS_CACHE_RETENTION_DAYS", 90)
     )
-
-    @property
-    def caching_enabled(self) -> bool:
-        return self.cache_entries >= 1
 
     @property
     def lead_bytes(self) -> int:
@@ -473,6 +466,13 @@ TOOLS_KEY = "tools"
 TOOL_ENABLED_KEY = "enabled"
 TOOL_CONFIG_KEY = "config"
 
+# Everything a tool block may say. Anything else in one is a setting written a
+# level too high — every tool's own settings live under 'config' — and is
+# reported rather than ignored: the symptom otherwise is a tool running on its
+# defaults with nothing anywhere saying why.
+TOOL_KEYS = (TOOL_ENABLED_KEY, TOOL_CONFIG_KEY)
+TOOL_KEY_SEPARATOR = ", "
+
 # A tool listed without saying so is off. Enabling one is a decision, and it
 # should have to be written down.
 TOOL_ENABLED_BY_DEFAULT = False
@@ -545,6 +545,19 @@ def _parse_tools(
                 "not a mapping; treating it as empty."
             )
             config = {}
+
+        # A setting written beside 'enabled' rather than under 'config' is read
+        # by nothing and says so nowhere, which leaves a tool quietly running on
+        # its defaults against a file that plainly asks for something else.
+        stray = [key for key in settings if str(key) not in TOOL_KEYS]
+        if stray:
+            problems.append(
+                f"Server {server_id}: tool '{name}' has "
+                f"{TOOL_KEY_SEPARATOR.join(repr(str(key)) for key in stray)} "
+                f"outside '{TOOL_CONFIG_KEY}', where nothing reads it. A tool block "
+                f"holds only {TOOL_KEY_SEPARATOR.join(repr(key) for key in TOOL_KEYS)}; "
+                f"move the rest under '{TOOL_CONFIG_KEY}:'."
+            )
 
         tools[str(name)] = ToolSettings(
             enabled=bool(settings.get(TOOL_ENABLED_KEY, TOOL_ENABLED_BY_DEFAULT)),

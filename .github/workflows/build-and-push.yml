@@ -29,6 +29,16 @@ jobs:
           python-version: '3.12'
           cache: pip
 
+      # The same package the image installs, and for the same reason: rendered
+      # speech is encoded with libopus rather than handed to discord.py as
+      # samples, so the tests need it loadable. discord.py ships a binary for
+      # macOS and Windows and falls back to the system library on Linux, which
+      # is why this passes locally and fails here without it.
+      - name: Install libopus
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libopus0
+
       - name: Install dependencies
         run: pip install -r requirements-dev.txt
 

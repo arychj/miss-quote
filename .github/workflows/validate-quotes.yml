@@ -1,0 +1,41 @@
+name: Validate Quotes
+
+# Separate from Build and Push on purpose. That workflow gates the image and
+# takes several minutes; this one reads a text file and is the only thing most
+# changes to the quote list need, so it should answer before the reviewer has
+# finished reading the diff.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/miss_quote/resources/quotes.csv'
+      - 'scripts/validate_quotes.py'
+      - '.github/workflows/validate-quotes.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/miss_quote/resources/quotes.csv'
+      - 'scripts/validate_quotes.py'
+      - '.github/workflows/validate-quotes.yml'
+  # A file mounted over the shipped one is the supported way to change the list,
+  # and it never touches this repository. This is how its author checks it.
+  workflow_dispatch:
+    inputs:
+      path:
+        description: 'Quote file to check, relative to the repository root'
+        required: false
+        default: 'src/miss_quote/resources/quotes.csv'
+
+env:
+  QUOTES_FILE: ${{ inputs.path || 'src/miss_quote/resources/quotes.csv' }}
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # No dependency install and no cache: the validator is standard library
+      # only, and the runner's own Python is enough to run it.
+      - name: Check the quote file
+        run: python scripts/validate_quotes.py "$QUOTES_FILE"

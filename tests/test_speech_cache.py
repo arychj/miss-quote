@@ -9,6 +9,7 @@ from datetime import timedelta
 import numpy as np
 import pytest
 
+from miss_quote.audio import opus
 from miss_quote.config import audio_cfg, tts_cfg
 from miss_quote.tts import cache as cache_module
 from miss_quote.tts.cache import SpeechCache
@@ -23,14 +24,27 @@ SOURCE_SECONDS = 0.5
 SOURCE_SAMPLES = int(SOURCE_RATE * SOURCE_SECONDS)
 
 CHUNKS = 4
-KEEP_TWO = 2
-CACHING_OFF = 0
+
+# What an Ogg file opens with, so a test can say the container is the container
+# without parsing it.
+OGG_MAGIC = b"OggS"
+
+# A loose floor for the encoded-versus-samples check. The real ratio on speech
+# is about ten; the test only has to fail if the clip stopped being encoded.
+SMALLEST_WORTHWHILE_SAVING = 4
 
 # Least-significant bits of a 16-bit sample. Chunked and one-pass filtering
 # round differently; at this magnitude the difference is around -78 dB, which is
 # inaudible, and the bound is loose so a soxr release cannot fail the suite over
 # a rounding change.
 FILTER_TOLERANCE = 8
+
+# How far apart the two channels of a widened mono clip may come back. Opus
+# codes stereo as mid and side rather than as two independent channels, so a
+# duplicated channel survives a round trip as very nearly itself rather than
+# exactly. Against a source amplitude of 10,000 this is under 3%, which a real
+# stereo mix would clear by an order of magnitude.
+CHANNEL_TOLERANCE = 256
 
 
 def _tone(samples: int = SOURCE_SAMPLES) -> bytes:
@@ -67,11 +81,25 @@ def synthesizer(monkeypatch) -> FakeSynthesizer:
 
 
 async def _collect(cache: SpeechCache, text: str = PHRASE) -> bytes:
-    return b"".join([chunk async for chunk in cache.stream(text)])
+    """The phrase as samples, which is what most of these assert against."""
+    return b"".join([chunk async for chunk in cache.stream(text).pcm()])
+
+
+async def _packets(cache: SpeechCache, text: str = PHRASE) -> list[bytes]:
+    return [packet async for packet in cache.stream(text).packets()]
 
 
 def _cached_files(directory) -> list:
-    return sorted(directory.glob("*.wav"))
+    return sorted(directory.glob("*.opus"))
+
+
+def _channel_difference(samples: np.ndarray) -> int:
+    """How far apart the left and right of an interleaved clip are."""
+    return int(
+        np.abs(
+            samples[0::2].astype(np.int32) - samples[1::2].astype(np.int32)
+        ).max()
+    )
 
 
 def _largest_difference(first: bytes, second: bytes) -> int:
@@ -94,26 +122,34 @@ async def test_a_phrase_is_synthesized_on_first_ask(synthesizer, tmp_path):
 
 
 async def test_the_clip_is_playback_ready(synthesizer, tmp_path):
-    """48 kHz stereo, which is the only thing Discord's player accepts."""
+    """
+    48 kHz stereo, which is the only thing Discord's player accepts.
+
+    Length is checked to within a frame rather than exactly. A clip is stored as
+    whole 20 ms packets, so the last one is padded out with silence, and half a
+    second of audio does not divide into 20 ms any more neatly than any other
+    phrase does.
+    """
     played = await _collect(SpeechCache(directory=tmp_path))
     samples = np.frombuffer(played, dtype=np.int16)
 
     expected_frames = SOURCE_SAMPLES * audio_cfg.playback_sample_rate // SOURCE_RATE
+    frames = len(samples) // audio_cfg.playback_channels
 
-    assert len(samples) // audio_cfg.playback_channels == expected_frames
-    assert np.array_equal(samples[0::2], samples[1::2])
+    assert abs(frames - expected_frames) <= opus.SAMPLES_PER_FRAME
+    assert _channel_difference(samples) <= CHANNEL_TOLERANCE
 
 
 async def test_audio_arrives_before_synthesis_finishes(synthesizer, tmp_path):
     """The point of streaming: playback starts on the first chunk."""
     cache = SpeechCache(directory=tmp_path)
 
-    chunks = [chunk async for chunk in cache.stream(PHRASE)]
+    chunks = [chunk async for chunk in cache.stream(PHRASE).packets()]
 
     assert len(chunks) > 1
 
 
-# ── memory ────────────────────────────────────────
+# ── not synthesizing twice ────────────────────────
 
 
 async def test_a_second_ask_is_not_synthesized_again(synthesizer, tmp_path):
@@ -135,40 +171,10 @@ async def test_a_different_phrase_is_synthesized(synthesizer, tmp_path):
     assert synthesizer.calls == [PHRASE, OTHER_PHRASE]
 
 
-async def test_a_clip_is_retired_when_memory_is_full(synthesizer, tmp_path):
-    """A display name is not a closed set, so the cache has to have a ceiling."""
-    cache = SpeechCache(directory=tmp_path, entries=KEEP_TWO)
-
-    for phrase in ("one", "two", "three"):
-        await _collect(cache, phrase)
-
-    assert len(cache._memory) == KEEP_TWO
 
 
-async def test_the_least_recently_used_clip_is_retired(synthesizer, tmp_path):
-    """A phrase still being said should outlive one rendered after it."""
-    cache = SpeechCache(directory=tmp_path, entries=KEEP_TWO)
-
-    await _collect(cache, PHRASE)
-    await _collect(cache, OTHER_PHRASE)
-    await _collect(cache, PHRASE)
-    await _collect(cache, THIRD_PHRASE)
-
-    assert cache._key(PHRASE) in cache._memory
-    assert cache._key(OTHER_PHRASE) not in cache._memory
 
 
-async def test_a_clip_read_off_disk_is_held_as_the_newest(synthesizer, tmp_path):
-    """It was just asked for, whatever the last process left in what order."""
-    await _collect(SpeechCache(directory=tmp_path), PHRASE)
-    cache = SpeechCache(directory=tmp_path, entries=KEEP_TWO)
-
-    await _collect(cache, OTHER_PHRASE)
-    await _collect(cache, PHRASE)
-    await _collect(cache, THIRD_PHRASE)
-
-    assert cache._key(PHRASE) in cache._memory
-    assert cache._key(OTHER_PHRASE) not in cache._memory
 
 
 # ── disk ──────────────────────────────────────────
@@ -180,14 +186,25 @@ async def test_a_clip_is_written_to_disk(synthesizer, tmp_path):
     assert len(_cached_files(tmp_path)) == 1
 
 
-async def test_the_stored_clip_is_the_synthesizers_own_audio(synthesizer, tmp_path):
-    """Mono at the source rate: a quarter the size, and playable by ear."""
-    await _collect(SpeechCache(directory=tmp_path))
+async def test_the_stored_clip_is_ogg_opus(synthesizer, tmp_path):
+    """A container, so the cache directory stays something you can listen to."""
+    cache = SpeechCache(directory=tmp_path)
+    packets = await _packets(cache)
 
-    with wave.open(str(_cached_files(tmp_path)[0]), "rb") as handle:
-        assert handle.getframerate() == SOURCE_RATE
-        assert handle.getnchannels() == 1
-        assert handle.getnframes() == SOURCE_SAMPLES
+    stored = _cached_files(tmp_path)[0]
+
+    assert stored.read_bytes().startswith(OGG_MAGIC)
+    assert opus.read(stored) == packets
+
+
+async def test_the_stored_clip_is_a_fraction_of_the_samples(synthesizer, tmp_path):
+    """The whole point of storing it encoded."""
+    cache = SpeechCache(directory=tmp_path)
+    played = await _collect(cache)
+
+    stored = _cached_files(tmp_path)[0].stat().st_size
+
+    assert stored < len(played) // SMALLEST_WORTHWHILE_SAVING
 
 
 async def test_a_new_process_reads_the_clip_off_disk(synthesizer, tmp_path):
@@ -218,19 +235,28 @@ async def test_changing_the_voice_does_not_serve_the_old_one(synthesizer, tmp_pa
     assert len(_cached_files(tmp_path)) == 2
 
 
-async def test_an_unwritable_directory_costs_persistence_only(synthesizer, tmp_path, caplog):
+async def test_an_unwritable_directory_still_plays_but_caches_nothing(
+    synthesizer, tmp_path, caplog
+):
+    """
+    The directory is the only place a clip is kept, so losing it costs the cache.
+
+    Every phrase is synthesized again every time it is said. That is worth
+    saying out loud at startup rather than leaving somebody to notice the
+    synthesizer is busy — hence an error rather than a warning.
+    """
     blocked = tmp_path / "file-not-a-directory"
     blocked.write_text("")
 
-    with caplog.at_level("WARNING"):
+    with caplog.at_level("ERROR"):
         cache = SpeechCache(directory=blocked / "cache")
 
     played = await _collect(cache)
 
     assert len(played) > 0
     assert await _collect(cache) == played
-    assert synthesizer.calls == [PHRASE]
-    assert any("memory" in record.message for record in caplog.records)
+    assert synthesizer.calls == [PHRASE, PHRASE]
+    assert any("every time it is said" in record.message for record in caplog.records)
 
 
 async def test_an_unreadable_clip_is_re_synthesized(synthesizer, tmp_path, caplog):
@@ -257,7 +283,6 @@ async def test_a_failed_synthesis_is_not_cached(monkeypatch, tmp_path, caplog):
         partial = await _collect(cache)
 
     assert len(partial) > 0
-    assert cache._memory == {}
     assert _cached_files(tmp_path) == []
 
 
@@ -296,7 +321,7 @@ async def test_nothing_happens_until_the_stream_is_drained(synthesizer, tmp_path
     await _collect(cache)
     assert synthesizer.calls == [PHRASE]
 
-    assert b"".join([chunk async for chunk in queued]) != b""
+    assert b"".join([chunk async for chunk in queued.pcm()]) != b""
     assert synthesizer.calls == [PHRASE]
 
 
@@ -320,7 +345,7 @@ async def test_a_warmed_phrase_is_not_synthesized_when_it_is_said(synthesizer, t
     assert synthesizer.calls == [PHRASE]
 
 
-async def test_warming_what_is_already_in_memory_synthesizes_nothing(
+async def test_warming_what_has_just_been_said_synthesizes_nothing(
     synthesizer, tmp_path
 ):
     cache = SpeechCache(directory=tmp_path)
@@ -349,25 +374,12 @@ async def test_warming_twice_synthesizes_once(synthesizer, tmp_path):
     assert synthesizer.calls == [PHRASE]
 
 
-async def test_warming_does_not_promote_a_clip_it_finds_held(synthesizer, tmp_path):
-    """A warm-up renders the whole roster; which name came first means nothing."""
-    cache = SpeechCache(directory=tmp_path, entries=KEEP_TWO)
-    await _collect(cache, PHRASE)
-    await _collect(cache, OTHER_PHRASE)
-
-    await cache.warm(PHRASE)
-    await _collect(cache, THIRD_PHRASE)
-
-    assert cache._key(PHRASE) not in cache._memory
 
 
 async def test_warming_with_nowhere_to_keep_it_synthesizes_nothing(
-    synthesizer, tmp_path, monkeypatch
+    synthesizer, tmp_path
 ):
-    """No memory and no directory makes it a synthesis nobody is ever served."""
-    monkeypatch.setattr(
-        cache_module, "tts_cfg", replace(tts_cfg, cache_entries=CACHING_OFF)
-    )
+    """Nowhere to keep it makes it a synthesis nobody is ever served."""
     blocked = tmp_path / "file-not-a-directory"
     blocked.write_text("")
 
@@ -430,10 +442,10 @@ async def test_a_clip_is_read_off_disk_only_once(tmp_path):
     assert first == second
 
 
-async def test_a_clip_is_not_evicted_to_make_room_for_speech(synthesizer, tmp_path):
-    """A clip was put there deliberately; a phrase was said once."""
+async def test_a_clip_is_held_however_much_speech_goes_past(synthesizer, tmp_path):
+    """A clip was put there deliberately, and nothing ages it out."""
     _write_clip(tmp_path / CLIP_NAME)
-    cache = SpeechCache(directory=tmp_path, entries=1)
+    cache = SpeechCache(directory=tmp_path)
 
     held = await cache.clip(CLIP_NAME)
     await _collect(cache, PHRASE)
@@ -524,6 +536,9 @@ RETAIN_DAYS = 90
 ONE_DAY_PAST_IT = RETAIN_DAYS + 1
 LONG_ENOUGH_AGO = timedelta(days=ONE_DAY_PAST_IT).total_seconds()
 RETENTION_OFF = 0
+
+# A name only this cache produces, which is what makes a file safe to reap.
+DIGEST = "a" * 64
 
 
 def _age(path, seconds: float = LONG_ENOUGH_AGO) -> None:
@@ -631,11 +646,99 @@ async def test_a_warmed_clip_nobody_plays_is_still_reaped(synthesizer, tmp_path)
 async def test_touching_a_clip_that_was_never_stored_creates_nothing(
     synthesizer, tmp_path
 ):
-    """`touch` would leave an empty WAV behind for a later read to trip over."""
-    cache = SpeechCache(directory=tmp_path)
-    await _collect(cache)
+    """
+    `touch` would leave an empty file behind for a later read to trip over.
 
-    _cached_files(tmp_path)[0].unlink()
-    await _collect(cache)
+    `os.utime` is what keeps it from doing that, and it is asserted directly
+    rather than through a play: nothing else would notice, since a read that
+    found the empty file would report it and re-synthesize anyway.
+    """
+    cache = SpeechCache(directory=tmp_path)
+
+    await cache._touch(cache._key(PHRASE))
 
     assert _cached_files(tmp_path) == []
+
+
+# ── what an earlier version left behind ───────────
+
+
+async def test_a_clip_from_the_wav_era_is_reaped(synthesizer, tmp_path):
+    """
+    Nothing can read it any more, and nothing else would ever delete it.
+
+    A directory filled by a version that stored WAVs should empty on the usual
+    clock rather than sit there for the life of the volume.
+    """
+    stale = tmp_path / f"{DIGEST}.wav"
+    stale.write_bytes(b"whatever a wav is")
+    _age(stale)
+
+    SpeechCache(directory=tmp_path, retention_days=RETAIN_DAYS)
+
+    assert not stale.exists()
+
+
+async def test_a_hand_placed_clip_is_still_never_reaped(synthesizer, tmp_path):
+    """It is named, not hashed, so sweeping the old suffix cannot touch it."""
+    chime = tmp_path / "chime.wav"
+    chime.write_bytes(b"a chime somebody put here")
+    _age(chime)
+
+    SpeechCache(directory=tmp_path, retention_days=RETAIN_DAYS)
+
+    assert chime.exists()
+
+
+async def test_a_truncated_clip_is_re_synthesized(synthesizer, tmp_path):
+    """
+    A half-written container is refused rather than played as a short clip.
+
+    The cache writes atomically, so this is a torn volume rather than anything
+    this process did — but a clip that simply stops would be cached in memory
+    and played that way forever.
+    """
+    await _collect(SpeechCache(directory=tmp_path))
+    stored = _cached_files(tmp_path)[0]
+    stored.write_bytes(stored.read_bytes()[:200])
+
+    cache = SpeechCache(directory=tmp_path)
+    played = await _collect(cache)
+
+    assert len(played) > 0
+    assert synthesizer.calls == [PHRASE, PHRASE]
+
+
+async def test_a_clip_played_quieter_streams_too(synthesizer, tmp_path):
+    """
+    The decode must not gate the first frame on the last packet.
+
+    A clip below full volume has to be decoded, and decoding it all before
+    yielding any of it would make every such announcement wait for its own end —
+    a whole synthesis on a miss, and the whole decode even off disk.
+    """
+    await _collect(SpeechCache(directory=tmp_path))
+    cache = SpeechCache(directory=tmp_path)
+
+    chunks = [chunk async for chunk in cache.stream(PHRASE).pcm()]
+
+    assert len(chunks) > 1
+
+
+async def test_a_clip_played_quieter_is_decoded_in_batches(synthesizer, tmp_path):
+    """
+    Neither a packet at a time nor the whole clip at once.
+
+    The decode runs in a thread, so the batch is what decides how often the loop
+    is handed back: one hop per packet would cost more in scheduling than the
+    decode, and one hop for the clip would put the whole thing in front of the
+    first frame.
+    """
+    await _collect(SpeechCache(directory=tmp_path))
+    cache = SpeechCache(directory=tmp_path)
+
+    chunks = [chunk async for chunk in cache.stream(PHRASE).pcm()]
+    batch = cache_module.DECODE_BATCH_PACKETS * opus.FRAME_BYTES
+
+    assert all(len(chunk) <= batch for chunk in chunks)
+    assert len(chunks) < SOURCE_SAMPLES  # nowhere near one per packet

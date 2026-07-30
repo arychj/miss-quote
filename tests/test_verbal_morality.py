@@ -111,6 +111,20 @@ class BlockingSpeaker(RecordingSpeaker):
         await super().play(source, audio, scale)
 
 
+class FakePhrase:
+    """One phrase from `FakeSpeech`, in whichever form is asked for."""
+
+    def __init__(self, speech: "FakeSpeech", text: str) -> None:
+        self._speech = speech
+        self._text = text
+
+    def pcm(self):
+        return self._speech._pcm(self._text)
+
+    def packets(self):
+        return self._speech._pcm(self._text)
+
+
 class FakeSpeech:
     """
     Stands in for the cache, handing back the text it was asked to render.
@@ -131,9 +145,19 @@ class FakeSpeech:
         # otherwise, which is what a cache hit looks like.
         self.chunks: tuple[str, ...] | None = None
 
-    async def stream(self, text: str):
+    def stream(self, text: str) -> "FakePhrase":
+        """
+        A phrase the speaker can take either way, as the real cache hands back.
+
+        This tool only ever asks for samples — it chains a chime in front of the
+        words and plays the result quieter — but the shape has to match, or a
+        test would pass against an object the tool cannot use.
+        """
         self.asked.append(text)
 
+        return FakePhrase(self, text)
+
+    async def _pcm(self, text: str):
         for chunk in (text,) if self.chunks is None else self.chunks:
             self.pulled.append(chunk)
             yield chunk
@@ -980,7 +1004,7 @@ async def test_the_head_start_does_not_reorder_the_announcement(speech, speaker,
 
 async def test_a_head_start_stops_once_it_has_enough(speech):
     speech.chunks = CHUNKS
-    words = speech.stream(DEFAULT_ANNOUNCEMENT)
+    words = speech.stream(DEFAULT_ANNOUNCEMENT).pcm()
 
     held = await _lead(words, len(CHUNKS[0]) + 1)
 
@@ -991,7 +1015,7 @@ async def test_a_head_start_stops_once_it_has_enough(speech):
 async def test_a_phrase_shorter_than_the_head_start_is_not_waited_on(speech):
     """The stream ends; there is no more coming however much was asked for."""
     speech.chunks = CHUNKS
-    words = speech.stream(DEFAULT_ANNOUNCEMENT)
+    words = speech.stream(DEFAULT_ANNOUNCEMENT).pcm()
 
     held = await _lead(words, len("".join(CHUNKS)) + 1)
 

@@ -9,7 +9,7 @@ import pytest
 
 import miss_quote.bot.speaker as speaker_module
 from miss_quote.audio.gain import scaled
-from miss_quote.bot.speaker import PCMStream, DiscordSpeaker
+from miss_quote.bot.speaker import DiscordSpeaker, OpusStream, PCMStream
 from miss_quote.config import audio_cfg
 from miss_quote.transcript.writer import Source
 
@@ -28,6 +28,14 @@ PATIENCE_SECONDS = 2.0
 HALF_VOLUME = 0.5
 SAMPLE_DTYPE = np.int16
 
+# What a fake clip reports having been asked for, so a test can name the path
+# the speaker took rather than infer it.
+ENCODED = "packets"
+SAMPLES = "pcm"
+
+# Stands in for one 20 ms Opus packet, which is opaque to everything here.
+OPUS_PACKET = b"\x78\x9a\xbc"
+
 
 class FakeVoiceClient:
     """A voice client that drains a source on a thread, as discord.py does."""
@@ -35,6 +43,7 @@ class FakeVoiceClient:
     def __init__(self, channel_id: int = CHANNEL_ID, connected: bool = True) -> None:
         self.channel = type("Channel", (), {"id": channel_id, "name": "general-voice"})()
         self.frames: list[bytes] = []
+        self.sources: list = []
         self._connected = connected
         self._playing = False
         self._thread: threading.Thread | None = None
@@ -47,6 +56,7 @@ class FakeVoiceClient:
 
     def play(self, source, after) -> None:
         self._playing = True
+        self.sources.append(source)
 
         def drain() -> None:
             while (frame := source.read()):
@@ -251,3 +261,113 @@ async def test_a_failing_stream_does_not_strand_the_player():
         )
 
     assert voice_client.frames == [LOUD]
+
+
+# ── which form a clip goes out in ─────────────────
+
+
+class FakePhrase:
+    """
+    A clip the speaker can take either way, as the cache hands one over.
+
+    The two forms are told apart by what they contain rather than by type, so a
+    test can say which one the speaker reached for.
+    """
+
+    def __init__(self) -> None:
+        self.asked: list[str] = []
+
+    async def packets(self):
+        self.asked.append(ENCODED)
+        yield OPUS_PACKET
+
+    async def pcm(self):
+        self.asked.append(SAMPLES)
+        yield LOUD
+
+
+async def test_a_clip_at_full_volume_is_sent_as_it_was_stored():
+    """The point of storing it encoded: discord.py builds no encoder at all."""
+    voice_client = FakeVoiceClient()
+    phrase = FakePhrase()
+
+    await _speaker(voice_client).play(SOURCE, phrase)
+
+    assert phrase.asked == [ENCODED]
+    assert voice_client.frames == [OPUS_PACKET]
+
+
+async def test_a_clip_below_full_volume_is_decoded_first():
+    """A gain is a multiplication, and there is nothing to multiply in a packet."""
+    voice_client = FakeVoiceClient()
+    phrase = FakePhrase()
+
+    await _speaker(voice_client).play(SOURCE, phrase, HALF_VOLUME)
+
+    assert phrase.asked == [SAMPLES]
+
+
+async def test_the_deployment_volume_alone_can_force_the_decode(monkeypatch):
+    """A channel that turned everything down never gets the encoded path."""
+    monkeypatch.setattr(
+        speaker_module, "audio_cfg", replace(audio_cfg, playback_volume=HALF_VOLUME)
+    )
+    phrase = FakePhrase()
+
+    await _speaker(FakeVoiceClient()).play(SOURCE, phrase)
+
+    assert phrase.asked == [SAMPLES]
+
+
+async def test_an_encoded_clip_says_so_to_the_player():
+    """`is_opus` is the whole mechanism; without it the packets are re-encoded."""
+    voice_client = FakeVoiceClient()
+
+    await _speaker(voice_client).play(SOURCE, FakePhrase())
+
+    assert voice_client.sources[-1].is_opus() is True
+
+
+async def test_a_scaled_clip_does_not_say_so():
+    voice_client = FakeVoiceClient()
+
+    await _speaker(voice_client).play(SOURCE, FakePhrase(), HALF_VOLUME)
+
+    assert voice_client.sources[-1].is_opus() is False
+
+
+async def test_a_plain_stream_of_samples_is_still_accepted():
+    """What a tool assembling a clip of its own hands over."""
+    voice_client = FakeVoiceClient()
+
+    await _speaker(voice_client).play(SOURCE, _audio(LOUD))
+
+    assert voice_client.frames == [LOUD]
+
+
+def test_a_packet_is_handed_over_whole():
+    """One packet is one frame; half of one is not audio."""
+    stream = OpusStream(STALL_SECONDS)
+    stream.feed(OPUS_PACKET)
+    stream.finish()
+
+    assert stream.read() == OPUS_PACKET
+    assert stream.read() == b""
+
+
+def test_packets_keep_their_order():
+    stream = OpusStream(STALL_SECONDS)
+    for packet in (b"one", b"two", b"three"):
+        stream.feed(packet)
+    stream.finish()
+
+    assert [stream.read() for _ in range(3)] == [b"one", b"two", b"three"]
+
+
+def test_a_stalled_encoder_ends_the_encoded_clip(caplog):
+    stream = OpusStream(STALL_SECONDS)
+
+    with caplog.at_level("WARNING"):
+        assert stream.read() == b""
+
+    assert "No audio" in caplog.text
