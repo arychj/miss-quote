@@ -3,24 +3,34 @@ Publishing the credit tally, and keeping it on disk.
 
 The tally itself is `ledger.credits`, which knows nothing about Discord. This is
 the other half: a task that wakes on an interval, writes a changed tally out, and
-puts it in the topic of whatever voice channel the bot is sitting in.
+puts it under the name of whatever voice channel the bot is sitting in.
 
-Both are driven off the ledger's revision rather than a flag, so a tally that
-changed four times between two ticks costs one write and one edit. Somebody
-swearing four times in a sentence is one revision bump per utterance and a topic
-that is only ever edited when it would say something new.
+What it sets is the channel's **status**, not its topic. A voice channel has no
+topic — `PATCH /channels/{id}` with one is refused, and refused with
+`CHANNEL_TOPIC_INVALID`, "Field contains at least one word that is not allowed",
+which reads like a profanity filter and is nothing of the kind: the same request
+is refused for a topic of "test". The status is the line the client shows beneath
+a voice channel's name, which is what a topic looks like on a voice channel and
+what somebody setting one by hand would set. Settings and prose here say topic,
+because that is what it is to everybody looking at it; only the call itself knows
+the difference. Do not "fix" this back to `topic=`.
 
-The two run on their own intervals, because they are limited by different things.
-Writing a few hundred bytes costs nothing and happens every few seconds, so a pod
-killed outright loses seconds of fines. A channel topic edit is rate-limited to
-roughly a couple per ten minutes per channel, and discord.py answers a 429 by
-sleeping until it clears, so five minutes is as fast as the topic can honestly go
-— it converges on the tally rather than tracking it.
+Both halves are driven off the ledger's revision rather than a flag, so a tally
+that changed four times between two ticks costs one write and one edit. Somebody
+swearing four times in a sentence is one revision bump per utterance and a status
+that is only ever set when it would say something new.
 
-Saving therefore happens first on every tick. An edit that lands in a bucket can
-hold this task for minutes, and what that must not delay is the persistence: a
-pod terminated while an edit is waiting should still have the tally on disk from
-the tick before.
+They run on their own intervals, because they are limited by different things.
+Writing a few hundred bytes costs nothing, so it happens every few seconds and a
+pod killed outright loses seconds of fines. A status edit is rate-limited, though
+not nearly as hard as a channel rename: Discord reports a bucket of roughly six a
+second, so how often it runs is a question of how often a tally is worth reading
+rather than of what the API will tolerate.
+
+Saving happens first on every tick regardless. An edit that lands in a rate-limit
+bucket can hold this task while discord.py sleeps it out, and what that must not
+delay is the persistence: a pod terminated while an edit is waiting should still
+have the tally on disk from the tick before.
 """
 
 from __future__ import annotations
@@ -40,6 +50,11 @@ logger = get_logger(__name__)
 
 # An interval at or below this is off rather than continuous.
 NEVER = 0.0
+
+# A request Discord will not accept however many times it is sent. Its own case
+# because the alternative is retrying it for the life of the process, at the cost
+# of the channel's rate limit, for an answer that cannot come out differently.
+REFUSED = 400
 
 # So the first tick publishes, rather than waiting out a topic interval to say
 # what the tally already was at startup.
@@ -132,7 +147,7 @@ class Scoreboard:
         self._saved = revision
 
     async def publish(self) -> None:
-        """Put each server's changed tally in the topic of the channel the bot is in."""
+        """Put each server's changed tally under the name of the channel the bot is in."""
         for server in self._ledger.servers():
             revision = self._ledger.revision_for(server)
             if self._published.get(server, UNWRITTEN) >= revision:
@@ -148,31 +163,58 @@ class Scoreboard:
             if await self._post(server, channel, self._ledger.topic(server)):
                 self._published[server] = revision
 
-    async def _post(self, server: str, channel: Any, topic: str) -> bool:
+    async def _post(self, server: str, channel: Any, tally: str) -> bool:
         """
-        Edit one channel topic, reporting whether the tally can be considered up.
+        Put one tally under a channel's name, reporting whether it can be
+        considered up.
 
-        A refusal is treated as final and a failure as temporary. Missing
-        `Manage Channels` is not going to resolve itself, and retrying it every
-        tick would spend the channel's rate limit on a request that cannot
-        succeed; anything else — a 500, a timeout, a rate limit — is worth
-        another go on the next tick.
+        A refusal is treated as final and a failure as temporary. Neither a
+        missing permission nor a request Discord will not parse resolves itself,
+        and retrying either every tick spends the channel's rate limit on an
+        answer that cannot change; anything else — a 500, a timeout, a rate limit
+        — is worth another go on the next tick. A tally that changes is published
+        either way, because what was refused was this text and the next text is
+        not this one.
+
+        Every failure carries the string it was trying to set. A rejection whose
+        cause is a name in the tally cannot be diagnosed from the fact of it.
         """
         try:
-            await channel.edit(topic=topic)
+            await channel.edit(status=tally)
         except discord.Forbidden:
             logger.warning(
-                "Not allowed to set the topic of '%s'; the tally for %s will stay off it. "
-                "The bot needs Manage Channels.",
+                "Not allowed to set the status of '%s'; the tally for %s will stay off "
+                "it. The bot needs Set Voice Channel Status on the channel.",
                 channel,
                 server,
             )
             return True
-        except (discord.HTTPException, OSError, asyncio.TimeoutError) as exc:
-            logger.warning("Could not set the topic of '%s': %s", channel, exc)
+        except discord.HTTPException as exc:
+            if exc.status == REFUSED:
+                logger.error(
+                    "Discord will not take '%s' as the status of '%s': %s. "
+                    "The tally for %s stays off it until it changes.",
+                    tally,
+                    channel,
+                    exc,
+                    server,
+                )
+                return True
+
+            logger.warning(
+                "Could not set the status of '%s' to '%s': %s", channel, tally, exc
+            )
+            return False
+        except (OSError, asyncio.TimeoutError) as exc:
+            logger.warning(
+                "Could not reach Discord to set the status of '%s' to '%s': %s",
+                channel,
+                tally,
+                exc,
+            )
             return False
 
-        logger.debug("Published the tally for %s to '%s': %s", server, channel, topic)
+        logger.debug("Published the tally for %s to '%s': %s", server, channel, tally)
         return True
 
     def _channel_for(self, server: str) -> Any | None:

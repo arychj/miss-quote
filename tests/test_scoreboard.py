@@ -29,22 +29,33 @@ NO_TOPIC = 0.0
 NOW = 1_000.0
 
 FORBIDDEN_STATUS = 403
+REJECTED_STATUS = 400
 SERVER_ERROR_STATUS = 500
 
 
 class FakeChannel:
-    """A voice channel that keeps the topics it was given."""
+    """
+    A voice channel that keeps what it was asked to change.
+
+    The whole edit is kept rather than just the value, because which field is
+    written is the thing most worth guarding: a voice channel has no topic, and
+    Discord refuses one with an error that reads like a profanity filter.
+    """
 
     def __init__(self, failure: Exception | None = None) -> None:
-        self.topics: list[str] = []
+        self.edits: list[dict] = []
         self.failure = failure
         self.name = "general-voice"
 
-    async def edit(self, *, topic: str) -> None:
+    async def edit(self, **fields) -> None:
         if self.failure is not None:
             raise self.failure
 
-        self.topics.append(topic)
+        self.edits.append(fields)
+
+    @property
+    def statuses(self) -> list[str]:
+        return [edit["status"] for edit in self.edits]
 
     def __str__(self) -> str:
         return self.name
@@ -124,7 +135,7 @@ async def test_a_changed_tally_reaches_the_channel_topic(ledger, channel):
 
     await _scoreboard(ledger, channel).publish()
 
-    assert channel.topics == [f"{ELI}: 2"]
+    assert channel.statuses == [f"{ELI}: 2"]
 
 
 async def test_an_unchanged_tally_is_not_published_twice(ledger, channel):
@@ -135,7 +146,7 @@ async def test_an_unchanged_tally_is_not_published_twice(ledger, channel):
     await scoreboard.publish()
     await scoreboard.publish()
 
-    assert len(channel.topics) == 1
+    assert len(channel.statuses) == 1
 
 
 async def test_a_further_change_is_published(ledger, channel):
@@ -146,7 +157,7 @@ async def test_a_further_change_is_published(ledger, channel):
     ledger.award(SERVER, ERIK_ID, ERIK, 1)
     await scoreboard.publish()
 
-    assert channel.topics == [f"{ELI}: 1", f"{ELI}: 1 {ERIK}: 1"]
+    assert channel.statuses == [f"{ELI}: 1", f"{ELI}: 1 {ERIK}: 1"]
 
 
 async def test_several_changes_between_ticks_are_one_edit(ledger, channel):
@@ -156,7 +167,7 @@ async def test_several_changes_between_ticks_are_one_edit(ledger, channel):
 
     await _scoreboard(ledger, channel).publish()
 
-    assert channel.topics == [f"{ELI}: 2 {ERIK}: 1"]
+    assert channel.statuses == [f"{ELI}: 2 {ERIK}: 1"]
 
 
 async def test_nothing_is_published_when_the_bot_is_in_no_voice_channel(ledger):
@@ -174,7 +185,7 @@ async def test_a_tally_missed_for_want_of_a_channel_is_published_later(ledger, c
     scoreboard._guilds = lambda server_id: FakeGuild(FakeVoiceClient(channel))
     await scoreboard.publish()
 
-    assert channel.topics == [f"{ELI}: 1"]
+    assert channel.statuses == [f"{ELI}: 1"]
 
 
 async def test_nothing_is_published_while_the_bot_is_disconnected(ledger, channel):
@@ -182,7 +193,7 @@ async def test_nothing_is_published_while_the_bot_is_disconnected(ledger, channe
 
     await _scoreboard(ledger, channel, connected=False).publish()
 
-    assert channel.topics == []
+    assert channel.statuses == []
 
 
 async def test_a_server_nobody_configured_is_not_published(ledger, channel):
@@ -191,11 +202,27 @@ async def test_a_server_nobody_configured_is_not_published(ledger, channel):
 
     await _scoreboard(ledger, channel).publish()
 
-    assert channel.topics == []
+    assert channel.statuses == []
 
 
-async def test_a_refused_edit_is_not_retried(ledger, caplog):
-    """Manage Channels is not going to appear on its own, and retries cost the bucket."""
+async def test_the_tally_is_set_as_the_status_and_not_the_topic(ledger, channel):
+    """
+    A voice channel has no topic.
+
+    Discord refuses one with CHANNEL_TOPIC_INVALID, "Field contains at least one
+    word that is not allowed", which reads like a profanity filter and is not
+    one — it refuses a topic of "test" the same way. The status is the line the
+    client shows under the channel name.
+    """
+    ledger.award(SERVER, ELI_ID, ELI, 1)
+
+    await _scoreboard(ledger, channel).publish()
+
+    assert channel.edits == [{"status": f"{ELI}: 1"}]
+
+
+async def test_a_forbidden_edit_is_not_retried(ledger, caplog):
+    """The permission is not going to appear on its own, and retries cost the bucket."""
     channel = FakeChannel(failure=discord.Forbidden(_response(FORBIDDEN_STATUS).response, "no"))
     ledger.award(SERVER, ELI_ID, ELI, 1)
     scoreboard = _scoreboard(ledger, channel)
@@ -204,7 +231,52 @@ async def test_a_refused_edit_is_not_retried(ledger, caplog):
         await scoreboard.publish()
         await scoreboard.publish()
 
-    assert any("Manage Channels" in record.message for record in caplog.records)
+    assert any("Set Voice Channel Status" in record.message for record in caplog.records)
+
+
+async def test_a_rejected_status_is_not_retried(ledger, caplog):
+    """
+    A request Discord will not parse cannot come good on the next tick.
+
+    Retrying one spends the channel's rate limit, every interval, for the life of
+    the process.
+    """
+    channel = FakeChannel(failure=_response(REJECTED_STATUS))
+    ledger.award(SERVER, ELI_ID, ELI, 1)
+    scoreboard = _scoreboard(ledger, channel)
+
+    with caplog.at_level("ERROR"):
+        await scoreboard.publish()
+        await scoreboard.publish()
+
+    assert len(caplog.records) == 1
+
+
+async def test_a_rejection_says_what_it_tried_to_set(ledger, caplog):
+    """A rejection caused by a name in the tally cannot be diagnosed without it."""
+    channel = FakeChannel(failure=_response(REJECTED_STATUS))
+    ledger.award(SERVER, ELI_ID, ELI, 1)
+
+    with caplog.at_level("ERROR"):
+        await _scoreboard(ledger, channel).publish()
+
+    assert f"{ELI}: 1" in caplog.records[0].getMessage()
+
+
+async def test_a_rejected_tally_is_published_once_it_changes(ledger, channel, caplog):
+    """What was refused was that text; the next text is not that text."""
+    channel.failure = _response(REJECTED_STATUS)
+    ledger.award(SERVER, ELI_ID, ELI, 1)
+    scoreboard = _scoreboard(ledger, channel)
+
+    with caplog.at_level("ERROR"):
+        await scoreboard.publish()
+
+    channel.failure = None
+    ledger.award(SERVER, ERIK_ID, ERIK, 1)
+    await scoreboard.publish()
+
+    assert channel.statuses == [f"{ELI}: 1 {ERIK}: 1"]
 
 
 async def test_a_failed_edit_is_tried_again(ledger, channel, caplog):
@@ -218,7 +290,7 @@ async def test_a_failed_edit_is_tried_again(ledger, channel, caplog):
     channel.failure = None
     await scoreboard.publish()
 
-    assert channel.topics == [f"{ELI}: 1"]
+    assert channel.statuses == [f"{ELI}: 1"]
 
 
 # ── persisting ────────────────────────────────────
@@ -302,7 +374,7 @@ async def test_a_tally_is_still_saved_with_the_topic_switched_off(ledger, channe
 
     task.cancel()
 
-    assert channel.topics == []
+    assert channel.statuses == []
 
 
 # ── the loop ──────────────────────────────────────
@@ -313,12 +385,12 @@ async def test_the_loop_publishes_and_saves(ledger, channel, path):
     task = asyncio.create_task(_scoreboard(ledger, channel).run())
 
     async with asyncio.timeout(PATIENCE_SECONDS):
-        while not channel.topics or not path.is_file():
+        while not channel.statuses or not path.is_file():
             await asyncio.sleep(INTERVAL_SECONDS)
 
     task.cancel()
 
-    assert channel.topics == [f"{ELI}: 1"]
+    assert channel.statuses == [f"{ELI}: 1"]
 
 
 async def test_a_failing_tick_does_not_stop_the_loop(ledger, channel, caplog):
