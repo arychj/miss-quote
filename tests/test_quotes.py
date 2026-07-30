@@ -466,8 +466,18 @@ def test_a_trigger_is_folded_for_matching(monkeypatch, tmp_path):
 
 
 def test_the_shipped_file_loads(speech, speaker):
-    """The list the image carries, read by the same code that reads a mounted one."""
-    assert len(_load(BUNDLED)) > 1
+    """
+    The list the image carries, read by the same code that reads a mounted one.
+
+    Nothing here counts anything. How many quotes the file holds is content, and
+    a test that pins the number is one that fails the next time somebody adds a
+    line. What is worth asserting is that every row came back usable: `_load`
+    raises on a file with nothing in it, so reaching the loop at all is the
+    other half of it.
+    """
+    for trigger, answers in _load(BUNDLED).items():
+        assert trigger == trigger.casefold()
+        assert all(quote.text and quote.movie for quote in answers)
 
 
 # ── detection ─────────────────────────────────────
