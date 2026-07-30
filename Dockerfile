@@ -28,6 +28,7 @@ WORKDIR /app
 
 COPY audio/ audio/
 COPY bot/ bot/
+COPY ledger/ ledger/
 COPY stt/ stt/
 COPY tools/ tools/
 COPY transcript/ transcript/
@@ -38,14 +39,16 @@ COPY config.py main.py ./
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     TRANSCRIPT_DIR=/transcripts \
-    TTS_CACHE_DIR=/cache/tts
+    TTS_CACHE_DIR=/cache/tts \
+    CREDITS_FILE=/credits/credits.json
 
-# The cache is created either way. Mounting a volume over it is what makes
-# rendered speech outlive the pod; without one the bot re-synthesizes each
-# phrase once per restart, which costs a delay rather than a failure.
+# The cache and the credits directory are created either way. Mounting a volume
+# over each is what makes rendered speech and the tally outlive the pod; without
+# one the bot re-synthesizes each phrase once per restart, which costs a delay
+# rather than a failure, and forgives every fine anybody has earned.
 RUN useradd --create-home --uid 1000 bot \
-    && mkdir -p /transcripts /cache/tts \
-    && chown -R bot:bot /transcripts /cache
+    && mkdir -p /transcripts /cache/tts /credits \
+    && chown -R bot:bot /transcripts /cache /credits
 
 USER bot
 

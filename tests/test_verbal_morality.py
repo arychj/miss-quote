@@ -7,18 +7,35 @@ from pathlib import Path
 import pytest
 
 import tools.verbal_morality as verbal_morality
-from config import ServerConfig, ToolSettings, tts_cfg
+from config import SILENT_VOLUME, UNITY_VOLUME, ServerConfig, ToolSettings, tts_cfg
+from ledger.credits import CreditLedger
 from tools.runner import ToolRunner
-from tools.verbal_morality import DEFAULT_ANNOUNCEMENT, VerbalMorality, _lead
+from tools.verbal_morality import (
+    BACKOFF_PER_VIOLATION,
+    DEFAULT_ANNOUNCEMENT,
+    VIOLATION_WINDOW_SECONDS,
+    RecentViolations,
+    VerbalMorality,
+    _lead,
+)
 from transcript.writer import Source, Utterance
 
 SERVER_ALIAS = "first-server"
+OTHER_SERVER_ALIAS = "second-server"
 SPEAKER = "Speaker One"
 OTHER_SPEAKER = "Speaker Two"
 
 SPEAKER_ID = 234567890123456789
 OTHER_SPEAKER_ID = 345678901234567890
 ROSTER = {SPEAKER_ID: SPEAKER, OTHER_SPEAKER_ID: OTHER_SPEAKER}
+
+# Somebody the server never wrote down, known by whatever Discord reports.
+STRANGER = "Someone Else"
+STRANGER_ID = 456789012345678901
+
+# Enough violations to reach the floor whatever the step is.
+MANY_VIOLATIONS = 100
+QUIETEST = 0.25
 
 # Announcements the pre-warm renders per speaker: one violation, two, and three.
 WARMED_PER_SPEAKER = 3
@@ -49,10 +66,12 @@ class RecordingSpeaker:
 
     def __init__(self) -> None:
         self.played: list[tuple[Source, str]] = []
+        self.scales: list[float] = []
 
-    async def play(self, source, audio) -> None:
+    async def play(self, source, audio, scale: float = UNITY_VOLUME) -> None:
         spoken = "".join([chunk async for chunk in audio])
         self.played.append((source, spoken))
+        self.scales.append(scale)
 
 
 class FakeSpeech:
@@ -115,6 +134,21 @@ def speech(monkeypatch, tmp_path):
     return fake
 
 
+@pytest.fixture(autouse=True)
+def credits(monkeypatch, tmp_path) -> CreditLedger:
+    """
+    A ledger of its own per test, in place of the process-wide one.
+
+    Autouse because every tool built here enrolls its roster on construction, and
+    a tool reaching the real ledger would read whatever the deployment has on
+    disk — and, worse, count into it.
+    """
+    ledger = CreditLedger(tmp_path / "credits.json")
+    monkeypatch.setattr("tools.verbal_morality.shared_ledger", lambda: ledger)
+
+    return ledger
+
+
 @pytest.fixture
 def chime(speech) -> str:
     """A clip sitting in the cache directory, as an operator would leave one."""
@@ -137,14 +171,21 @@ def _tool(speaker, config=None, users=None) -> VerbalMorality:
     )
 
 
-def _utterance(text: str, user: str = SPEAKER) -> Utterance:
+def _utterance(
+    text: str, user: str = SPEAKER, user_id: int = SPEAKER_ID
+) -> Utterance:
     return Utterance(
-        timestamp=datetime.now().astimezone(), user_id=1, user=user, text=text
+        timestamp=datetime.now().astimezone(), user_id=user_id, user=user, text=text
     )
 
 
-async def _hear(tool: VerbalMorality, text: str, user: str = SPEAKER) -> None:
-    await tool.handle_utterance(_utterance(text, user), FakeSession(SOURCE))
+async def _hear(
+    tool: VerbalMorality,
+    text: str,
+    user: str = SPEAKER,
+    user_id: int = SPEAKER_ID,
+) -> None:
+    await tool.handle_utterance(_utterance(text, user, user_id), FakeSession(SOURCE))
 
 
 # ── construction ──────────────────────────────────
@@ -366,6 +407,164 @@ async def test_two_speakers_get_their_own_announcements(speech, speaker):
     await _hear(tool, FORBIDDEN, user="Second")
 
     assert [text.split(",")[0] for text in speech.asked] == ["First", "Second"]
+
+
+# ── the tally ─────────────────────────────────────
+
+
+async def test_a_fine_is_added_to_the_tally(speech, speaker, credits):
+    await _hear(_tool(speaker), FORBIDDEN)
+
+    assert credits.total(SERVER_ALIAS, SPEAKER_ID) == 1
+
+
+async def test_the_tally_accumulates_across_utterances(speech, speaker, credits):
+    tool = _tool(speaker)
+
+    await _hear(tool, FORBIDDEN)
+    await _hear(tool, f"{FORBIDDEN} and {ALSO_FORBIDDEN}")
+
+    assert credits.total(SERVER_ALIAS, SPEAKER_ID) == 3
+
+
+async def test_a_clean_utterance_costs_nothing(speech, speaker, credits):
+    await _hear(_tool(speaker), "that should work")
+
+    assert credits.total(SERVER_ALIAS, SPEAKER_ID) == 0
+
+
+async def test_the_roster_starts_on_the_board_at_nothing_owed(speech, speaker, credits):
+    """So the topic says who is being watched before anybody has sworn."""
+    _tool(speaker, users=ROSTER)
+
+    assert credits.topic(SERVER_ALIAS) == f"{SPEAKER}: 0 {OTHER_SPEAKER}: 0"
+
+
+async def test_the_tally_reads_as_the_channel_topic(speech, speaker, credits):
+    tool = _tool(speaker, users=ROSTER)
+
+    await _hear(tool, f"{FORBIDDEN} {ALSO_FORBIDDEN}")
+
+    assert credits.topic(SERVER_ALIAS) == f"{SPEAKER}: 2 {OTHER_SPEAKER}: 0"
+
+
+async def test_somebody_off_the_roster_is_added_when_they_earn_something(
+    speech, speaker, credits
+):
+    tool = _tool(speaker, users=ROSTER)
+
+    await _hear(tool, FORBIDDEN, user=STRANGER, user_id=STRANGER_ID)
+
+    assert f"{STRANGER}: 1" in credits.topic(SERVER_ALIAS)
+
+
+async def test_two_servers_keep_their_own_tallies(speech, speaker, credits):
+    """A server's words are its own, and so is what they cost."""
+    here = _tool(speaker, users=ROSTER)
+    elsewhere = VerbalMorality(
+        server=OTHER_SERVER_ALIAS,
+        config={"words": WORDS},
+        speaker=speaker,
+        users=ROSTER,
+    )
+
+    await _hear(here, FORBIDDEN)
+    await _hear(elsewhere, f"{FORBIDDEN} {ALSO_FORBIDDEN}")
+
+    assert credits.total(SERVER_ALIAS, SPEAKER_ID) == 1
+    assert credits.total(OTHER_SERVER_ALIAS, SPEAKER_ID) == 2
+
+
+# ── the backoff ───────────────────────────────────
+
+
+async def test_the_first_fine_in_a_while_is_announced_at_full_volume(speech, speaker):
+    await _hear(_tool(speaker), FORBIDDEN)
+
+    assert speaker.scales == [UNITY_VOLUME]
+
+
+async def test_each_violation_takes_the_next_announcement_down(speech, speaker):
+    tool = _tool(speaker)
+
+    await _hear(tool, FORBIDDEN)
+    await _hear(tool, FORBIDDEN)
+    await _hear(tool, FORBIDDEN)
+
+    assert speaker.scales == pytest.approx(
+        [
+            UNITY_VOLUME,
+            UNITY_VOLUME - BACKOFF_PER_VIOLATION,
+            UNITY_VOLUME - BACKOFF_PER_VIOLATION * 2,
+        ]
+    )
+
+
+async def test_every_word_in_an_utterance_counts_toward_the_backoff(speech, speaker):
+    """Four in a sentence is four steps down, however few announcements it took."""
+    tool = _tool(speaker)
+
+    await _hear(tool, f"{FORBIDDEN} {FORBIDDEN} {ALSO_FORBIDDEN}")
+    await _hear(tool, FORBIDDEN)
+
+    assert speaker.scales[1] == pytest.approx(UNITY_VOLUME - BACKOFF_PER_VIOLATION * 3)
+
+
+async def test_one_speaker_backing_off_does_not_quieten_another(speech, speaker):
+    tool = _tool(speaker)
+
+    await _hear(tool, FORBIDDEN)
+    await _hear(tool, FORBIDDEN)
+    await _hear(tool, FORBIDDEN, user=OTHER_SPEAKER, user_id=OTHER_SPEAKER_ID)
+
+    assert speaker.scales[-1] == UNITY_VOLUME
+
+
+def test_the_backoff_stops_at_the_floor():
+    """However much somebody swears, the announcement does not invert itself."""
+    recent = RecentViolations(floor=QUIETEST)
+
+    recent.record(SPEAKER_ID, MANY_VIOLATIONS)
+
+    assert recent.scale(SPEAKER_ID) == QUIETEST
+
+
+def test_a_floor_of_silence_silences_a_repeat_offender():
+    """Which is what a server that wants the joke to stop entirely asks for."""
+    recent = RecentViolations(floor=SILENT_VOLUME)
+
+    recent.record(SPEAKER_ID, MANY_VIOLATIONS)
+
+    assert recent.scale(SPEAKER_ID) == SILENT_VOLUME
+
+
+def test_a_violation_stops_counting_once_the_window_has_passed():
+    recent = RecentViolations()
+    now = 1_000.0
+
+    recent.record(SPEAKER_ID, 1, now=now)
+
+    assert recent.scale(SPEAKER_ID, now=now + VIOLATION_WINDOW_SECONDS + 1) == UNITY_VOLUME
+
+
+def test_a_violation_inside_the_window_still_counts():
+    recent = RecentViolations()
+    now = 1_000.0
+
+    recent.record(SPEAKER_ID, 1, now=now)
+
+    assert recent.count(SPEAKER_ID, now=now + VIOLATION_WINDOW_SECONDS - 1) == 1
+
+
+def test_a_speaker_who_has_aged_out_is_forgotten_entirely():
+    """The map is per process and nothing sweeps it; reading is what prunes."""
+    recent = RecentViolations()
+    now = 1_000.0
+    recent.record(SPEAKER_ID, 1, now=now)
+
+    recent.count(SPEAKER_ID, now=now + VIOLATION_WINDOW_SECONDS + 1)
+
+    assert SPEAKER_ID not in recent._seen
 
 
 # ── the chime ─────────────────────────────────────

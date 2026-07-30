@@ -65,6 +65,79 @@ def test_a_negative_playback_volume_is_silence_rather_than_an_inversion(
     assert reloaded.audio_cfg.playback_volume == reloaded.SILENT_VOLUME
 
 
+def test_the_volume_floor_is_read_as_a_fraction(monkeypatch) -> None:
+    monkeypatch.setenv("VIOLATION_VOLUME_FLOOR", "0.4")
+
+    import config
+
+    assert importlib.reload(config).morality_cfg.volume_floor == 0.4
+
+
+def test_a_volume_floor_of_zero_silences_a_repeat_offender(monkeypatch) -> None:
+    monkeypatch.setenv("VIOLATION_VOLUME_FLOOR", "0")
+
+    import config
+
+    reloaded = importlib.reload(config)
+
+    assert reloaded.morality_cfg.volume_floor == reloaded.SILENT_VOLUME
+
+
+def test_a_volume_floor_above_unity_is_no_backoff_rather_than_a_boost(
+    monkeypatch,
+) -> None:
+    """There is nowhere to back off to; it must not become a way to get louder."""
+    monkeypatch.setenv("VIOLATION_VOLUME_FLOOR", "4")
+
+    import config
+
+    reloaded = importlib.reload(config)
+
+    assert reloaded.morality_cfg.volume_floor == reloaded.UNITY_VOLUME
+
+
+def test_a_negative_volume_floor_is_silence_rather_than_an_inversion(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("VIOLATION_VOLUME_FLOOR", "-2")
+
+    import config
+
+    reloaded = importlib.reload(config)
+
+    assert reloaded.morality_cfg.volume_floor == reloaded.SILENT_VOLUME
+
+
+def test_the_topic_is_published_less_often_than_the_tally_is_saved() -> None:
+    """A topic edit is rate limited to a couple per ten minutes; a write is not."""
+    import config
+
+    morality = config.morality_cfg
+
+    assert morality.topic_interval_seconds > morality.save_interval_seconds
+
+
+def test_publishing_stops_at_a_topic_interval_of_zero(monkeypatch) -> None:
+    """So a deployment can keep the tally without touching a channel topic."""
+    monkeypatch.setenv("CREDITS_TOPIC_SECONDS", "0")
+
+    import config
+
+    reloaded = importlib.reload(config)
+
+    assert not reloaded.morality_cfg.publishing_enabled
+    assert reloaded.morality_cfg.counting_enabled
+
+
+def test_counting_stops_at_a_save_interval_of_zero(monkeypatch) -> None:
+    """Which leaves the tally in memory until shutdown writes it."""
+    monkeypatch.setenv("CREDITS_SAVE_SECONDS", "0")
+
+    import config
+
+    assert not importlib.reload(config).morality_cfg.counting_enabled
+
+
 def test_invalid_integer_config_fails_fast(monkeypatch) -> None:
     import config
 

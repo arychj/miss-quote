@@ -312,6 +312,62 @@ class ProcessConfig:
 
 
 # ──────────────────────────────────────────────
+# Verbal morality
+# ──────────────────────────────────────────────
+@dataclass(frozen=True)
+class MoralityConfig:
+    """
+    The standing tally of fines, and how quiet a repeat offender gets.
+
+    Where the rest of the tool's settings are per server and live in the mounted
+    file, these are per deployment: where the tally is kept, how often it is
+    published, and the loudness floor, none of which one server should be able
+    to set differently from another.
+    """
+
+    # The tally, as JSON, kept across restarts. Mount a volume here; an
+    # unwritable path costs the persistence, not the counting.
+    credits_file: Path = field(
+        default_factory=lambda: Path(_env_str("CREDITS_FILE", "/credits/credits.json"))
+    )
+
+    # How often a changed tally is written to disk, and how often the loop that
+    # does it wakes at all. Any value at or below zero stops the loop, leaving
+    # the tally in memory until shutdown, which still saves it.
+    save_interval_seconds: float = field(
+        default_factory=lambda: _env_float("CREDITS_SAVE_SECONDS", 5.0)
+    )
+
+    # How often a changed tally is published to the voice channel topic, which is
+    # its own, much longer interval: Discord rate-limits a topic edit to a couple
+    # per ten minutes per channel, and discord.py answers a 429 by sleeping until
+    # it clears. Five minutes is as fast as that ceiling allows. Any value at or
+    # below zero keeps the tally off the topic entirely, and still saves it.
+    topic_interval_seconds: float = field(
+        default_factory=lambda: _env_float("CREDITS_TOPIC_SECONDS", 300.0)
+    )
+
+    # The quietest an announcement gets, as a fraction of PLAYBACK_VOLUME, once
+    # a speaker has earned enough of a backoff to reach it. 0 silences them
+    # entirely; 1 turns the backoff off, since there is nowhere to back off to.
+    volume_floor: float = field(
+        default_factory=lambda: min(
+            UNITY_VOLUME,
+            max(SILENT_VOLUME, _env_float("VIOLATION_VOLUME_FLOOR", 0.25)),
+        )
+    )
+
+    @property
+    def counting_enabled(self) -> bool:
+        """Whether anything happens between startup and shutdown."""
+        return self.save_interval_seconds > 0
+
+    @property
+    def publishing_enabled(self) -> bool:
+        return self.topic_interval_seconds > 0
+
+
+# ──────────────────────────────────────────────
 # Logging
 # ──────────────────────────────────────────────
 @dataclass(frozen=True)
@@ -512,6 +568,21 @@ class FileConfig:
         server = self.servers.get(server_id)
         return None if server is None else server.alias
 
+    def id_for(self, alias: str) -> int | None:
+        """
+        The server an alias names, for the things that only know the alias.
+
+        Tools are handed the alias rather than the ID, so anything of theirs that
+        has to reach Discord — a tally published to a channel topic — has to come
+        back the other way. An alias two servers share is already reported as an
+        error at startup; here the first entry wins.
+        """
+        for server_id, server in self.servers.items():
+            if server.alias == alias:
+                return server_id
+
+        return None
+
     def name_for(self, server_id: int, user_id: int, reported: str) -> str:
         """
         The configured name for a speaker, or what Discord reported.
@@ -541,5 +612,6 @@ stt_cfg = STTConfig()
 tts_cfg = TTSConfig()
 transcript_cfg = TranscriptConfig()
 process_cfg = ProcessConfig()
+morality_cfg = MoralityConfig()
 log_cfg = LogConfig()
 file_cfg = FileConfig.load()

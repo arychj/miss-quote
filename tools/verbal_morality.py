@@ -2,8 +2,14 @@
 The Verbal Morality Bot, after Demolition Man.
 
 Listens for words the server has decided against and, on hearing one, announces
-the fine out loud in the channel it was said in. The credits are imaginary and
-no tally is kept: the point is being caught, not the accounting.
+the fine out loud in the channel it was said in. The credits are imaginary but
+they are added up: what everybody owes goes in the voice channel topic, and
+`ledger.credits` keeps it across restarts.
+
+A repeat offender is announced more and more quietly. Being fined is the joke,
+and a joke told fifteen times in five minutes is a denial of service on the
+conversation, so the announcement backs off toward `VIOLATION_VOLUME_FLOOR` as
+somebody keeps earning them. See `RecentViolations`.
 
 What the server writes down are stems. Each is expanded at startup into the
 endings it is said with, so a list stays a list of words rather than a list of
@@ -21,10 +27,12 @@ rather than while the channel waits for it. See `prewarm`.
 from __future__ import annotations
 
 import re
+import time
 from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Any
 
-from config import tts_cfg
+from config import UNITY_VOLUME, morality_cfg, tts_cfg
+from ledger.credits import shared_ledger
 from tools.base import Speaker, Tool
 from transcript.writer import TranscriptSession, Utterance
 from tts.cache import shared_cache
@@ -71,11 +79,100 @@ FORESEEN_OFFENCES = 3
 
 OFFENCE_SEPARATOR = ", "
 
+# How long a violation counts against how loudly the next one is announced, and
+# how much of the announcement each one inside that window costs. Fifteen of
+# them reaches the floor, which is a quarter of the way there by default; the
+# floor itself is a deployment setting, since a server may want a repeat
+# offender silenced rather than merely quietened.
+VIOLATION_WINDOW_SECONDS = 300.0
+BACKOFF_PER_VIOLATION = 0.05
+
+# A fraction is what the speaker is handed; a percentage is what reads in a log.
+PERCENT = 100
+
 # Stand in for a speaker and their fine while the announcement is checked at
 # startup.
 PROBE_NAME = "someone"
 PROBE_CREDITS = f"{SINGLE_CREDIT} {CREDIT_NOUN}"
 PROBE_VIOLATIONS = SINGLE_VIOLATION
+
+
+class RecentViolations:
+    """
+    How much somebody has sworn lately, and how loudly to say so.
+
+    In memory only, and per tool instance, which is per server: one server's
+    patience is not another's, and a tally that survives a restart is the
+    credits, not this. Five minutes after the last one, a speaker is back to
+    being announced at whatever loudness the channel asked for.
+
+    Timestamps rather than a count, because the window slides: a count would
+    have to be reset on a schedule, and the reset would land mid-argument and
+    hand somebody a fresh full-volume announcement for their fifteenth swear.
+    Kept per user and pruned on the way past, so nothing has to sweep it.
+    """
+
+    def __init__(
+        self,
+        window_seconds: float = VIOLATION_WINDOW_SECONDS,
+        step: float = BACKOFF_PER_VIOLATION,
+        floor: float | None = None,
+    ) -> None:
+        self._window = window_seconds
+        self._step = step
+        self._floor = morality_cfg.volume_floor if floor is None else floor
+        self._seen: dict[int, list[float]] = {}
+
+    def scale(self, user_id: int, now: float | None = None) -> float:
+        """
+        How loud the next announcement for a speaker should be, as a fraction.
+
+        Read before the violation being announced is recorded, so somebody's
+        first swear in five minutes is announced at full volume: the backoff is
+        for saying it again, and a floor that applied from the first word would
+        just be a quieter bot.
+        """
+        backoff = self._step * self.count(user_id, now)
+
+        return max(self._floor, UNITY_VOLUME - backoff)
+
+    def count(self, user_id: int, now: float | None = None) -> int:
+        """Violations still inside the window, dropping the ones that have aged out."""
+        recent = self._recent(user_id, now)
+
+        if recent:
+            self._seen[user_id] = recent
+        else:
+            self._seen.pop(user_id, None)
+
+        return len(recent)
+
+    def record(self, user_id: int, violations: int, now: float | None = None) -> None:
+        """
+        Note violations against a speaker, one timestamp each.
+
+        Each forbidden word counts, on the same terms as the fine: somebody who
+        strings four together has earned four credits and four steps of backoff,
+        however few announcements it took to say so.
+        """
+        moment = time.monotonic() if now is None else now
+        recent = self._recent(user_id, moment)
+        recent.extend([moment] * violations)
+
+        self._seen[user_id] = recent
+
+    def _recent(self, user_id: int, now: float | None) -> list[float]:
+        """
+        A speaker's violations that are still inside the window.
+
+        Monotonic rather than wall clock, so a clock correction cannot make a
+        violation look like it happened in the future and stay in the window
+        until it arrives.
+        """
+        moment = time.monotonic() if now is None else now
+        cutoff = moment - self._window
+
+        return [seen for seen in self._seen.get(user_id, []) if seen > cutoff]
 
 
 class VerbalMorality(Tool):
@@ -97,6 +194,13 @@ class VerbalMorality(Tool):
         self._announcement = _checked(config.get(ANNOUNCEMENT_KEY) or DEFAULT_ANNOUNCEMENT)
         self._speech = shared_cache()
         self._chime = self._located(config.get(CHIME_KEY))
+        self._recent = RecentViolations()
+
+        # Enrolled at construction so the topic reads `Eli: 0 Erik: 0` before
+        # anybody has sworn, rather than filling in one name at a time as each
+        # person earns their first fine.
+        self._credits = shared_ledger()
+        self._credits.enroll(self.server, self.users)
 
         logger.debug(
             "[%s] Listening for %d words: %s",
@@ -178,28 +282,45 @@ class VerbalMorality(Tool):
         self, utterance: Utterance, session: TranscriptSession
     ) -> None:
         """
-        Announce one fine for an offending utterance.
+        Announce one fine for an offending utterance, and add it to the tally.
 
         One announcement however many words were in it, and one credit for
         each. A speaker who strings four together has earned four credits, but
         four announcements over the top of each other is a denial of service on
         the channel.
+
+        The loudness is read before the violations are recorded, so the first
+        swear in five minutes is announced at full volume and each one after it
+        is quieter. The tally is added to whether or not the announcement is
+        audible: what somebody owes is not a function of how loudly they were
+        told about it.
         """
         offences = self._forbidden.findall(utterance.text)
         if not offences:
             return
 
+        scale = self._recent.scale(utterance.user_id)
+        self._recent.record(utterance.user_id, len(offences))
+
         fine = _fine(len(offences))
+        owed = self._credits.award(
+            self.server, utterance.user_id, utterance.user, len(offences)
+        )
+
         logger.info(
-            "🚨 [%s] %s said %s; announcing a fine of %s.",
+            "🚨 [%s] %s said %s; announcing a fine of %s at %d%% volume (%d owed).",
             self.server,
             utterance.user,
             OFFENCE_SEPARATOR.join(f"'{offence}'" for offence in offences),
             fine,
+            round(scale * PERCENT),
+            owed,
         )
 
         await self.speaker.play(
-            session.source, self._announce(self._wording(utterance.user, len(offences)))
+            session.source,
+            self._announce(self._wording(utterance.user, len(offences))),
+            scale,
         )
 
     def _wording(self, user: str, offences: int) -> str:

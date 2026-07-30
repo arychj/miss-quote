@@ -126,13 +126,15 @@ class DiscordSpeaker:
         self._guilds = guilds
         self._locks: dict[int, asyncio.Lock] = {}
 
-    async def play(self, source: Source, audio: AsyncIterator[bytes]) -> None:
+    async def play(
+        self, source: Source, audio: AsyncIterator[bytes], scale: float = UNITY_VOLUME
+    ) -> None:
         async with self._lock_for(source.guild_id):
             voice_client = self._voice_client_for(source)
             if voice_client is None:
                 return
 
-            await self._play(voice_client, audio)
+            await self._play(voice_client, audio, scale)
 
     def _lock_for(self, guild_id: int) -> asyncio.Lock:
         lock = self._locks.get(guild_id)
@@ -173,9 +175,19 @@ class DiscordSpeaker:
 
     @staticmethod
     async def _play(
-        voice_client: discord.VoiceClient, audio: AsyncIterator[bytes]
+        voice_client: discord.VoiceClient,
+        audio: AsyncIterator[bytes],
+        scale: float = UNITY_VOLUME,
     ) -> None:
-        stream = PCMStream(tts_cfg.stall_seconds, audio_cfg.playback_volume)
+        """
+        Feed one clip to the player, at the deployment's loudness times `scale`.
+
+        The two are multiplied here rather than anywhere a tool can see, so
+        `PLAYBACK_VOLUME` remains the only thing that says how loud a channel
+        wants to be interrupted and a tool only says how much quieter than that
+        this particular clip should be.
+        """
+        stream = PCMStream(tts_cfg.stall_seconds, audio_cfg.playback_volume * scale)
         finished = asyncio.Event()
         loop = asyncio.get_running_loop()
 
