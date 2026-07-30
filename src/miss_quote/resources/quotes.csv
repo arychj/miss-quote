@@ -1,8 +1,8 @@
 movie,trigger,quote
 2001 A Space Odyssey,miss minutes,I'm sorry {user} I'm afraid I can't do that
-Aliens,game over,Game over man, game over!
-Anchorman,escalated,Boy, that escalated quickly.
-Anchorman,percent,60% of the time, it works every time.
+Aliens,game over,"Game over man, game over!"
+Anchorman,escalated,"Boy, that escalated quickly."
+Anchorman,percent,"60% of the time, it works every time."
 Animal House,bored,TOGA! TOGA! TOGA!
 Animal House,party,TOGA! TOGA! TOGA!
 Animal House,warning,"As of this moment, {user} is on double secret probation!"
@@ -10,7 +10,7 @@ Apollo 13,failure,Failure is not an option!
 Army of Darkness,weapon,This... is my BOOMSTICK!
 Batman,serious,Why. So. Serious?
 Dead Poets Society,captain,O Captain! My Captain!
-Demolition Man,seashells,Ha ha, {user} doesn't know how to use the three seashells!
+Demolition Man,seashells,"Ha ha, {user} doesn't know how to use the three seashells!"
 Demolition Man,taco bell,Now all restaurants are Taco Bell.
 Demolition Man,toilet paper,He doesn't know how to use the three seashells!
 Die Hard,yippee,"Yippee-keye-yay, motherfucker!"
@@ -25,7 +25,7 @@ Firefly,curse,Curse your sudden but inevitable betrayal!
 Firefly,leaf on the wind,Watch how I soar.
 Firefly,stop me,No power in the verse can stop me.
 Futurama,money,Shut up and take my money!
-Futurama,good news,Good news, everyone!
+Futurama,good news,"Good news, everyone!"
 Galaxy Quest,give up,"Never give up, never surrender!"
 Galaxy Quest,hammer,By Grabthar's hammer... what a savings.
 Hitchhiker's Guide to the Galaxy,panic,DON'T PANIC.
