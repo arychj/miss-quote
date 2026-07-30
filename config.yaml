@@ -47,16 +47,20 @@ servers:
       # The words below are placeholders. What a server objects to is its own
       # business and belongs in the mounted ConfigMap, not in this repository.
       #
-      # What everybody owes is added up per server, kept in CREDITS_FILE, and
-      # published to the voice channel topic as `Eli: 0 Erik: 0`, which needs
-      # Manage Channels on the channel. Everyone in `users` above starts on the
-      # board at nothing owed. A repeat offender is announced more quietly, down
-      # to VIOLATION_VOLUME_FLOOR; none of that is per server, so it is set in
-      # the environment rather than here.
+      # A fine is a debit, counted per server and kept in CREDITS_FILE. The four
+      # people furthest into the red are published to the voice channel topic as
+      # `Eli: -9 Erik: -2`, which needs Manage Channels on the channel. Everyone
+      # in `users` above starts on the board at nothing spent, and only they are
+      # eligible for it: somebody the server has not written down is still heard
+      # and still fined, but a Discord nickname does not go in a topic.
+      #
+      # A repeat offender is announced more quietly, down to
+      # VIOLATION_VOLUME_FLOOR; none of that is per server, so it is set in the
+      # environment rather than here.
       #
       # Every name in `users` above is rendered at startup, against one, two,
-      # and three violations, so the fine lands while the offence is still what
-      # the channel is talking about.
+      # and three violations and in both wordings below, so the fine lands while
+      # the offence is still what the channel is talking about.
       verbal-morality:
         enabled: false
         config:
@@ -73,10 +77,18 @@ servers:
           #
           # `{user}` is the speaker's name from `users` where one is set.
           # `{credits}` is the fine, already pluralized: one credit per
-          # forbidden word in the utterance, so "1 credit" or "3 credits".
+          # forbidden word in the utterance, so "1 credit" or "3 credits". What
+          # a credit is called is CREDIT_CURRENCY.
           # `{violations}` is "a violation" or "multiple violations", to match.
           #
           # announcement: "{user}, you are fined {credits} for {violations} of the verbal morality statute."
+
+          # Optional, and the same placeholders. Said instead when the same
+          # speaker is fined again inside REPEAT_FINE_SECONDS — reading the
+          # whole sentence out again sounds like a bot that has lost track of
+          # what it just said.
+          #
+          # repeat_announcement: "{user}, you are also fined {credits} for {violations} of the verbal morality statute."
 
           # Optional. A 16-bit WAV played ahead of the announcement, named
           # relative to TTS_CACHE_DIR — put the file in the same volume the

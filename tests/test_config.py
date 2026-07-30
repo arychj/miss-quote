@@ -108,6 +108,74 @@ def test_a_negative_volume_floor_is_silence_rather_than_an_inversion(
     assert reloaded.morality_cfg.volume_floor == reloaded.SILENT_VOLUME
 
 
+def test_the_backoff_step_is_read_as_a_percentage(monkeypatch) -> None:
+    """A percentage is what somebody writes; a fraction is what scales audio."""
+    monkeypatch.setenv("VOLUME_BACKOFF_PERCENT", "20")
+
+    import config
+
+    assert importlib.reload(config).morality_cfg.backoff_step == 0.2
+
+
+def test_a_backoff_step_of_zero_leaves_a_repeat_offender_at_full_volume(
+    monkeypatch,
+) -> None:
+    """Nothing comes off per violation, which is how the backoff is turned off."""
+    monkeypatch.setenv("VOLUME_BACKOFF_PERCENT", "0")
+
+    import config
+
+    reloaded = importlib.reload(config)
+
+    assert reloaded.morality_cfg.backoff_step == reloaded.SILENT_VOLUME
+
+
+def test_a_negative_backoff_step_does_not_make_a_repeat_offender_louder(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("VOLUME_BACKOFF_PERCENT", "-10")
+
+    import config
+
+    reloaded = importlib.reload(config)
+
+    assert reloaded.morality_cfg.backoff_step == reloaded.SILENT_VOLUME
+
+
+def test_a_backoff_step_above_everything_reaches_the_floor_in_one(monkeypatch) -> None:
+    monkeypatch.setenv("VOLUME_BACKOFF_PERCENT", "400")
+
+    import config
+
+    reloaded = importlib.reload(config)
+
+    assert reloaded.morality_cfg.backoff_step == reloaded.UNITY_VOLUME
+
+
+def test_the_backoff_window_is_read_in_seconds(monkeypatch) -> None:
+    monkeypatch.setenv("VOLUME_BACKOFF_DURATION", "45")
+
+    import config
+
+    assert importlib.reload(config).morality_cfg.backoff_seconds == 45.0
+
+
+def test_the_currency_defaults_to_credits(monkeypatch) -> None:
+    monkeypatch.delenv("CREDIT_CURRENCY", raising=False)
+
+    import config
+
+    assert importlib.reload(config).morality_cfg.currency == "credit"
+
+
+def test_the_currency_can_be_something_else(monkeypatch) -> None:
+    monkeypatch.setenv("CREDIT_CURRENCY", "buck")
+
+    import config
+
+    assert importlib.reload(config).morality_cfg.currency == "buck"
+
+
 def test_the_topic_is_published_less_often_than_the_tally_is_saved() -> None:
     """A topic edit is rate limited to a couple per ten minutes; a write is not."""
     import config

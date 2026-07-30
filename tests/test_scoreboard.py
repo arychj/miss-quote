@@ -19,6 +19,8 @@ UNCONFIGURED_SERVER = "nobody-configured-this"
 ELI, ELI_ID = "Eli", 1
 ERIK, ERIK_ID = "Erik", 2
 
+ROSTER = {ELI_ID: ELI, ERIK_ID: ERIK}
+
 LEDGER_NAME = "credits.json"
 INTERVAL_SECONDS = 0.01
 PATIENCE_SECONDS = 2.0
@@ -99,6 +101,19 @@ def ledger(path) -> CreditLedger:
 
 
 @pytest.fixture
+def board(ledger) -> CreditLedger:
+    """
+    A ledger with the server's roster enrolled, as a built tool leaves one.
+
+    Only the roster may appear in a topic, so a test about what reaches the
+    channel has to have one; a test about what reaches the disk does not.
+    """
+    ledger.enroll(SERVER, ROSTER)
+
+    return ledger
+
+
+@pytest.fixture
 def channel() -> FakeChannel:
     return FakeChannel()
 
@@ -119,18 +134,18 @@ def _scoreboard(
 # ── publishing ────────────────────────────────────
 
 
-async def test_a_changed_tally_reaches_the_channel_topic(ledger, channel):
-    ledger.award(SERVER, ELI_ID, ELI, 2)
+async def test_a_changed_tally_reaches_the_channel_topic(board, channel):
+    board.fine(SERVER, ELI_ID, ELI, 2)
 
-    await _scoreboard(ledger, channel).publish()
+    await _scoreboard(board, channel).publish()
 
-    assert channel.topics == [f"{ELI}: 2"]
+    assert channel.topics == [f"{ELI}: -2 {ERIK}: 0"]
 
 
-async def test_an_unchanged_tally_is_not_published_twice(ledger, channel):
+async def test_an_unchanged_tally_is_not_published_twice(board, channel):
     """A topic edit is rate limited; spending one to say the same thing is waste."""
-    ledger.award(SERVER, ELI_ID, ELI, 2)
-    scoreboard = _scoreboard(ledger, channel)
+    board.fine(SERVER, ELI_ID, ELI, 2)
+    scoreboard = _scoreboard(board, channel)
 
     await scoreboard.publish()
     await scoreboard.publish()
@@ -138,67 +153,68 @@ async def test_an_unchanged_tally_is_not_published_twice(ledger, channel):
     assert len(channel.topics) == 1
 
 
-async def test_a_further_change_is_published(ledger, channel):
-    scoreboard = _scoreboard(ledger, channel)
-    ledger.award(SERVER, ELI_ID, ELI, 1)
+async def test_a_further_change_is_published(board, channel):
+    scoreboard = _scoreboard(board, channel)
+    board.fine(SERVER, ELI_ID, ELI, 1)
     await scoreboard.publish()
 
-    ledger.award(SERVER, ERIK_ID, ERIK, 1)
+    board.fine(SERVER, ERIK_ID, ERIK, 1)
     await scoreboard.publish()
 
-    assert channel.topics == [f"{ELI}: 1", f"{ELI}: 1 {ERIK}: 1"]
+    assert channel.topics == [f"{ELI}: -1 {ERIK}: 0", f"{ELI}: -1 {ERIK}: -1"]
 
 
-async def test_several_changes_between_ticks_are_one_edit(ledger, channel):
-    ledger.award(SERVER, ELI_ID, ELI, 1)
-    ledger.award(SERVER, ELI_ID, ELI, 1)
-    ledger.award(SERVER, ERIK_ID, ERIK, 1)
+async def test_several_changes_between_ticks_are_one_edit(board, channel):
+    board.fine(SERVER, ELI_ID, ELI, 1)
+    board.fine(SERVER, ELI_ID, ELI, 1)
+    board.fine(SERVER, ERIK_ID, ERIK, 1)
 
-    await _scoreboard(ledger, channel).publish()
+    await _scoreboard(board, channel).publish()
 
-    assert channel.topics == [f"{ELI}: 2 {ERIK}: 1"]
-
-
-async def test_nothing_is_published_when_the_bot_is_in_no_voice_channel(ledger):
-    ledger.award(SERVER, ELI_ID, ELI, 1)
-
-    await _scoreboard(ledger).publish()  # Reaching this without raising is the test.
+    assert channel.topics == [f"{ELI}: -2 {ERIK}: -1"]
 
 
-async def test_a_tally_missed_for_want_of_a_channel_is_published_later(ledger, channel):
+async def test_nothing_is_published_when_the_bot_is_in_no_voice_channel(board):
+    board.fine(SERVER, ELI_ID, ELI, 1)
+
+    await _scoreboard(board).publish()  # Reaching this without raising is the test.
+
+
+async def test_a_tally_missed_for_want_of_a_channel_is_published_later(board, channel):
     """Otherwise the topic waits for the next fine to catch up."""
-    ledger.award(SERVER, ELI_ID, ELI, 1)
-    scoreboard = Scoreboard(ledger, lambda server_id: FakeGuild(None), INTERVAL_SECONDS)
+    board.fine(SERVER, ELI_ID, ELI, 1)
+    scoreboard = Scoreboard(board, lambda server_id: FakeGuild(None), INTERVAL_SECONDS)
     await scoreboard.publish()
 
     scoreboard._guilds = lambda server_id: FakeGuild(FakeVoiceClient(channel))
     await scoreboard.publish()
 
-    assert channel.topics == [f"{ELI}: 1"]
+    assert channel.topics == [f"{ELI}: -1 {ERIK}: 0"]
 
 
-async def test_nothing_is_published_while_the_bot_is_disconnected(ledger, channel):
-    ledger.award(SERVER, ELI_ID, ELI, 1)
+async def test_nothing_is_published_while_the_bot_is_disconnected(board, channel):
+    board.fine(SERVER, ELI_ID, ELI, 1)
 
-    await _scoreboard(ledger, channel, connected=False).publish()
+    await _scoreboard(board, channel, connected=False).publish()
 
     assert channel.topics == []
 
 
 async def test_a_server_nobody_configured_is_not_published(ledger, channel):
     """The alias cannot be resolved to a guild, so there is nowhere to put it."""
-    ledger.award(UNCONFIGURED_SERVER, ELI_ID, ELI, 1)
+    ledger.enroll(UNCONFIGURED_SERVER, ROSTER)
+    ledger.fine(UNCONFIGURED_SERVER, ELI_ID, ELI, 1)
 
     await _scoreboard(ledger, channel).publish()
 
     assert channel.topics == []
 
 
-async def test_a_refused_edit_is_not_retried(ledger, caplog):
+async def test_a_refused_edit_is_not_retried(board, caplog):
     """Manage Channels is not going to appear on its own, and retries cost the bucket."""
     channel = FakeChannel(failure=discord.Forbidden(_response(FORBIDDEN_STATUS).response, "no"))
-    ledger.award(SERVER, ELI_ID, ELI, 1)
-    scoreboard = _scoreboard(ledger, channel)
+    board.fine(SERVER, ELI_ID, ELI, 1)
+    scoreboard = _scoreboard(board, channel)
 
     with caplog.at_level("WARNING"):
         await scoreboard.publish()
@@ -207,10 +223,10 @@ async def test_a_refused_edit_is_not_retried(ledger, caplog):
     assert any("Manage Channels" in record.message for record in caplog.records)
 
 
-async def test_a_failed_edit_is_tried_again(ledger, channel, caplog):
+async def test_a_failed_edit_is_tried_again(board, channel, caplog):
     channel.failure = _response(SERVER_ERROR_STATUS)
-    ledger.award(SERVER, ELI_ID, ELI, 1)
-    scoreboard = _scoreboard(ledger, channel)
+    board.fine(SERVER, ELI_ID, ELI, 1)
+    scoreboard = _scoreboard(board, channel)
 
     with caplog.at_level("WARNING"):
         await scoreboard.publish()
@@ -218,23 +234,23 @@ async def test_a_failed_edit_is_tried_again(ledger, channel, caplog):
     channel.failure = None
     await scoreboard.publish()
 
-    assert channel.topics == [f"{ELI}: 1"]
+    assert channel.topics == [f"{ELI}: -1 {ERIK}: 0"]
 
 
 # ── persisting ────────────────────────────────────
 
 
 async def test_a_changed_tally_is_written_to_disk(ledger, path):
-    ledger.award(SERVER, ELI_ID, ELI, 2)
+    ledger.fine(SERVER, ELI_ID, ELI, 2)
 
     await _scoreboard(ledger).persist()
 
-    assert CreditLedger(path).total(SERVER, ELI_ID) == 2
+    assert CreditLedger(path).total(SERVER, ELI_ID) == -2
 
 
 async def test_an_unchanged_tally_is_not_written_again(ledger, path):
     scoreboard = _scoreboard(ledger)
-    ledger.award(SERVER, ELI_ID, ELI, 2)
+    ledger.fine(SERVER, ELI_ID, ELI, 2)
     await scoreboard.persist()
     written = path.stat().st_mtime_ns
 
@@ -252,13 +268,13 @@ async def test_nothing_is_written_for_a_tally_nobody_has_touched(ledger, path):
 async def test_a_fine_landing_during_a_write_is_not_marked_saved(ledger, path):
     """The revision is read before the write, so the next tick picks it up."""
     scoreboard = _scoreboard(ledger)
-    ledger.award(SERVER, ELI_ID, ELI, 1)
+    ledger.fine(SERVER, ELI_ID, ELI, 1)
 
     await scoreboard.persist()
-    ledger.award(SERVER, ERIK_ID, ERIK, 1)
+    ledger.fine(SERVER, ERIK_ID, ERIK, 1)
     await scoreboard.persist()
 
-    assert CreditLedger(path).total(SERVER, ERIK_ID) == 1
+    assert CreditLedger(path).total(SERVER, ERIK_ID) == -1
 
 
 # ── the topic's own interval ──────────────────────
@@ -292,9 +308,9 @@ def test_a_turn_never_comes_when_the_topic_is_switched_off(ledger):
     assert not scoreboard._topic_turn_has_come(now=NOW)
 
 
-async def test_a_tally_is_still_saved_with_the_topic_switched_off(ledger, channel, path):
-    ledger.award(SERVER, ELI_ID, ELI, 1)
-    task = asyncio.create_task(_scoreboard(ledger, channel, topic_seconds=NO_TOPIC).run())
+async def test_a_tally_is_still_saved_with_the_topic_switched_off(board, channel, path):
+    board.fine(SERVER, ELI_ID, ELI, 1)
+    task = asyncio.create_task(_scoreboard(board, channel, topic_seconds=NO_TOPIC).run())
 
     async with asyncio.timeout(PATIENCE_SECONDS):
         while not path.is_file():
@@ -308,9 +324,9 @@ async def test_a_tally_is_still_saved_with_the_topic_switched_off(ledger, channe
 # ── the loop ──────────────────────────────────────
 
 
-async def test_the_loop_publishes_and_saves(ledger, channel, path):
-    ledger.award(SERVER, ELI_ID, ELI, 1)
-    task = asyncio.create_task(_scoreboard(ledger, channel).run())
+async def test_the_loop_publishes_and_saves(board, channel, path):
+    board.fine(SERVER, ELI_ID, ELI, 1)
+    task = asyncio.create_task(_scoreboard(board, channel).run())
 
     async with asyncio.timeout(PATIENCE_SECONDS):
         while not channel.topics or not path.is_file():
@@ -318,12 +334,12 @@ async def test_the_loop_publishes_and_saves(ledger, channel, path):
 
     task.cancel()
 
-    assert channel.topics == [f"{ELI}: 1"]
+    assert channel.topics == [f"{ELI}: -1 {ERIK}: 0"]
 
 
-async def test_a_failing_tick_does_not_stop_the_loop(ledger, channel, caplog):
-    ledger.award(SERVER, ELI_ID, ELI, 1)
-    scoreboard = _scoreboard(ledger, channel)
+async def test_a_failing_tick_does_not_stop_the_loop(board, channel, caplog):
+    board.fine(SERVER, ELI_ID, ELI, 1)
+    scoreboard = _scoreboard(board, channel)
     failures = []
 
     async def once() -> None:
@@ -402,8 +418,8 @@ async def test_the_bot_starts_publishing_once(stt_bot, ledger):
 
 async def test_shutting_down_writes_the_tally(stt_bot, ledger, path):
     """The interval task is cancelled by then; the file is what is left."""
-    ledger.award(SERVER, ELI_ID, ELI, 5)
+    ledger.fine(SERVER, ELI_ID, ELI, 5)
 
     await stt_bot._shutdown()
 
-    assert CreditLedger(path).total(SERVER, ELI_ID) == 5
+    assert CreditLedger(path).total(SERVER, ELI_ID) == -5

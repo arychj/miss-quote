@@ -27,6 +27,10 @@ MILLISECONDS_PER_SECOND = 1000
 UNITY_VOLUME = 1.0
 SILENT_VOLUME = 0.0
 
+# A fraction is what the code scales audio by; a percentage is what somebody
+# setting one in a deployment writes.
+PERCENT = 100
+
 
 def _env_str(name: str, default: str) -> str:
     value = os.getenv(name)
@@ -53,6 +57,11 @@ def _env_float(name: str, default: float) -> float:
         return float(value)
     except ValueError as exc:
         raise ValueError(f"{name} must be a number, got {value!r}") from exc
+
+
+def _env_percent(name: str, default: float) -> float:
+    """A percentage from the environment, as the fraction everything else uses."""
+    return _env_float(name, default) / PERCENT
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -320,9 +329,9 @@ class MoralityConfig:
     The standing tally of fines, and how quiet a repeat offender gets.
 
     Where the rest of the tool's settings are per server and live in the mounted
-    file, these are per deployment: where the tally is kept, how often it is
-    published, and the loudness floor, none of which one server should be able
-    to set differently from another.
+    file, these are per deployment: where the tally is kept, what it is counted
+    in, how often it is published, and how the backoff behaves, none of which one
+    server should be able to set differently from another.
     """
 
     # The tally, as JSON, kept across restarts. Mount a volume here; an
@@ -330,6 +339,12 @@ class MoralityConfig:
     credits_file: Path = field(
         default_factory=lambda: Path(_env_str("CREDITS_FILE", "/credits/credits.json"))
     )
+
+    # What a fine is denominated in, in the singular. The plural is grown from
+    # it by the same spelling rules the word list uses, so a deployment that
+    # fines in something other than credits sets one variable rather than
+    # rewriting every server's announcement.
+    currency: str = field(default_factory=lambda: _env_str("CREDIT_CURRENCY", "credit"))
 
     # How often a changed tally is written to disk, and how often the loop that
     # does it wakes at all. Any value at or below zero stops the loop, leaving
@@ -345,6 +360,34 @@ class MoralityConfig:
     # below zero keeps the tally off the topic entirely, and still saves it.
     topic_interval_seconds: float = field(
         default_factory=lambda: _env_float("CREDITS_TOPIC_SECONDS", 300.0)
+    )
+
+    # How soon after being fined a speaker is announced as being fined *again*,
+    # which is a second wording rather than a second announcement. Short, and
+    # deliberately much shorter than the backoff window: it is for the flurry
+    # where somebody is still mid-sentence, not for the argument they had five
+    # minutes ago. 0 means nothing is ever a repeat.
+    repeat_seconds: float = field(
+        default_factory=lambda: _env_float("REPEAT_FINE_SECONDS", 5.0)
+    )
+
+    # How long a violation counts against how loudly the next one is announced.
+    # A sliding window, so a speaker is back to full volume this long after
+    # their last one rather than at the top of some fixed period.
+    backoff_seconds: float = field(
+        default_factory=lambda: _env_float("VOLUME_BACKOFF_DURATION", 300.0)
+    )
+
+    # How much of an announcement each violation inside that window takes off.
+    # At the default, fifteen of them reach a floor of a quarter. 0 turns the
+    # backoff off, there being nothing to take off; anything above 100% would
+    # make one violation enough to reach the floor, and anything below 0 would
+    # make a repeat offender louder rather than quieter.
+    backoff_step: float = field(
+        default_factory=lambda: min(
+            UNITY_VOLUME,
+            max(SILENT_VOLUME, _env_percent("VOLUME_BACKOFF_PERCENT", 5.0)),
+        )
     )
 
     # The quietest an announcement gets, as a fraction of PLAYBACK_VOLUME, once
