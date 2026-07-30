@@ -42,6 +42,20 @@ servers:
     # `enabled: true` is off, and a name no tool answers to is reported at
     # startup and skipped.
     tools:
+      # Answers out loud with a film line when someone says the phrase that sets
+      # it off.
+      #
+      # There is nothing to configure per server: the triggers and the lines are
+      # one list per deployment, read from QUOTES_FILE, because a film everybody
+      # in one channel has seen is one everybody in the next has too. Enabling
+      # the tool is the whole decision.
+      #
+      # A trigger that has just fired goes quiet for a while, so a channel that
+      # keeps saying the same word only hears the joke once. How long is
+      # QUOTE_BACKOFF_SECONDS, which is not per server either.
+      quotes:
+        enabled: false
+
       # Announces a fine, out loud, when someone says one of `words`.
       #
       # The words below are placeholders. What a server objects to is its own

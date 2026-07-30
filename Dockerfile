@@ -29,6 +29,7 @@ WORKDIR /app
 COPY audio/ audio/
 COPY bot/ bot/
 COPY ledger/ ledger/
+COPY resources/ resources/
 COPY stt/ stt/
 COPY tools/ tools/
 COPY transcript/ transcript/
@@ -40,7 +41,8 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     TRANSCRIPT_DIR=/transcripts \
     TTS_CACHE_DIR=/cache/tts \
-    CREDITS_FILE=/credits/credits.json
+    CREDITS_FILE=/credits/credits.json \
+    QUOTES_FILE=/app/resources/quotes.csv
 
 # The cache and the credits directory are created either way. Mounting a volume
 # over each is what makes rendered speech and the tally outlive the pod; without

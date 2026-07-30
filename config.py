@@ -412,6 +412,40 @@ class MoralityConfig:
 
 
 # ──────────────────────────────────────────────
+# Quotes
+# ──────────────────────────────────────────────
+
+# The list the image ships with, found relative to this file so a checkout and a
+# container agree without either of them being told where they are.
+BUNDLED_QUOTES = Path(__file__).resolve().parent / "resources" / "quotes.csv"
+
+
+@dataclass(frozen=True)
+class QuotesConfig:
+    """
+    Where the `quotes` tool reads its triggers and lines from.
+
+    Per deployment rather than per server, unlike the words a server objects to:
+    a film everybody in one channel has seen is one everybody in the next has
+    too, and a list per server is a second file to keep current.
+    """
+
+    # A CSV of `movie,trigger,quote`. Mount one over this path, or point the
+    # variable at it, to say something the shipped list does not.
+    file: Path = field(
+        default_factory=lambda: Path(_env_str("QUOTES_FILE", str(BUNDLED_QUOTES)))
+    )
+
+    # How long a trigger stays spent after it fires. The joke is the
+    # recognition, and a channel that keeps saying the same word does not want
+    # the same line back each time. Any value at or below zero answers every
+    # trigger every time, which is a deployment's own business to want.
+    backoff_seconds: float = field(
+        default_factory=lambda: _env_float("QUOTE_BACKOFF_SECONDS", 300.0)
+    )
+
+
+# ──────────────────────────────────────────────
 # Logging
 # ──────────────────────────────────────────────
 @dataclass(frozen=True)
@@ -657,5 +691,6 @@ tts_cfg = TTSConfig()
 transcript_cfg = TranscriptConfig()
 process_cfg = ProcessConfig()
 morality_cfg = MoralityConfig()
+quotes_cfg = QuotesConfig()
 log_cfg = LogConfig()
 file_cfg = FileConfig.load()
