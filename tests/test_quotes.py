@@ -1,5 +1,6 @@
-"""What sets a quote off, what comes back, and how long the line stays spent."""
+"""What sets a quote off, what comes back, how long the line stays spent, and who is paid for placing it."""
 
+import asyncio
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -12,10 +13,33 @@ from miss_quote.config import (
     ServerConfig,
     ToolSettings,
     quotes_cfg,
+    scoreboard_cfg,
 )
-from miss_quote.tools.base import ToolContext
-from miss_quote.tools.quotes import Quote, Quotes, RecentQuotes, _load
+from miss_quote.ledger.credits import CreditLedger
+from miss_quote.tools.base import ToolContext, Toolbox
+from miss_quote.tools.quotes import (
+    ANNOUNCEMENT_KEY,
+    ANSWER_SECONDS_KEY,
+    DEFAULT_ANNOUNCEMENT,
+    DEFAULT_REMARKS,
+    DEFAULT_SELF_ANSWER_ANNOUNCEMENT,
+    DEFAULT_SELF_ANSWER_PENALTY,
+    DEFAULT_TIE_ANNOUNCEMENT,
+    PENALIZE_SELF_ANSWERS_KEY,
+    REMARKS_KEY,
+    SELF_ANSWER_ANNOUNCEMENT_KEY,
+    SELF_ANSWER_PENALTY_KEY,
+    TIE_ANNOUNCEMENT_KEY,
+    TIE_SECONDS_KEY,
+    Quote,
+    Quotes,
+    RecentQuotes,
+    Round,
+    _denominated,
+    _load,
+)
 from miss_quote.tools.runner import ToolRunner
+from miss_quote.tools.scoreboard import Scoreboard
 from miss_quote.transcript.writer import Source, Utterance
 
 SERVER_ALIAS = "first-server"
@@ -25,6 +49,12 @@ OTHER_SPEAKER = "Speaker Two"
 SPEAKER_ID = 234567890123456789
 OTHER_SPEAKER_ID = 345678901234567890
 ROSTER = {SPEAKER_ID: SPEAKER, OTHER_SPEAKER_ID: OTHER_SPEAKER}
+
+# Whoever sets a line off, kept apart from the two who answer it: they are
+# barred from their own round, so a test about winning one should not have to
+# think about who spoke first.
+ASKER = "Speaker Three"
+ASKER_ID = 456789012345678901
 
 SOURCE = Source(
     guild_id=1, guild_alias=SERVER_ALIAS, channel_id=2, channel="general-voice"
@@ -67,6 +97,36 @@ BACKOFF = 300.0
 NO_BACKOFF = 0.0
 SHORT_WINDOW = 30.0
 
+# The round, on the same terms: fixed here rather than read from whatever the
+# defaults happen to be.
+ANSWER_WINDOW = 5.0
+TIE_WINDOW = 1.0
+NO_WINDOW = 0.0
+
+# Naming the film, the way the game show does and the several ways a channel
+# actually says it.
+ANSWER = f"What is {MOVIE}"
+CONTRACTED_ANSWER = f"What's {MOVIE}?"
+WRONG_ANSWER = f"What is {OTHER_MOVIE}"
+
+# A title with a leading article, which an answer may leave off, and one with an
+# abbreviation a channel says as a word.
+ARTICLE_MOVIE = "The Matrix"
+VERSUS_MOVIE = "Tucker and Dale vs Evil"
+
+# Which ending the tests see, settled by `settled` below so an announcement is a
+# fixed string rather than one of several.
+REMARK = DEFAULT_REMARKS[0]
+ADDED_REMARK = "having watched it more recently than is respectable."
+
+ONE_CREDIT = 1
+TWO_CREDITS = 2
+NOTHING = 0
+
+LEDGER_NAME = "credits.json"
+
+NOW = 1_000.0
+
 
 class RecordingSpeaker:
     """A speaker that keeps what it was asked to say instead of playing it."""
@@ -101,6 +161,20 @@ class FakeSpeech:
 
         self.held.add(text)
         return True
+
+
+class BlockingSpeaker(RecordingSpeaker):
+    """A speaker that holds the channel open until it is let go of."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.playing = asyncio.Event()
+        self.finish = asyncio.Event()
+
+    async def play(self, source, audio, scale: float = UNITY_VOLUME) -> None:
+        self.playing.set()
+        await self.finish.wait()
+        await super().play(source, audio, scale)
 
 
 class FakeSession:
@@ -146,9 +220,42 @@ def _pointed_at(monkeypatch, path: Path) -> None:
     monkeypatch.setattr("miss_quote.tools.quotes.quotes_cfg", replace(quotes_cfg, file=path))
 
 
-def _tool(speaker, users=None) -> Quotes:
+@pytest.fixture(autouse=True)
+def settled(monkeypatch) -> None:
+    """
+    Pin which ending an announcement takes, so it is a string a test can name.
+
+    Autouse because every test that hears an award wants it settled, and the one
+    about the drawing does its own arranging.
+    """
+    monkeypatch.setattr(
+        "miss_quote.tools.quotes._chosen", lambda remarks: remarks[0]
+    )
+
+
+@pytest.fixture
+def board(monkeypatch, tmp_path) -> Scoreboard:
+    """
+    A real board on a ledger of this test's own.
+
+    The tool asks for the shared ledger, and one reaching the real one would read
+    whatever the machine running the tests happens to have at /credits.
+    """
+    ledger = CreditLedger(tmp_path / LEDGER_NAME)
+    monkeypatch.setattr("miss_quote.tools.scoreboard.shared_ledger", lambda: ledger)
+
+    return Scoreboard(ToolContext(server=SERVER_ALIAS, users=ROSTER))
+
+
+def _tool(speaker, users=None, config=None, board=None) -> Quotes:
     return Quotes(
-        ToolContext(server=SERVER_ALIAS, speaker=speaker, users=users or {})
+        ToolContext(
+            server=SERVER_ALIAS,
+            config=config or {},
+            speaker=speaker,
+            users=users or {},
+            tools=Toolbox([board] if board is not None else []),
+        )
     )
 
 
@@ -158,8 +265,49 @@ def _utterance(text: str, user: str = SPEAKER, user_id: int = SPEAKER_ID) -> Utt
     )
 
 
-async def _hear(tool: Quotes, text: str, user: str = SPEAKER) -> None:
-    await tool.handle_utterance(_utterance(text, user), FakeSession(SOURCE))
+async def _hear(
+    tool: Quotes, text: str, user: str = SPEAKER, user_id: int = SPEAKER_ID
+) -> None:
+    await tool.handle_utterance(_utterance(text, user, user_id), FakeSession(SOURCE))
+
+
+def _announced(user: str = SPEAKER, tied: bool = False, remark: str = REMARK) -> str:
+    """The award as the tool will say it, built from the wording it ships with."""
+    template = DEFAULT_TIE_ANNOUNCEMENT if tied else DEFAULT_ANNOUNCEMENT
+
+    return template.format(user=user, credits=_denominated(ONE_CREDIT), remark=remark)
+
+
+async def _quoted(tool: Quotes, trigger: str = TRIGGER) -> None:
+    """Set a line off from somebody who is then barred from naming it."""
+    await _hear(tool, trigger, user=ASKER, user_id=ASKER_ID)
+
+
+def _rebuked(user: str = SPEAKER, penalty: int = DEFAULT_SELF_ANSWER_PENALTY) -> str:
+    """What somebody naming their own line is told."""
+    return DEFAULT_SELF_ANSWER_ANNOUNCEMENT.format(
+        user=user, credits=_denominated(penalty), remark=REMARK
+    )
+
+
+def _warmed_awards(
+    *names: str, remarks: tuple = DEFAULT_REMARKS, policing: bool = True
+) -> list[str]:
+    """
+    Every wording for each name, in the order the pre-warm renders them.
+
+    Built from the templates rather than written out, so a reworded default is
+    one edit and not a test that fails for saying the same thing differently.
+    """
+    return [
+        wording
+        for name in names
+        for wording in (
+            *(_announced(name, remark=remark) for remark in remarks),
+            _announced(name, tied=True),
+            *([_rebuked(name)] if policing else []),
+        )
+    ]
 
 
 # ── the file ──────────────────────────────────────
@@ -479,7 +627,7 @@ async def test_a_quote_naming_nobody_is_warmed_once_however_many_speakers(
 ):
     await _tool(speaker, users=ROSTER).prewarm()
 
-    assert speech.warmed == [QUOTE, OTHER_QUOTE]
+    assert speech.warmed == [QUOTE, OTHER_QUOTE, *_warmed_awards(SPEAKER, OTHER_SPEAKER)]
 
 
 async def test_a_quote_naming_the_speaker_is_warmed_per_name(
@@ -492,7 +640,27 @@ async def test_a_quote_naming_the_speaker_is_warmed_per_name(
     assert speech.warmed == [
         PERSONAL_QUOTE.format(user=SPEAKER),
         PERSONAL_QUOTE.format(user=OTHER_SPEAKER),
+        *_warmed_awards(SPEAKER, OTHER_SPEAKER),
     ]
+
+
+async def test_both_wordings_of_the_award_are_warmed_per_name(
+    quotes_file, speech, speaker
+):
+    """A tie is announced as one, and nobody should wait for the synthesizer for it."""
+    await _tool(speaker, users=ROSTER).prewarm()
+
+    assert _announced(SPEAKER, tied=True) in speech.warmed
+
+
+async def test_no_award_is_warmed_where_nothing_is_being_asked(
+    quotes_file, speech, speaker
+):
+    tool = _tool(speaker, users=ROSTER, config={ANSWER_SECONDS_KEY: NO_WINDOW})
+
+    await tool.prewarm()
+
+    assert speech.warmed == [QUOTE, OTHER_QUOTE]
 
 
 async def test_a_quote_naming_the_speaker_warms_nothing_without_a_roster(
@@ -538,4 +706,693 @@ async def test_the_runner_warms_a_configured_server(quotes_file, speech, speaker
     await runner.prewarm()
 
     assert runner.problems == []
-    assert speech.warmed == [QUOTE, OTHER_QUOTE]
+    assert speech.warmed == [QUOTE, OTHER_QUOTE, *_warmed_awards(SPEAKER, OTHER_SPEAKER)]
+
+
+# ── the round ─────────────────────────────────────
+
+
+def _round(movie: str = MOVIE, window: float = ANSWER_WINDOW, tie: float = TIE_WINDOW):
+    """A round on a fixed clock, so a window is tested rather than waited out."""
+    return Round(movie, window, tie, opened=NOW)
+
+
+def test_naming_the_film_inside_the_window_earns():
+    assert _round().answered_by(_utterance(ANSWER), now=NOW + 1)
+
+
+def test_naming_the_film_after_the_window_earns_nothing():
+    assert not _round().answered_by(_utterance(ANSWER), now=NOW + ANSWER_WINDOW + 1)
+
+
+def test_naming_the_wrong_film_earns_nothing():
+    assert not _round().answered_by(_utterance(WRONG_ANSWER), now=NOW + 1)
+
+
+def test_saying_the_film_without_asking_earns_nothing():
+    """It is a question or it is somebody talking about a film."""
+    assert not _round().answered_by(_utterance(MOVIE), now=NOW + 1)
+
+
+def test_a_second_answer_inside_the_tie_window_earns_too():
+    """Which of two people the transcriber returned first is not a fact about them."""
+    opened = _round()
+    opened.answered_by(_utterance(ANSWER, SPEAKER, SPEAKER_ID), now=NOW + 1)
+
+    assert opened.answered_by(
+        _utterance(ANSWER, OTHER_SPEAKER, OTHER_SPEAKER_ID), now=NOW + 1 + TIE_WINDOW
+    )
+
+
+def test_a_second_answer_after_the_tie_window_has_been_beaten_to_it():
+    opened = _round()
+    opened.answered_by(_utterance(ANSWER, SPEAKER, SPEAKER_ID), now=NOW + 1)
+
+    assert not opened.answered_by(
+        _utterance(ANSWER, OTHER_SPEAKER, OTHER_SPEAKER_ID),
+        now=NOW + 1 + TIE_WINDOW + 0.1,
+    )
+
+
+def test_the_tie_window_runs_from_the_first_answer_rather_than_the_question():
+    """Nobody is punished for the round having been asked a moment earlier."""
+    opened = _round()
+    opened.answered_by(_utterance(ANSWER, SPEAKER, SPEAKER_ID), now=NOW + ANSWER_WINDOW)
+
+    assert opened.answered_by(
+        _utterance(ANSWER, OTHER_SPEAKER, OTHER_SPEAKER_ID), now=NOW + ANSWER_WINDOW
+    )
+
+
+def test_no_tie_window_pays_only_whoever_was_first():
+    opened = _round(tie=NO_WINDOW)
+    opened.answered_by(_utterance(ANSWER, SPEAKER, SPEAKER_ID), now=NOW + 1)
+
+    assert not opened.answered_by(
+        _utterance(ANSWER, OTHER_SPEAKER, OTHER_SPEAKER_ID), now=NOW + 1.1
+    )
+
+
+def test_nobody_earns_twice_from_one_round():
+    opened = _round()
+    opened.answered_by(_utterance(ANSWER), now=NOW + 1)
+
+    assert not opened.answered_by(_utterance(ANSWER), now=NOW + 1.5)
+
+
+def test_a_round_is_spent_once_its_window_has_passed():
+    assert _round().expired(now=NOW + ANSWER_WINDOW + 1)
+
+
+def test_a_round_inside_its_window_is_still_open():
+    assert not _round().expired(now=NOW + ANSWER_WINDOW - 1)
+
+
+# ── what counts as naming the film ────────────────
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        ANSWER,
+        ANSWER.lower(),
+        CONTRACTED_ANSWER,
+        f"oh, {ANSWER}!",
+        f"{ANSWER}, obviously",
+    ],
+)
+def test_the_film_may_be_named_however_it_is_said(answer):
+    assert _round().answered_by(_utterance(answer), now=NOW + 1)
+
+
+def test_a_leading_article_is_optional():
+    """The file writes the title as the poster does; a channel says either."""
+    assert _round(movie=ARTICLE_MOVIE).answered_by(
+        _utterance("what is matrix"), now=NOW + 1
+    )
+
+
+def test_a_title_with_a_leading_article_answers_to_it_as_well():
+    assert _round(movie=ARTICLE_MOVIE).answered_by(
+        _utterance(f"what is {ARTICLE_MOVIE}"), now=NOW + 1
+    )
+
+
+def test_an_abbreviation_in_a_title_may_be_said_as_a_word():
+    assert _round(movie=VERSUS_MOVIE).answered_by(
+        _utterance("what is tucker and dale versus evil"), now=NOW + 1
+    )
+
+
+def test_a_title_said_as_a_word_answers_to_the_abbreviation():
+    assert _round(movie="Tucker and Dale versus Evil").answered_by(
+        _utterance("what is tucker and dale vs. evil"), now=NOW + 1
+    )
+
+
+def test_an_apostrophe_the_transcript_dropped_still_names_the_film():
+    assert _round(movie="Hitchhiker's Guide to the Galaxy").answered_by(
+        _utterance("what is hitchhikers guide to the galaxy"), now=NOW + 1
+    )
+
+
+def test_a_longer_word_is_not_the_film():
+    assert not _round().answered_by(_utterance(f"what is {MOVIE}ing"), now=NOW + 1)
+
+
+# ── being paid for it ─────────────────────────────
+
+
+async def test_naming_the_film_earns_a_credit(quotes_file, speech, speaker, board):
+    tool = _tool(speaker, board=board)
+    await _quoted(tool)
+
+    await _hear(tool, ANSWER)
+
+    assert board.balance(SPEAKER_ID) == ONE_CREDIT
+
+
+async def test_the_question_is_only_asked_once_the_line_has_been_said(
+    quotes_file, speech, speaker, board
+):
+    """Nobody can name a film the channel has not been quoted at yet."""
+    await _hear(_tool(speaker, board=board), ANSWER)
+
+    assert board.balance(SPEAKER_ID) == NOTHING
+
+
+async def test_naming_the_wrong_film_earns_nothing(quotes_file, speech, speaker, board):
+    tool = _tool(speaker, board=board)
+    await _quoted(tool)
+
+    await _hear(tool, WRONG_ANSWER)
+
+    assert board.balance(SPEAKER_ID) == NOTHING
+
+
+async def test_two_people_naming_it_at_once_are_both_paid(
+    quotes_file, speech, speaker, board
+):
+    tool = _tool(speaker, board=board)
+    await _quoted(tool)
+
+    await _hear(tool, ANSWER, user=SPEAKER, user_id=SPEAKER_ID)
+    await _hear(tool, ANSWER, user=OTHER_SPEAKER, user_id=OTHER_SPEAKER_ID)
+
+    assert board.balance(SPEAKER_ID) == board.balance(OTHER_SPEAKER_ID) == ONE_CREDIT
+
+
+async def test_saying_it_twice_is_paid_once(quotes_file, speech, speaker, board):
+    tool = _tool(speaker, board=board)
+    await _quoted(tool)
+
+    await _hear(tool, ANSWER)
+    await _hear(tool, ANSWER)
+
+    assert board.balance(SPEAKER_ID) == ONE_CREDIT
+
+
+async def test_a_credit_is_earned_per_round(quotes_file, speech, speaker, board):
+    tool = _tool(speaker, board=board)
+
+    await _quoted(tool)
+    await _hear(tool, ANSWER)
+    await _quoted(tool, OTHER_TRIGGER)
+    await _hear(tool, f"what is {OTHER_MOVIE}")
+
+    assert board.balance(SPEAKER_ID) == TWO_CREDITS
+
+
+async def test_two_rounds_may_be_open_at_once(quotes_file, speech, speaker, board):
+    """An answer names its own film, so neither question is made ambiguous."""
+    tool = _tool(speaker, board=board)
+    await _quoted(tool)
+    await _quoted(tool, OTHER_TRIGGER)
+
+    await _hear(tool, ANSWER)
+
+    assert board.balance(SPEAKER_ID) == ONE_CREDIT
+
+
+async def test_naming_the_film_is_announced(quotes_file, speech, speaker, board):
+    tool = _tool(speaker, board=board)
+    await _quoted(tool)
+
+    await _hear(tool, ANSWER)
+
+    assert speech.asked == [QUOTE, _announced(SPEAKER)]
+
+
+async def test_the_announcement_names_whoever_got_it(
+    quotes_file, speech, speaker, board
+):
+    tool = _tool(speaker, board=board)
+    await _quoted(tool)
+
+    await _hear(tool, ANSWER, user=OTHER_SPEAKER, user_id=OTHER_SPEAKER_ID)
+
+    assert speech.asked[-1] == _announced(OTHER_SPEAKER)
+
+
+async def test_an_award_has_no_chime_in_front_of_it(
+    quotes_file, speech, speaker, board
+):
+    """A flourish is for an interruption; this one answers a question already asked."""
+    tool = _tool(speaker, board=board)
+    await _quoted(tool)
+
+    await _hear(tool, ANSWER)
+
+    _, spoken = speaker.played[-1]
+    assert spoken == _announced(SPEAKER)
+
+
+async def test_the_award_is_announced_where_it_was_earned(
+    quotes_file, speech, speaker, board
+):
+    tool = _tool(speaker, board=board)
+    await _quoted(tool)
+
+    await _hear(tool, ANSWER)
+
+    played_source, _ = speaker.played[-1]
+    assert played_source == SOURCE
+
+
+async def test_a_tied_answer_is_told_it_also_won(quotes_file, speech, speaker, board):
+    """The whole sentence again reads as though the bot had lost track."""
+    tool = _tool(speaker, board=board)
+    await _quoted(tool)
+
+    await _hear(tool, ANSWER, user=SPEAKER, user_id=SPEAKER_ID)
+    await _hear(tool, ANSWER, user=OTHER_SPEAKER, user_id=OTHER_SPEAKER_ID)
+
+    assert speech.asked[-1] == _announced(OTHER_SPEAKER, tied=True)
+
+
+async def _mid_announcement(board) -> tuple[Quotes, BlockingSpeaker, asyncio.Task]:
+    """A tool with an award playing and the channel held open."""
+    speaker = BlockingSpeaker()
+    tool = _tool(speaker, board=board)
+
+    quoting = asyncio.create_task(_quoted(tool))
+    await speaker.playing.wait()
+    speaker.finish.set()
+    await quoting
+
+    speaker.playing.clear()
+    speaker.finish.clear()
+    playing = asyncio.create_task(_hear(tool, ANSWER))
+    await speaker.playing.wait()
+
+    return tool, speaker, playing
+
+
+async def test_a_tied_award_is_announced_while_the_first_is_still_playing(
+    quotes_file, speech, board
+):
+    """Both are said. Paying somebody silently reads as the round having missed them."""
+    tool, speaker, playing = await _mid_announcement(board)
+
+    tying = asyncio.create_task(
+        _hear(tool, ANSWER, user=OTHER_SPEAKER, user_id=OTHER_SPEAKER_ID)
+    )
+    speaker.finish.set()
+    await asyncio.gather(playing, tying)
+
+    # Unordered: what keeps two announcements in the order they were earned is
+    # the real speaker's per-server lock, which this stand-in does not hold.
+    assert sorted(speech.asked) == sorted(
+        [QUOTE, _announced(SPEAKER), _announced(OTHER_SPEAKER, tied=True)]
+    )
+
+
+async def test_a_rebuke_is_announced_while_something_is_still_playing(
+    quotes_file, speech, board
+):
+    """A rebuke passed over is a fine nobody was told about."""
+    tool, speaker, playing = await _mid_announcement(board)
+
+    rebuking = asyncio.create_task(_hear(tool, ANSWER, user=ASKER, user_id=ASKER_ID))
+    speaker.finish.set()
+    await asyncio.gather(playing, rebuking)
+
+    assert _rebuked(ASKER) in speech.asked
+
+
+async def test_a_tied_award_is_still_paid(quotes_file, speech, board):
+    tool, speaker, playing = await _mid_announcement(board)
+
+    tying = asyncio.create_task(
+        _hear(tool, ANSWER, user=OTHER_SPEAKER, user_id=OTHER_SPEAKER_ID)
+    )
+    speaker.finish.set()
+    await asyncio.gather(playing, tying)
+
+    assert board.balance(OTHER_SPEAKER_ID) == ONE_CREDIT
+
+
+async def test_the_channel_is_free_again_once_an_award_has_been_announced(
+    quotes_file, speech, board
+):
+    tool, speaker, playing = await _mid_announcement(board)
+    speaker.finish.set()
+    await playing
+
+    await _quoted(tool, OTHER_TRIGGER)
+
+    assert speech.asked[-1] == OTHER_QUOTE
+
+
+async def test_a_server_may_write_its_own_announcement(
+    quotes_file, speech, speaker, board
+):
+    wording = "{user} wins {credits}."
+    tool = _tool(speaker, config={ANNOUNCEMENT_KEY: wording}, board=board)
+    await _quoted(tool)
+
+    await _hear(tool, ANSWER)
+
+    assert speech.asked[-1] == wording.format(
+        user=SPEAKER, credits=_denominated(ONE_CREDIT)
+    )
+
+
+def test_an_announcement_with_an_unfillable_placeholder_will_not_start(
+    quotes_file, speech, speaker
+):
+    """Discovered at startup rather than at the moment there is a credit to explain."""
+    with pytest.raises(ValueError, match=ANNOUNCEMENT_KEY):
+        _tool(speaker, config={ANNOUNCEMENT_KEY: "{user} wins {tally}."})
+
+
+def test_a_tie_announcement_with_an_unfillable_placeholder_will_not_start(
+    quotes_file, speech, speaker
+):
+    with pytest.raises(ValueError, match=TIE_ANNOUNCEMENT_KEY):
+        _tool(speaker, config={TIE_ANNOUNCEMENT_KEY: "{user} also wins {tally}."})
+
+
+async def test_the_ending_is_drawn_from_the_list(
+    monkeypatch, quotes_file, speech, speaker, board
+):
+    """One fixed sentence is a joke told once and then endured."""
+    chosen = DEFAULT_REMARKS[-1]
+    monkeypatch.setattr(
+        "miss_quote.tools.quotes._chosen", lambda remarks: remarks[-1]
+    )
+    tool = _tool(speaker, board=board)
+    await _quoted(tool)
+
+    await _hear(tool, ANSWER)
+
+    assert speech.asked[-1] == _announced(SPEAKER, remark=chosen)
+
+
+def test_a_server_may_add_an_ending_of_its_own(quotes_file, speech, speaker):
+    tool = _tool(speaker, config={REMARKS_KEY: [ADDED_REMARK]})
+
+    assert tool._remarks == (*DEFAULT_REMARKS, ADDED_REMARK)
+
+
+def test_an_added_ending_does_not_replace_the_shipped_ones(
+    quotes_file, speech, speaker
+):
+    """Saying one extra thing should not cost writing out all of them."""
+    tool = _tool(speaker, config={REMARKS_KEY: [ADDED_REMARK]})
+
+    assert set(DEFAULT_REMARKS) <= set(tool._remarks)
+
+
+def test_a_lone_ending_may_be_written_unquoted(quotes_file, speech, speaker):
+    """A bare string where a list was expected is one line, not a mistake."""
+    tool = _tool(speaker, config={REMARKS_KEY: ADDED_REMARK})
+
+    assert tool._remarks == (*DEFAULT_REMARKS, ADDED_REMARK)
+
+
+def test_an_ending_that_is_not_a_list_will_not_start(quotes_file, speech, speaker):
+    tool_config = {REMARKS_KEY: {"not": "a list"}}
+
+    with pytest.raises(ValueError, match=REMARKS_KEY):
+        _tool(speaker, config=tool_config)
+
+
+async def test_every_ending_is_warmed(quotes_file, speech, speaker):
+    """Which one comes up is decided when somebody wins, not at startup."""
+    tool = _tool(speaker, users=ROSTER, config={REMARKS_KEY: [ADDED_REMARK]})
+
+    await tool.prewarm()
+
+    assert speech.warmed == [
+        QUOTE,
+        OTHER_QUOTE,
+        *_warmed_awards(
+            SPEAKER, OTHER_SPEAKER, remarks=(*DEFAULT_REMARKS, ADDED_REMARK)
+        ),
+    ]
+
+
+async def test_a_tie_wording_with_no_ending_is_warmed_once(
+    quotes_file, speech, speaker
+):
+    """A template carrying no remark is one phrase however many are written."""
+    await _tool(speaker, users=ROSTER).prewarm()
+
+    assert speech.warmed.count(_announced(SPEAKER, tied=True)) == 1
+
+
+async def test_the_currency_is_what_the_deployment_calls_it(
+    monkeypatch, quotes_file, speech, speaker, board
+):
+    monkeypatch.setattr(
+        "miss_quote.tools.quotes.scoreboard_cfg",
+        replace(scoreboard_cfg, currency="doubloon"),
+    )
+    tool = _tool(speaker, board=board)
+    await _quoted(tool)
+
+    await _hear(tool, ANSWER)
+
+    assert "1 doubloon" in speech.asked[-1]
+
+
+async def test_an_answer_does_not_set_off_another_quote(
+    monkeypatch, tmp_path, speech, speaker, board
+):
+    """Otherwise the tool would be driving the loop rather than following it."""
+    _written(
+        monkeypatch,
+        tmp_path,
+        HEADER,
+        f"{MOVIE},{TRIGGER},{QUOTE}",
+        f"{OTHER_MOVIE},{MOVIE.lower()},{OTHER_QUOTE}",
+    )
+    tool = _tool(speaker, board=board)
+    await _quoted(tool)
+
+    await _hear(tool, ANSWER)
+
+    assert speech.asked == [QUOTE, _announced(SPEAKER)]
+
+
+async def test_a_row_that_names_no_film_asks_nothing(
+    monkeypatch, tmp_path, speech, speaker, board
+):
+    _written(monkeypatch, tmp_path, HEADER, f",{TRIGGER},{QUOTE}")
+    tool = _tool(speaker, board=board)
+    await _quoted(tool)
+
+    await _hear(tool, "what is it")
+
+    assert board.balance(SPEAKER_ID) == NOTHING
+
+
+async def test_a_server_with_no_board_pays_nothing_and_carries_on(
+    quotes_file, speech, speaker
+):
+    """Saying the line is this tool's job; keeping score is somebody else's."""
+    tool = _tool(speaker)
+    await _quoted(tool)
+
+    await _hear(tool, ANSWER)
+
+    assert speech.asked == [QUOTE, _announced(SPEAKER)]
+
+
+# ── naming your own line ──────────────────────────
+
+
+async def _self_answered(tool: Quotes) -> None:
+    """Somebody sets a line off and then names it themselves."""
+    await _quoted(tool)
+    await _hear(tool, ANSWER, user=ASKER, user_id=ASKER_ID)
+
+
+async def test_naming_your_own_line_earns_nothing(quotes_file, speech, speaker, board):
+    """The trigger and the title are both in front of them; they recalled neither."""
+    await _self_answered(_tool(speaker, board=board))
+
+    assert board.balance(ASKER_ID) == -DEFAULT_SELF_ANSWER_PENALTY
+
+
+async def test_naming_your_own_line_is_called_out(quotes_file, speech, speaker, board):
+    """A rule nobody is told about is one everybody keeps testing."""
+    await _self_answered(_tool(speaker, board=board))
+
+    assert speech.asked[-1] == _rebuked(ASKER)
+
+
+async def test_the_rebuke_says_what_it_cost(quotes_file, speech, speaker, board):
+    await _self_answered(_tool(speaker, board=board))
+
+    assert _denominated(DEFAULT_SELF_ANSWER_PENALTY) in speech.asked[-1]
+
+
+async def test_the_penalty_is_what_the_server_set(quotes_file, speech, speaker, board):
+    penalty = 3
+    tool = _tool(speaker, config={SELF_ANSWER_PENALTY_KEY: penalty}, board=board)
+
+    await _self_answered(tool)
+
+    assert board.balance(ASKER_ID) == -penalty
+
+
+async def test_a_penalty_is_taken_once_however_many_attempts(
+    quotes_file, speech, speaker, board
+):
+    tool = _tool(speaker, board=board)
+    await _self_answered(tool)
+
+    await _hear(tool, ANSWER, user=ASKER, user_id=ASKER_ID)
+
+    assert board.balance(ASKER_ID) == -DEFAULT_SELF_ANSWER_PENALTY
+
+
+async def test_naming_your_own_line_does_not_close_the_round(
+    quotes_file, speech, speaker, board
+):
+    """An attempt should not win anything, nor spoil it for the channel."""
+    tool = _tool(speaker, board=board)
+    await _self_answered(tool)
+
+    await _hear(tool, ANSWER)
+
+    assert board.balance(SPEAKER_ID) == ONE_CREDIT
+
+
+async def test_naming_your_own_line_does_not_start_the_tie_window(
+    quotes_file, speech, speaker, board
+):
+    """Whoever names it after them is the first answer, not a tie."""
+    tool = _tool(speaker, board=board)
+    await _self_answered(tool)
+
+    await _hear(tool, ANSWER)
+
+    assert speech.asked[-1] == _announced(SPEAKER)
+
+
+async def test_somebody_else_naming_it_is_not_penalized(
+    quotes_file, speech, speaker, board
+):
+    tool = _tool(speaker, board=board)
+    await _quoted(tool)
+
+    await _hear(tool, ANSWER)
+
+    assert board.balance(SPEAKER_ID) == ONE_CREDIT
+
+
+async def test_the_bar_is_per_round(quotes_file, speech, speaker, board):
+    """Setting one line off does not disqualify you from naming the next."""
+    tool = _tool(speaker, board=board)
+    await _quoted(tool)
+    await _hear(tool, OTHER_TRIGGER, user=SPEAKER, user_id=SPEAKER_ID)
+
+    await _hear(tool, ANSWER, user=ASKER, user_id=ASKER_ID)
+
+    assert board.balance(ASKER_ID) == -DEFAULT_SELF_ANSWER_PENALTY
+
+
+async def test_a_server_may_let_people_name_their_own(
+    quotes_file, speech, speaker, board
+):
+    tool = _tool(speaker, config={PENALIZE_SELF_ANSWERS_KEY: False}, board=board)
+
+    await _self_answered(tool)
+
+    assert board.balance(ASKER_ID) == ONE_CREDIT
+
+
+async def test_a_server_that_allows_it_says_the_ordinary_thing(
+    quotes_file, speech, speaker, board
+):
+    tool = _tool(speaker, config={PENALIZE_SELF_ANSWERS_KEY: False}, board=board)
+
+    await _self_answered(tool)
+
+    assert speech.asked[-1] == _announced(ASKER)
+
+
+async def test_a_server_that_allows_it_warms_no_rebuke(quotes_file, speech, speaker):
+    """Rendering it would be paying a synthesizer for a phrase nothing can reach."""
+    tool = _tool(
+        speaker, users=ROSTER, config={PENALIZE_SELF_ANSWERS_KEY: False}
+    )
+
+    await tool.prewarm()
+
+    assert speech.warmed == [
+        QUOTE,
+        OTHER_QUOTE,
+        *_warmed_awards(SPEAKER, OTHER_SPEAKER, policing=False),
+    ]
+
+
+async def test_the_rebuke_is_warmed_per_name(quotes_file, speech, speaker):
+    await _tool(speaker, users=ROSTER).prewarm()
+
+    assert _rebuked(SPEAKER) in speech.warmed
+
+
+def test_a_server_may_write_its_own_rebuke(quotes_file, speech, speaker):
+    wording = "No. {user} loses {credits}."
+    tool = _tool(speaker, config={SELF_ANSWER_ANNOUNCEMENT_KEY: wording})
+
+    assert tool._announcements[SELF_ANSWER_ANNOUNCEMENT_KEY] == wording
+
+
+def test_a_rebuke_with_an_unfillable_placeholder_will_not_start(
+    quotes_file, speech, speaker
+):
+    with pytest.raises(ValueError, match=SELF_ANSWER_ANNOUNCEMENT_KEY):
+        _tool(speaker, config={SELF_ANSWER_ANNOUNCEMENT_KEY: "No. {tally}."})
+
+
+def test_a_penalty_that_is_not_a_number_will_not_start(quotes_file, speech, speaker):
+    with pytest.raises(ValueError, match=SELF_ANSWER_PENALTY_KEY):
+        _tool(speaker, config={SELF_ANSWER_PENALTY_KEY: "five"})
+
+
+def test_a_negative_penalty_is_floored_at_nothing(quotes_file, speech, speaker):
+    """A penalty below zero is a reward, and there is a flag for wanting that."""
+    tool = _tool(speaker, config={SELF_ANSWER_PENALTY_KEY: -5})
+
+    assert tool._penalty == NOTHING
+
+
+# ── the windows, as a server sets them ────────────
+
+
+async def test_no_answer_window_asks_nothing(quotes_file, speech, speaker, board):
+    """Which is what a deployment that wants the lines and not the game asks for."""
+    tool = _tool(speaker, config={ANSWER_SECONDS_KEY: NO_WINDOW}, board=board)
+    await _quoted(tool)
+
+    await _hear(tool, ANSWER)
+
+    assert board.balance(SPEAKER_ID) == NOTHING
+
+
+def test_the_windows_come_from_the_server(quotes_file, speech, speaker):
+    tool = _tool(
+        speaker,
+        config={ANSWER_SECONDS_KEY: SHORT_WINDOW, TIE_SECONDS_KEY: TIE_WINDOW},
+    )
+
+    assert (tool._window, tool._tie) == (SHORT_WINDOW, TIE_WINDOW)
+
+
+def test_a_server_that_sets_neither_window_gets_the_defaults(
+    quotes_file, speech, speaker
+):
+    tool = _tool(speaker)
+
+    assert (tool._window, tool._tie) == (ANSWER_WINDOW, TIE_WINDOW)
+
+
+def test_a_window_that_is_not_a_number_will_not_start(quotes_file, speech, speaker):
+    """A server that wrote a window down meant something by it."""
+    with pytest.raises(ValueError, match=ANSWER_SECONDS_KEY):
+        _tool(speaker, config={ANSWER_SECONDS_KEY: "five"})

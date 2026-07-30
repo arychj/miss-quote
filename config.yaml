@@ -43,26 +43,105 @@ servers:
     # startup and skipped.
     tools:
       # Answers out loud with a film line when someone says the phrase that sets
-      # it off.
+      # it off, and then asks the channel where the line came from.
       #
-      # There is nothing to configure per server: the triggers and the lines are
-      # one list per deployment, read from QUOTES_FILE, because a film everybody
-      # in one channel has seen is one everybody in the next has too. Enabling
-      # the tool is the whole decision.
+      # The triggers and the lines are one list per deployment, read from
+      # QUOTES_FILE, because a film everybody in one channel has seen is one
+      # everybody in the next has too. A trigger that has just fired goes quiet
+      # for a while, so a channel that keeps saying the same word only hears the
+      # joke once; how long is QUOTE_BACKOFF_SECONDS, which is not per server
+      # either.
       #
-      # A trigger that has just fired goes quiet for a while, so a channel that
-      # keeps saying the same word only hears the joke once. How long is
-      # QUOTE_BACKOFF_SECONDS, which is not per server either.
+      # Once the line has been said, naming what it came from — "what is
+      # Firefly" — earns a credit through `scoreboard` below, announced out
+      # loud. A leading "the" is optional either way, `vs` and `versus` are the
+      # same word, and a title is matched however the transcript punctuated it.
+      # With no scoreboard enabled the question is asked and nothing is paid,
+      # which is said once at startup rather than left to be noticed.
       quotes:
         enabled: false
+        config:
+          # How long the channel has to name the title, from the moment the line
+          # has finished playing rather than from the trigger — until it has
+          # been said there is nothing to answer. 0 stops the tool asking at
+          # all, for a deployment that wants the lines and not the game.
+          #
+          # answer_seconds: 5
+
+          # How long after the first correct answer a second one still counts.
+          # The first answer takes the round; anyone inside this window is paid
+          # as well, because two people arriving at the same title half a second
+          # apart both knew it and which of them the transcriber returned first
+          # is not a fact about who was faster. 0 pays only whoever was first.
+          #
+          # tie_seconds: 1
+
+          # Endings the announcement picks from, one at random each time. These
+          # are ADDED to the ones the tool ships with rather than replacing
+          # them, so saying one extra thing costs one line instead of writing
+          # out the whole list again.
+          #
+          # Nothing here should assume what a row points at. The column is
+          # called `movie` because it started that way, but a trigger answers
+          # for a series, a game, or a book as often as a film, and an
+          # announcement that guesses wrong guesses wrong out loud.
+          #
+          # remarks:
+          #   - having watched it more recently than is respectable.
+          #   - reasons that are between you and your search history.
+
+          # Whether whoever set a line off is barred from naming it. They have
+          # the trigger and the title in front of them and had to recall
+          # neither, so a round they can win is one anybody can farm by reading
+          # the quote file out loud. An attempt is refused out loud and costs
+          # them, rather than being quietly ignored: a rule nobody is told about
+          # is one everybody keeps testing.
+          #
+          # false lets them answer their own round like anybody else, for a
+          # server that would rather not police it.
+          #
+          # penalize_self_answers: true
+
+          # What an attempt costs them. More than the credit it was an attempt
+          # to win, so gaming the round is a losing trade however many times it
+          # is tried. Taken once per round however many times they try it, and
+          # floored at 0 — a penalty below zero is a reward, and the flag above
+          # is how to want that.
+          #
+          # self_answer_penalty: 5
+
+          # Optional. What is said to whoever names it first.
+          #
+          # `{user}` is their name from `users` above.
+          # `{credits}` is what changed hands, already pluralized — "1 credit",
+          # "5 credits". What a credit is called is CREDIT_CURRENCY.
+          # `{remark}` is one of the endings above, drawn fresh each time. A
+          # wording without it says the same thing every round.
+          #
+          # announcement: "Correct! {user}, you are awarded {credits} for {remark}"
+
+          # Optional, and the same placeholders. Said to anyone paid on a tie —
+          # the whole sentence again reads as though the bot had lost track of
+          # what it just said. Nothing this tool says is dropped for landing
+          # while something else is playing, unlike a fine, so a tie is heard
+          # rather than swallowed by the award it came in behind.
+          #
+          # tie_announcement: "{user}, you are also awarded {credits}, for getting there at the same time."
+
+          # Optional, and the same placeholders again. Said to whoever tried to
+          # name their own line, where `{credits}` is what it cost them. Never
+          # said at all where `penalize_self_answers` is false.
+          #
+          # self_answer_announcement: "Nuh uh uh. {user}, you set it off, so you do not get to name it. You are fined {credits} for being a dick."
 
       # Keeps this server's running tally and publishes it to the voice channel
       # topic as `Eli: -9 Erik: -2`, which needs Set Voice Channel Status on the
       # channel.
       #
-      # It hears nothing on its own. Other tools count through it — today that
-      # is verbal-morality, which fines people — so a server that enables one of
-      # those and not this one gets everything except the tally. Nothing else is
+      # It hears nothing on its own. Other tools count through it —
+      # verbal-morality, which fines people, and quotes, which pays them for
+      # naming a film — so a server that enables one of those and not this one
+      # gets everything except the tally. Nothing else is
       # configured per server: where the file lives, what it counts in, and how
       # often it is written and published are CREDITS_* in the environment.
       #
