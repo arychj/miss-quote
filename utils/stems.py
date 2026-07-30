@@ -8,7 +8,9 @@ somebody conjugates.
 
 The rules here are English spelling rather than a dictionary. A final consonant
 doubles after a short vowel, so `shit` grows a `shitter` and not a `shiter`; a
-silent `e` drops before a vowel; a `y` after a consonant becomes `i`. Nothing
+silent `e` drops before a vowel; a `y` after a consonant becomes `i`, except
+before a suffix that starts with one, where it goes without being replaced —
+`shittiness`, not `shittyiness`. Nothing
 checks whether the result is a word anyone says, and it does not matter: `fucky`
 costs a few bytes in an alternation, while a missing `shitting` costs the tool
 the thing it exists to catch.
@@ -36,6 +38,12 @@ GERUND = "ing"
 AGENT = "er"
 ADJECTIVE = "y"
 
+# What a stem is when it is a quality, a carrying-on, or a state of affairs:
+# "fiddlestickity", "fuckery", "shittiness".
+QUALITY = "ity"
+PRACTICE = "ery"
+STATE = "iness"
+
 # The gerund as it is said rather than written: "fuckin", not "fucking". Word
 # boundaries make the apostrophe somebody may have typed after it irrelevant.
 DROPPED_G = "g"
@@ -54,7 +62,8 @@ def expand(stem: str) -> list[str]:
     Every form of a stem worth listening for, the stem itself included.
 
     The suffixes are the ones that turn a swear into another swear: a plural, a
-    past tense, a gerund, someone who does it, and something that is like it.
+    past tense, a gerund, someone who does it, something that is like it, and
+    the three that make it a noun again — a quality, a carrying-on, and a state.
     Comparatives and superlatives are left out — nobody is fined for being the
     shittiest.
     """
@@ -69,6 +78,9 @@ def expand(stem: str) -> list[str]:
         gerund.removesuffix(DROPPED_G),
         agent,
         _plural(agent),
+        _suffixed(stem, QUALITY),
+        _suffixed(stem, PRACTICE),
+        _suffixed(stem, STATE),
     ]
 
     # A stem that already ends in `y` is one: "bloody" needs no "bloodyy".
@@ -90,9 +102,17 @@ def _suffixed(stem: str, suffix: str) -> str:
         return stem[:-1] + suffix
 
     if len(stem) > 1 and stem.endswith(Y) and not _vowel(stem[-2]):
-        # "bloodied" and "bloodier", but "bloodying": the `y` survives the one
-        # suffix that would otherwise put two `i`s together.
-        return stem + suffix if suffix.startswith(I) else stem[:-1] + I + suffix
+        if suffix == GERUND:
+            # "bloodying": the one suffix the `y` survives, because dropping it
+            # for an `i` would put two of them together.
+            return stem + suffix
+
+        if suffix.startswith(I):
+            # "bloodiness": the suffix brought its own `i`, so the `y` just goes.
+            return stem[:-1] + suffix
+
+        # "bloodied", "bloodier".
+        return stem[:-1] + I + suffix
 
     if _doubles(stem):
         return stem + stem[-1] + suffix

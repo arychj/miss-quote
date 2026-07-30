@@ -29,6 +29,27 @@ def test_a_stem_grows_the_endings_it_is_said_with():
     } <= grown
 
 
+def test_a_stem_grows_the_endings_that_make_it_a_noun_again():
+    grown = _expand(STEM)
+
+    assert {f"{STEM}ity", f"{STEM}ery", f"{STEM}iness"} <= grown
+
+
+def test_the_endings_that_make_real_words_make_the_real_words():
+    """The point of the exercise: fuckery and shittiness are what people say."""
+    assert "fuckery" in _expand("fuck")
+    assert {"shittery", "shittiness"} <= _expand("shit")
+    assert "buggery" in _expand("bugger")
+
+
+def test_a_y_becomes_an_i_only_once_before_an_i():
+    """It is "bloodiness", not "bloodyiness" and not "bloodiiness"."""
+    grown = _expand("bloody")
+
+    assert "bloodiness" in grown
+    assert not {"bloodyiness", "bloodiiness"} & grown
+
+
 def test_the_spoken_gerund_counts_too():
     """Nobody pronounces the g, and a transcript writes down what it heard."""
     assert f"{STEM}in" in _expand(STEM)
