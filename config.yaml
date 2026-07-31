@@ -323,13 +323,24 @@ servers:
         enabled: false
         config:
           # Prompts of your own, added to the shipped `recap`, `minutes`, and
-          # `bard`. One under a shipped name replaces it. Written here rather
-          # than inside a channel because a prompt is a library entry, and
-          # restating a paragraph of instructions once per room is how two of
-          # them end up saying different things by accident.
+          # `bard` — which are prose in `resources/prompts.yaml` inside the
+          # image, if you want to read what they say. One written under a
+          # shipped name replaces it. Written here rather than inside a channel
+          # because a prompt is a library entry, and restating a paragraph of
+          # instructions once per room is how two of them end up saying
+          # different things by accident.
+          #
+          # In one of your own, `{transcript_instructions}` is replaced by the
+          # paragraph describing the script format — which a prompt summarizing
+          # a session wants and a retelling prompt does not, being given a
+          # written summary rather than a transcript — and `{retelling_closing}`
+          # by the instruction to end on a line that means the story is over.
+          # Any other braces are left alone.
           #
           # prompts:
           #   terse: |
+          #     {transcript_instructions}
+          #
           #     Summarize the conversation in three sentences.
 
           monitored_channels:
@@ -345,8 +356,13 @@ servers:
               # prompt: recap
 
               # Which prompt turns a stored summary into something to say out
-              # loud, and how long it is allowed to be. `bard` is written for a
-              # synthesizer: no markdown, no bullets, no emoji.
+              # loud, and roughly how long it should be. `bard` is written for a
+              # synthesizer — no markdown, no bullets, no emoji — and tells the
+              # session back as a story, in the third person, signing off so the
+              # room knows it ended.
+              #
+              # The length is a target rather than a cap: 200 words is about a
+              # minute out loud, and a quiet evening is allowed to be shorter.
               #
               # retelling_prompt: bard
               # retelling_words: 200
@@ -369,9 +385,12 @@ servers:
               # preamble: "Sure! Let me go look at my notes."
               # empty: "I don't have any notes from this channel yet."
 
-              # What is said once the story is told. A retelling runs to a
-              # minute and ends wherever the model chose to, so without a fixed
-              # line the channel cannot tell finished from stopped.
+              # A fixed line said once the story is told, for a server that
+              # would rather hear the same words every time. Off unless you set
+              # one: the retelling prompt already ends the story itself, and a
+              # fixed sentence after one that has just said goodbye is one
+              # goodbye too many. Set it and it is rendered at startup, like the
+              # preamble.
               #
               # closing: "I wonder what'll happen tonight?"
 

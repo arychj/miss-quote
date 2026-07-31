@@ -458,21 +458,27 @@ The part worth explaining is the silence. Inference takes seconds, so the bot pl
 
 A second ask while a retelling is still going is dropped rather than queued — what is queued behind a minute of narration is a minute of the same narration — and `backoff_seconds` is how soon after one the channel can be told again.
 
-**The story ends on a fixed line**, `closing`, rendered at startup like the other two. A retelling runs to a minute and ends wherever the model chose to end it, so a channel that has been listening has no way to tell "finished" from "stopped". A sentence it has heard before does, and being cached it starts the instant the words run out. Nothing to tell gets no closing — there is no story to have finished.
+**The story ends itself.** A retelling runs to a minute and ends wherever the model chose to end it, so a channel that has been listening has no way to tell "finished" from "stopped" — which is a thing to ask the prompt for rather than a thing to bolt on after it. `bard` is told to close on a line that means the tale is over, in the voice it has been telling it in, and that sign-off is what the room hears. A custom retelling prompt gets the same instruction by writing `{retelling_closing}`.
 
-**The retelling itself is never cached.** The speech cache exists so a phrase said again costs a file read; the account of one evening is composed for one moment and nobody will ever ask for those exact words again. Storing it would leave a quarter-megabyte file that only its own age will ever clear. It is synthesized, played, and let go — the preamble, the empty line, and the closing are the ones worth keeping, and all three are.
+`closing` is the other way to do it: a fixed sentence, played after the story, for a server that would rather hear the same words every time. It is **unset by default**, since a fixed line following one that has just said goodbye is one goodbye too many. Set it and it is rendered at startup like the preamble, so it starts the instant the words run out. Nothing to tell gets no closing either way — there is no story to have finished.
+
+**The retelling itself is never cached.** The speech cache exists so a phrase said again costs a file read; the account of one evening is composed for one moment and nobody will ever ask for those exact words again. Storing it would leave a quarter-megabyte file that only its own age will ever clear. It is synthesized, played, and let go — the preamble, the empty line, and a `closing` if there is one are the ones worth keeping, and those are.
 
 #### Prompts
 
-Prompts are named and selected by name. Three ship:
+Prompts are named and selected by name. Three ship, as prose in `src/miss_quote/resources/prompts.yaml` rather than as strings in the source — a prompt is content, and the file also says which one does each job by default:
 
 | Name | For | Output goes to |
 |---|---|---|
 | `recap` | The default. An account of the evening for the people who were there, in the order it happened, naming names | A Discord message, so Markdown is fine |
 | `minutes` | Topics, decisions, and open questions, as headed sections | A Discord message |
-| `bard` | The default retelling. A short spoken account, warm and a little wry | **A speech synthesizer**, so it forbids Markdown, bullets, and emoji at some length — a synthesizer reads an asterisk out as a word |
+| `bard` | The default retelling. A bard telling the room its own evening back, in the third person, cut down to what actually mattered and signed off so the room knows it ended | **A speech synthesizer**, so it forbids Markdown, bullets, and emoji at some length — a synthesizer reads an asterisk out as a word |
 
 `prompts:` adds your own to those, and one written under a shipped name replaces it — which is how a server that likes the structure of `recap` and not its tone changes the tone without inventing a name for it. It sits at the tool level rather than inside a channel because a prompt is a library entry, and restating a paragraph of instructions once per room is how two of them end up saying different things by accident.
+
+A prompt of your own can pull in the text the shipped ones share by naming it in braces. The prefix says which job the fragment is for, because the two are handed different things: `{transcript_instructions}` is the paragraph describing the script format, which any prompt summarizing a session wants and no retelling prompt should carry — a retelling is given the summary `recap` already wrote, not a transcript. `{retelling_closing}` is the instruction to end on a line that means the story is over.
+
+`{words}` is filled separately, per channel, from `retelling_words`, and cannot be used as a fragment name. Any other braces are left exactly as written, so an example of the JSON you want back survives. A shipped prompt naming a fragment that does not exist stops the bot at startup; one of your own is left alone, since braces in it are usually deliberate.
 
 **A prompt named by a name nothing answers to stops the tool from starting**, reported alongside every other startup problem. A tool running on instructions nobody asked for produces summaries that look fine and are not what the file requested, which is worse than a tool that refuses.
 
@@ -483,12 +489,12 @@ Prompts are named and selected by name. Three ship:
 | `channel` | — | Text channel to post in, by name. Unset writes to disk and posts nothing |
 | `prompt` | `recap` | Which prompt summarizes a sealed session |
 | `retelling_prompt` | `bard` | Which prompt turns a stored summary into something to say out loud |
-| `retelling_words` | `200` | How long the spoken retelling is allowed to be |
+| `retelling_words` | `200` | Roughly how long the spoken retelling should be — a target the prompt is told to aim at, not a cap it is cut to. About a minute out loud |
 | `minimum_utterances` | `5` | Below this a session is not a conversation and is not summarized |
 | `backoff_seconds` | `120` | How soon the channel can be told its notes again. `0`, or below, tells it every time |
 | `preamble` | `Sure! Let me go look at my notes.` | What plays while the model is thinking |
 | `empty` | `I don't have any notes from this channel yet.` | What plays when there is nothing to tell |
-| `closing` | `I wonder what'll happen tonight?` | What plays once the story is told. A retelling runs to a minute and ends wherever the model chose to, so a fixed line is what tells the channel it finished rather than stopped |
+| `closing` | — | A fixed line played once the story is told, for a server that wants the same words every time. Unset, and the retelling prompt's own sign-off is what says it finished |
 | `name` | `miss quote`, `misquote`, `missquote`, `mis quote`, `ms quote`, `mizquote` | What the bot answers to, in the spellings a transcriber returns for a name it has never been told. **Replaces** the default |
 | `triggers` | `what happened last session`, and four more | What asking looks like. **Replaces** the default |
 
@@ -919,7 +925,8 @@ miss-quote/
 │       ├── ledger/
 │       │   └── credits.py     # What everybody has left, per server
 │       ├── resources/
-│       │   └── quotes.csv     # Triggers and the film lines they answer with
+│       │   ├── quotes.csv     # Triggers and the film lines they answer with
+│       │   └── prompts.yaml   # What the model is told to do, as prose
 │       ├── tools/
 │       │   ├── base.py        # What a tool is: its moments, and what it is handed
 │       │   ├── registry.py    # Tool names a config file can switch on
@@ -930,7 +937,7 @@ miss-quote/
 │       │   ├── tts.py         # Says things out loud; the only thing that plays anything
 │       │   └── verbal_morality.py  # Fines a speaker, out loud, for the wrong thing
 │       ├── summary/
-│       │   ├── prompts.py     # What the model is told to do, by name
+│       │   ├── prompts.py     # Loads the prompt file, fills its placeholders
 │       │   ├── dialogue.py    # A transcript as the text a model reads
 │       │   └── store.py       # Summaries on disk, and finding the last one
 │       ├── transcript/

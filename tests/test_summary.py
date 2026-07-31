@@ -185,6 +185,15 @@ def _config(**channel) -> dict:
     }
 
 
+def _silent_ending() -> dict:
+    """A watched channel that never mentions `closing`, which is most of them."""
+    return {
+        "monitored_channels": {
+            WATCHED: {"channel": POSTING_CHANNEL, "preamble": PREAMBLE, "empty": EMPTY}
+        }
+    }
+
+
 def _transcript(root: Path, source: Source, lines: int = ENOUGH_UTTERANCES) -> Transcript:
     """A sealed session with something in it."""
     path = root / "transcripts" / source.relative_directory / "2026-07-26T20-14-03.jsonl"
@@ -486,10 +495,35 @@ async def test_a_tool_with_no_channels_says_so(summaries, caplog):
 # ── the ending ────────────────────────────────
 
 
+async def test_a_channel_that_asked_for_no_closing_ends_on_the_story(summaries, model):
+    """
+    The ordinary case. The retelling prompt ends the story itself, and a fixed
+    sentence after one that has just said goodbye is one goodbye too many.
+    """
+    tool, speech = _tool(config=_silent_ending())
+    model.answers = [SUMMARY, RETELLING]
+    await tool.handle_finished(_transcript(summaries, WATCHED_SOURCE))
+
+    await tool.handle_utterance(
+        _said("Miss Quote, what happened last session?"), Session(WATCHED_SOURCE)
+    )
+
+    assert speech.played == [PREAMBLE, RETELLING]
+
+
+async def test_a_closing_nobody_asked_for_is_not_rendered_either(summaries, model):
+    """An empty phrase is a synthesizer round trip for silence."""
+    tool, speech = _tool(config=_silent_ending())
+
+    await tool.prewarm()
+
+    assert sorted(speech.warmed) == sorted([PREAMBLE, EMPTY])
+
+
 async def test_a_retelling_is_followed_by_a_fixed_closing(summaries, model):
     """
-    A retelling runs to a minute and ends wherever the model chose to, so the
-    channel cannot tell a finished story from one that stopped.
+    For a server that would rather hear the same sentence every time than trust
+    the prompt to end the story.
     """
     tool, speech = _tool()
     model.answers = [SUMMARY, RETELLING]
