@@ -62,6 +62,7 @@ MINIMUM_UTTERANCES_KEY = "minimum_utterances"
 BACKOFF_SECONDS_KEY = "backoff_seconds"
 PREAMBLE_KEY = "preamble"
 EMPTY_KEY = "empty"
+CLOSING_KEY = "closing"
 NAME_KEY = "name"
 TRIGGERS_KEY = "triggers"
 
@@ -78,6 +79,7 @@ CHANNEL_KEYS = (
     BACKOFF_SECONDS_KEY,
     PREAMBLE_KEY,
     EMPTY_KEY,
+    CLOSING_KEY,
     NAME_KEY,
     TRIGGERS_KEY,
 )
@@ -103,10 +105,32 @@ NEVER = 0.0
 DEFAULT_PREAMBLE = "Sure! Let me go look at my notes."
 DEFAULT_EMPTY = "I don't have any notes from this channel yet."
 
+# What is said once the story is told. A retelling runs to a minute or more and
+# ends wherever the model decided to end it, so a channel that has been listening
+# has no way to tell "finished" from "stopped". A fixed line does, and being
+# fixed it is rendered at startup and plays the instant the words run out.
+#
+# It is not a summary of anything, so it is the same sentence every time on
+# purpose: what carries the meaning is that the channel has heard it before.
+DEFAULT_CLOSING = "I wonder what'll happen tonight?"
+
 # What the bot answers to. Several spellings because none of them is what an ASR
 # will necessarily have written down: a name it has never been told is guessed
 # at phonetically, and "Miss Quote" comes back as one word about as often as two.
-DEFAULT_NAME = ("miss quote", "misquote", "ms quote", "mizquote")
+#
+# "missquote" is here because it is what actually came back the first time
+# somebody asked out loud — the transcriber heard the two words, ran them
+# together, and kept both esses. The list is the cheapest place to be generous:
+# a spelling nobody ever says costs one branch of an alternation, and a spelling
+# that is missing costs somebody asking a bot twice while it ignores them.
+DEFAULT_NAME = (
+    "miss quote",
+    "misquote",
+    "missquote",
+    "mis quote",
+    "ms quote",
+    "mizquote",
+)
 
 # What asking looks like. Matched after the name and in the same breath, so an
 # unaddressed "what happened last session" in the middle of a conversation is
@@ -146,6 +170,7 @@ class Monitored:
     backoff_seconds: float
     preamble: str
     empty: str
+    closing: str
     address: re.Pattern[str]
     triggers: re.Pattern[str]
 
@@ -240,7 +265,7 @@ class Summary(Tool):
         wordings = [
             wording
             for monitored in self._monitored.values()
-            for wording in (monitored.preamble, monitored.empty)
+            for wording in (monitored.preamble, monitored.empty, monitored.closing)
         ]
 
         logger.info(
@@ -435,7 +460,14 @@ class Summary(Tool):
 
         self._told[monitored.name] = time.monotonic()
 
-        await speech.play(source, retelling)
+        # Not kept: this is one evening's account, composed for this moment, and
+        # nobody will ever ask for those exact words again. See `SpeechCache.stream`.
+        await speech.play(source, retelling, keep=False)
+
+        # And a fixed line to say it is over. A retelling runs to a minute and
+        # ends wherever the model chose to; without this the channel cannot tell
+        # a finished story from one that stopped.
+        await speech.play(source, monitored.closing)
 
     async def _retell(self, summary: str, monitored: Monitored) -> str:
         """One stored summary, as something to say rather than something to read."""
@@ -539,6 +571,7 @@ def _channel(
         ),
         preamble=str(raw.get(PREAMBLE_KEY) or DEFAULT_PREAMBLE),
         empty=str(raw.get(EMPTY_KEY) or DEFAULT_EMPTY),
+        closing=str(raw.get(CLOSING_KEY) or DEFAULT_CLOSING),
         address=pattern(_spoken(NAME_KEY, raw.get(NAME_KEY), DEFAULT_NAME)),
         triggers=pattern(_spoken(TRIGGERS_KEY, raw.get(TRIGGERS_KEY), DEFAULT_TRIGGERS)),
     )

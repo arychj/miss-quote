@@ -95,7 +95,7 @@ class FakeSpeech:
         # otherwise, which is what a cache hit looks like.
         self.chunks: tuple[str, ...] | None = None
 
-    def stream(self, text: str) -> FakePhrase:
+    def stream(self, text: str, *, keep: bool = True) -> FakePhrase:
         self.asked.append(text)
 
         return FakePhrase(self, text)

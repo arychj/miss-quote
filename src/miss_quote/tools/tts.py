@@ -70,6 +70,7 @@ class Tts(Tool):
         *,
         scale: float = UNITY_VOLUME,
         chime: str | None = None,
+        keep: bool = True,
     ) -> None:
         """
         Say one thing, where it was said to, at the loudness it asked for.
@@ -85,16 +86,24 @@ class Tts(Tool):
         `chime` names a clip in the chime directory, without its extension, to
         play ahead of the words. A chime that is missing costs the chime and not
         the announcement.
+
+        `keep` is False for a sentence composed for one moment and never said
+        again — the account of one evening, read out once. The cache is for
+        phrases that come round again; see `SpeechCache.stream`.
         """
         if chime is None:
             # A phrase on its own, which the speaker can send as it was stored
             # if nothing has to be done to it first.
-            await self._speaker.play(source, self._speech.stream(text), scale)
+            await self._speaker.play(
+                source, self._speech.stream(text, keep=keep), scale
+            )
             return
 
-        await self._speaker.play(source, self._announce(text, chime), scale)
+        await self._speaker.play(source, self._announce(text, chime, keep), scale)
 
-    async def _announce(self, text: str, chime: str) -> AsyncIterator[bytes]:
+    async def _announce(
+        self, text: str, chime: str, keep: bool = True
+    ) -> AsyncIterator[bytes]:
         """
         The chime and then the words, as one clip rather than two.
 
@@ -114,7 +123,7 @@ class Tts(Tool):
         Waiting first spends that time before anything is playing.
         """
         opening = await self._chimes.clip(chime)
-        words = self._speech.stream(text).pcm()
+        words = self._speech.stream(text, keep=keep).pcm()
         lead = await _lead(words, tts_cfg.lead_bytes)
 
         if opening:

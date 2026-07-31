@@ -458,6 +458,10 @@ The part worth explaining is the silence. Inference takes seconds, so the bot pl
 
 A second ask while a retelling is still going is dropped rather than queued — what is queued behind a minute of narration is a minute of the same narration — and `backoff_seconds` is how soon after one the channel can be told again.
 
+**The story ends on a fixed line**, `closing`, rendered at startup like the other two. A retelling runs to a minute and ends wherever the model chose to end it, so a channel that has been listening has no way to tell "finished" from "stopped". A sentence it has heard before does, and being cached it starts the instant the words run out. Nothing to tell gets no closing — there is no story to have finished.
+
+**The retelling itself is never cached.** The speech cache exists so a phrase said again costs a file read; the account of one evening is composed for one moment and nobody will ever ask for those exact words again. Storing it would leave a quarter-megabyte file that only its own age will ever clear. It is synthesized, played, and let go — the preamble, the empty line, and the closing are the ones worth keeping, and all three are.
+
 #### Prompts
 
 Prompts are named and selected by name. Three ship:
@@ -484,7 +488,8 @@ Prompts are named and selected by name. Three ship:
 | `backoff_seconds` | `120` | How soon the channel can be told its notes again. `0`, or below, tells it every time |
 | `preamble` | `Sure! Let me go look at my notes.` | What plays while the model is thinking |
 | `empty` | `I don't have any notes from this channel yet.` | What plays when there is nothing to tell |
-| `name` | `miss quote`, `misquote`, `ms quote`, `mizquote` | What the bot answers to. **Replaces** the default |
+| `closing` | `I wonder what'll happen tonight?` | What plays once the story is told. A retelling runs to a minute and ends wherever the model chose to, so a fixed line is what tells the channel it finished rather than stopped |
+| `name` | `miss quote`, `misquote`, `missquote`, `mis quote`, `ms quote`, `mizquote` | What the bot answers to, in the spellings a transcriber returns for a name it has never been told. **Replaces** the default |
 | `triggers` | `what happened last session`, and four more | What asking looks like. **Replaces** the default |
 
 ### scoreboard
@@ -621,6 +626,8 @@ Synthesis is a second Wyoming server (`TTS_HOST`, `TTS_PORT`) — recognition an
 It is also the one thing that decides how a clip goes out. At `1.0` there is nothing to do to the audio, so cached clips are sent exactly as stored; anything lower means every clip is decoded and re-encoded on its way past. **Lowering `PLAYBACK_VOLUME` therefore has a CPU cost as well as a loudness one** — turn a channel down at the Discord end where you can.
 
 **No ffmpeg.** It is the usual way to play audio through discord.py, but only because it is the usual way to decode a file first. Synthesized speech is already raw PCM, so `soxr` converts it to the 48 kHz stereo Discord wants and the libopus already present for receiving handles the rest.
+
+A phrase composed for one moment is the exception and is **not** cached at all — see `summary`'s retelling. The cache is for phrases that come round again, and a sentence nobody will ever say twice is a large file on a retention clock only its own age will clear.
 
 **Clips are cached as what Discord is sent**, so a phrase is only ever synthesized once — and, at full volume, never processed again either. One layer: Opus packets, one per 20 ms, in an Ogg container under `SPEECH_DIR/cache`. About a tenth the size of the samples they came from, and playable, so you can hear what the bot actually said.
 

@@ -33,6 +33,7 @@ RETELLING = "So there they were, arguing about the rules, and nobody won."
 
 PREAMBLE = "Sure! Let me go look at my notes."
 EMPTY = "I don't have any notes from this channel yet."
+CLOSING = "I wonder what'll happen tonight?"
 
 ASKER = "Erik"
 ENOUGH_UTTERANCES = 12
@@ -59,9 +60,11 @@ class FakeTts(Tts):
         Tool.__init__(self, context)
         self.played: list[str] = []
         self.warmed: list[str] = []
+        self.kept: dict[str, bool] = {}
 
-    async def play(self, source, text, *, scale=1.0, chime=None) -> None:
+    async def play(self, source, text, *, scale=1.0, chime=None, keep=True) -> None:
         self.played.append(text)
+        self.kept[text] = keep
 
     def enqueue(self, phrases) -> int:
         self.warmed.extend(phrases)
@@ -82,11 +85,12 @@ class BlockingTts(FakeTts):
         super().__init__(context)
         self.thinking = asyncio.Event()
 
-    async def play(self, source, text, *, scale=1.0, chime=None) -> None:
+    async def play(self, source, text, *, scale=1.0, chime=None, keep=True) -> None:
         if text == PREAMBLE:
             await asyncio.wait_for(self.thinking.wait(), timeout=PATIENCE_SECONDS)
 
         self.played.append(text)
+        self.kept[text] = keep
 
 
 class FakeAnnouncer:
@@ -174,7 +178,8 @@ def _config(**channel) -> dict:
     """A tool config watching one channel, on the given terms."""
     return {
         "monitored_channels": {
-            WATCHED: {"channel": POSTING_CHANNEL, "preamble": PREAMBLE, "empty": EMPTY}
+            WATCHED: {"channel": POSTING_CHANNEL, "preamble": PREAMBLE, "empty": EMPTY,
+             "closing": CLOSING}
             | channel
         }
     }
@@ -328,7 +333,7 @@ async def test_the_model_is_asked_before_the_preamble_has_finished(
         _said("Miss Quote, what happened last session?"), Session(WATCHED_SOURCE)
     )
 
-    assert speech.played == [PREAMBLE, RETELLING]
+    assert speech.played == [PREAMBLE, RETELLING, CLOSING]
 
 
 async def test_the_retelling_is_the_most_recent_summary(summaries, model):
@@ -340,7 +345,7 @@ async def test_the_retelling_is_the_most_recent_summary(summaries, model):
         _said("Miss Quote, what happened last session?"), Session(WATCHED_SOURCE)
     )
 
-    assert speech.played == [PREAMBLE, RETELLING]
+    assert speech.played == [PREAMBLE, RETELLING, CLOSING]
     assert model.asked[-1][1] == SUMMARY
 
 
@@ -360,7 +365,12 @@ async def test_with_no_notes_it_says_so_and_asks_nothing(summaries, model):
     [
         "Miss Quote, what happened last session?",
         "misquote what happened last time",
+        # What a transcriber actually returned the first time somebody asked:
+        # the two words run together with both esses kept.
+        "Missquote. What happened last session?",
+        "mis quote, what happened last session",
         "Ms. Quote — recap the last session",
+        "mizquote what happened last session",
         "hey miss quote, what did we do last session, out of interest",
     ],
 )
@@ -398,7 +408,7 @@ async def test_it_is_not_told_twice_inside_the_backoff(summaries, model):
     await tool.handle_utterance(asked, Session(WATCHED_SOURCE))
     await tool.handle_utterance(asked, Session(WATCHED_SOURCE))
 
-    assert speech.played == [PREAMBLE, RETELLING]
+    assert speech.played == [PREAMBLE, RETELLING, CLOSING]
 
 
 async def test_a_second_ask_mid_retelling_is_dropped(summaries, model):
@@ -429,14 +439,6 @@ async def test_a_model_failure_mid_recall_says_nothing_more(summaries, model):
 
 
 # ── configuration ─────────────────────────────
-
-
-async def test_the_preamble_and_the_empty_line_are_rendered_in_advance(summaries, model):
-    tool, speech = _tool()
-
-    await tool.prewarm()
-
-    assert sorted(speech.warmed) == sorted([PREAMBLE, EMPTY])
 
 
 async def test_two_channels_each_get_their_own_prompt(summaries, model):
@@ -479,3 +481,57 @@ async def test_a_tool_with_no_channels_says_so(summaries, caplog):
     await tool.prewarm()
 
     assert "monitored_channels" in caplog.text
+
+
+# ── the ending ────────────────────────────────
+
+
+async def test_a_retelling_is_followed_by_a_fixed_closing(summaries, model):
+    """
+    A retelling runs to a minute and ends wherever the model chose to, so the
+    channel cannot tell a finished story from one that stopped.
+    """
+    tool, speech = _tool()
+    model.answers = [SUMMARY, RETELLING]
+    await tool.handle_finished(_transcript(summaries, WATCHED_SOURCE))
+
+    await tool.handle_utterance(
+        _said("Miss Quote, what happened last session?"), Session(WATCHED_SOURCE)
+    )
+
+    assert speech.played == [PREAMBLE, RETELLING, CLOSING]
+
+
+async def test_the_closing_is_rendered_in_advance_with_the_rest(summaries, model):
+    tool, speech = _tool()
+
+    await tool.prewarm()
+
+    assert sorted(speech.warmed) == sorted([PREAMBLE, EMPTY, CLOSING])
+
+
+async def test_nothing_to_tell_gets_no_closing(summaries, model):
+    """There is no story to have finished, so saying so would be a non sequitur."""
+    tool, speech = _tool()
+
+    await tool.handle_utterance(
+        _said("Miss Quote, what happened last session?"), Session(WATCHED_SOURCE)
+    )
+
+    assert speech.played == [EMPTY]
+
+
+async def test_the_retelling_is_not_kept_but_the_fixed_lines_are(summaries, model):
+    """
+    The cache is for phrases that come round again. An account of one evening
+    is a large file nothing will ever ask for twice.
+    """
+    tool, speech = _tool()
+    model.answers = [SUMMARY, RETELLING]
+    await tool.handle_finished(_transcript(summaries, WATCHED_SOURCE))
+
+    await tool.handle_utterance(
+        _said("Miss Quote, what happened last session?"), Session(WATCHED_SOURCE)
+    )
+
+    assert speech.kept == {PREAMBLE: True, RETELLING: False, CLOSING: True}
