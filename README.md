@@ -716,8 +716,29 @@ Only used by `summary`. Where the endpoint *is*, what key it wants, and which mo
 | Setting | Default | Purpose |
 |---|---|---|
 | `timeout_seconds` | `120.0` | Budget for one completion, end to end. Generous next to the ASR's, a summary being several hundred tokens of output rather than a sentence. Keep it well under the deployment's termination grace period — see **summary** above |
-| `max_tokens` | `1024` | A ceiling on what comes back, so a model that will not stop cannot produce a summary longer than the conversation it came from |
+| `max_output_tokens` | `1024` | A ceiling on what is **generated**. Not the context window and not the whole request: the input is not counted against it. Named for what it bounds rather than for the wire field it becomes (`max_tokens`), whose name has cost more than one person an afternoon |
 | `temperature` | `0.7` | How much licence the model has. Higher than a mechanical transform would want, because the output is prose somebody reads for pleasure |
+| `thinking` | `true` | Whether a model that reasons before answering is allowed to. `false` sends `chat_template_kwargs.enable_thinking`, and is sent **only** to turn reasoning off — an endpoint that has never heard of the field is never shown it |
+
+#### On reasoning models
+
+Worth knowing before pointing this at one, because the failure is confusing and the fix is a number.
+
+**Reasoning is generated, so it spends `max_output_tokens`.** A model that thinks before it answers puts the thinking in `reasoning_content` and the answer in `content`, and both come out of the same budget. Run out mid-thought and `content` is empty — a `200` carrying nothing, which reads like a broken endpoint and is a setting. Measured against a 27B reasoning model on a real 1,653-line session: 4,137 generated tokens, of which the answer was about 700. At `1024` it never reached the answer at all.
+
+The client says which of those happened rather than making you find out:
+
+```
+the model spent its whole 1024-token budget reasoning and never began the
+answer. Raise 'settings.llm.max_output_tokens', or set
+'settings.llm.thinking: false' to stop it reasoning at all
+```
+
+**Reasoning is also most of the wall clock**, which matters in exactly one place. The same session took 94s with reasoning and 12s without, for summaries of comparable quality. Nobody is waiting on a summary written after everyone has left. Somebody *is* waiting on the retelling — they asked out loud and the preamble covers a few seconds, not ninety — so a deployment pointing at a reasoning model will want `thinking: false`, or a model that does not reason, for the sake of that one path.
+
+**Thinking is stripped whichever way it arrives.** Where a model puts it is a property of the serving stack rather than of the model: beside the answer in a `reasoning_content` field, or inline at the front of `content`, fenced in `<think>` tags. The first costs nothing to ignore — only `content` is ever read. The second is cut out, in every spelling seen in the wild (`<think>`, `<thinking>`, `<reasoning>`, `<thought>`, any casing, with attributes, several blocks), because left in it opens the summary with the model talking to itself and the synthesizer reads the tags out loud. An opening tag with no closing partner is a model cut off mid-thought, so everything after it goes too.
+
+That happens **whether or not `thinking: false` is set**, because the setting is a request and not a guarantee: an endpoint free to ignore it still returns reasoning, and what comes back is still not something to file as a summary.
 
 ### `summaries`
 

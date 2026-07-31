@@ -115,8 +115,9 @@ BACKOFF_PERCENT_KEY = "backoff_percent"
 VOLUME_FLOOR_KEY = "volume_floor"
 RETENTION_DAYS_KEY = "retention_days"
 RESUME_SECONDS_KEY = "resume_seconds"
-MAX_TOKENS_KEY = "max_tokens"
+MAX_OUTPUT_TOKENS_KEY = "max_output_tokens"
 TEMPERATURE_KEY = "temperature"
+THINKING_KEY = "thinking"
 
 # Every setting there is, and what each one has to be. A name absent from here
 # is read by nothing, which is the quiet failure worth catching: the alternative
@@ -149,8 +150,9 @@ SETTINGS_SCHEMA: Mapping[str, Mapping[str, type]] = {
     },
     LLM_SECTION: {
         TIMEOUT_SECONDS_KEY: float,
-        MAX_TOKENS_KEY: int,
+        MAX_OUTPUT_TOKENS_KEY: int,
         TEMPERATURE_KEY: float,
+        THINKING_KEY: bool,
     },
     SUMMARIES_SECTION: {
         RETENTION_DAYS_KEY: int,
@@ -162,12 +164,35 @@ SETTING_KINDS: Mapping[type, str] = {
     str: "text",
     int: "a whole number",
     float: "a number",
+    bool: "true or false",
 }
 
 # How a complaint lists the names it was expecting instead.
 NAME_SEPARATOR = ", "
 
-SettingT = TypeVar("SettingT", str, int, float)
+SettingT = TypeVar("SettingT", str, int, float, bool)
+
+
+def _parse_bool(value: Any) -> bool:
+    """
+    A switch, however it was written down.
+
+    Its own parser rather than `bool(value)`, which is the wrong answer for
+    every string it is given: `bool("false")` is True, and a file that says
+    `thinking: "false"` means the opposite of what it would get. YAML already
+    reads a bare `false` as a boolean, so this is for the quoted case and for
+    the spellings the environment accepts.
+    """
+    if isinstance(value, bool):
+        return value
+
+    normalized = str(value).strip().lower()
+    if normalized in TRUE_VALUES:
+        return True
+    if normalized in FALSE_VALUES:
+        return False
+
+    raise ValueError(f"{value!r} is not a boolean")
 
 
 def _parse_setting(
@@ -175,7 +200,7 @@ def _parse_setting(
 ) -> Any | None:
     """One setting as the thing that reads it wants it, or nothing at all."""
     try:
-        return kind(value)
+        return _parse_bool(value) if kind is bool else kind(value)
     except (TypeError, ValueError):
         problems.append(
             f"'{SETTINGS_KEY}.{section}.{key}' must be {SETTING_KINDS[kind]}, not "
@@ -496,16 +521,37 @@ class LLMConfig:
         default_factory=lambda: file_cfg.setting(LLM_SECTION, TIMEOUT_SECONDS_KEY, 120.0)
     )
 
-    # A ceiling on what comes back, so a model that will not stop cannot produce
-    # a summary longer than the conversation it came from.
-    max_tokens: int = field(
-        default_factory=lambda: file_cfg.setting(LLM_SECTION, MAX_TOKENS_KEY, 1024)
+    # A ceiling on what is *generated*, which is the only thing the endpoint's
+    # `max_tokens` has ever bounded: the input is not counted against it, and
+    # neither is the context window. Named for what it does rather than for the
+    # wire field, whose name has cost more than one person an afternoon.
+    #
+    # On a model that reasons before it answers, the reasoning is generated too
+    # and comes out of this. A budget that runs out mid-thought returns no answer
+    # at all rather than a short one.
+    max_output_tokens: int = field(
+        default_factory=lambda: file_cfg.setting(
+            LLM_SECTION, MAX_OUTPUT_TOKENS_KEY, 1024
+        )
     )
 
     # How much licence the model has. Higher than a mechanical transform would
     # want, because the output is prose somebody reads for pleasure.
     temperature: float = field(
         default_factory=lambda: file_cfg.setting(LLM_SECTION, TEMPERATURE_KEY, 0.7)
+    )
+
+    # Whether a model that reasons before it answers is allowed to. Left alone
+    # by default, which is the only safe default: a reasoning model asked to
+    # stop is a supported request, and an ordinary one asked the same question
+    # is being sent a field it never agreed to read.
+    #
+    # Turning it off is a latency decision rather than a quality one. Reasoning
+    # is most of the wall clock and most of the tokens — measurably so — which
+    # nobody minds for a summary written after everyone has left, and which is
+    # dead air when somebody has just asked a question out loud.
+    thinking: bool = field(
+        default_factory=lambda: file_cfg.setting(LLM_SECTION, THINKING_KEY, True)
     )
 
     @property

@@ -401,11 +401,11 @@ def test_the_llm_section_is_read(monkeypatch, tmp_path):
         monkeypatch,
         tmp_path,
         "settings:\n"
-        "  llm:\n    timeout_seconds: 60\n    max_tokens: 512\n    temperature: 0.2\n",
+        "  llm:\n    timeout_seconds: 60\n    max_output_tokens: 512\n    temperature: 0.2\n",
     )
 
     assert cfg.setting("llm", "timeout_seconds", 120.0) == 60.0
-    assert cfg.setting("llm", "max_tokens", 1024) == 512
+    assert cfg.setting("llm", "max_output_tokens", 1024) == 512
     assert cfg.setting("llm", "temperature", 0.7) == 0.2
     assert cfg.problems == ()
 
@@ -421,10 +421,10 @@ def test_a_typo_in_the_new_sections_is_reported(monkeypatch, tmp_path):
     cfg = _load(
         monkeypatch,
         tmp_path,
-        "settings:\n  llm:\n    max_token: 512\n  summaries:\n    retention: 30\n",
+        "settings:\n  llm:\n    max_output_token: 512\n  summaries:\n    retention: 30\n",
     )
 
-    assert any("max_token" in problem for problem in cfg.problems)
+    assert any("max_output_token" in problem for problem in cfg.problems)
     assert any("retention" in problem for problem in cfg.problems)
 
 

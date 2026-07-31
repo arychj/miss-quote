@@ -26,11 +26,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from typing import Any
 
 import aiohttp
 
-from miss_quote.config import llm_cfg
+from miss_quote.config import (
+    LLM_SECTION,
+    MAX_OUTPUT_TOKENS_KEY,
+    SETTINGS_KEY,
+    THINKING_KEY,
+    llm_cfg,
+)
 from miss_quote.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -50,6 +57,48 @@ TEMPERATURE_FIELD = "temperature"
 
 CHOICES_FIELD = "choices"
 MESSAGE_FIELD = "message"
+FINISH_REASON_FIELD = "finish_reason"
+REASONING_FIELD = "reasoning_content"
+
+# A reasoning model puts its thinking in one of two places, and which one is a
+# property of the serving stack rather than of the model: beside the answer in
+# `reasoning_content`, or inline at the front of the answer, fenced in tags.
+# The first costs nothing to ignore — this only ever reads `content`. The second
+# has to be cut out, or the summary opens with the model talking to itself and
+# the synthesizer reads the tags out loud.
+#
+# Handled whether or not `thinking` is off, because that setting is a request
+# and not a guarantee: an endpoint that does not honour it still reasons, and
+# what comes back is still not something to file as a summary.
+REASONING_TAGS = "think|thinking|reasoning|thought"
+
+# A whole fenced block, however the opening tag was attributed.
+REASONING_BLOCK = re.compile(
+    rf"<(?P<tag>{REASONING_TAGS})\b[^>]*>.*?</(?P=tag)\s*>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+# An opening tag with no closing one, which is a model cut off mid-thought.
+# Everything from there on is thinking, so everything from there on goes.
+UNCLOSED_REASONING = re.compile(
+    rf"<(?:{REASONING_TAGS})\b[^>]*>.*\Z",
+    re.DOTALL | re.IGNORECASE,
+)
+
+# How a model that reasons before answering is asked not to. `max_tokens` bounds
+# what is generated, and on such a model the reasoning is generated too — so a
+# budget that runs out mid-thought returns an empty `content` and a whole
+# conversation's worth of nothing.
+#
+# Sent only to turn reasoning off, never to turn it on. An endpoint that has
+# never heard of it is then one this never mentions it to, which is what keeps
+# the request ordinary for everything that is not a reasoning model.
+TEMPLATE_KWARGS_FIELD = "chat_template_kwargs"
+ENABLE_THINKING_FIELD = "enable_thinking"
+
+# What a response says when it stopped because it ran out of budget rather than
+# because it had finished.
+TRUNCATED = "length"
 
 AUTHORIZATION_HEADER = "Authorization"
 BEARER_PREFIX = "Bearer "
@@ -91,9 +140,12 @@ async def complete(instruction: str, text: str) -> str:
             {ROLE_FIELD: SYSTEM_ROLE, CONTENT_FIELD: instruction},
             {ROLE_FIELD: USER_ROLE, CONTENT_FIELD: text},
         ],
-        MAX_TOKENS_FIELD: llm_cfg.max_tokens,
+        MAX_TOKENS_FIELD: llm_cfg.max_output_tokens,
         TEMPERATURE_FIELD: llm_cfg.temperature,
     }
+
+    if not llm_cfg.thinking:
+        payload[TEMPLATE_KWARGS_FIELD] = {ENABLE_THINKING_FIELD: False}
 
     try:
         async with asyncio.timeout(llm_cfg.timeout_seconds):
@@ -127,18 +179,68 @@ def _answer(body: str) -> str:
     """
     try:
         parsed: Any = json.loads(body)
-        choices = parsed[CHOICES_FIELD]
-        content = choices[0][MESSAGE_FIELD][CONTENT_FIELD]
+        choice = parsed[CHOICES_FIELD][0]
+        message = choice[MESSAGE_FIELD]
+        content = message[CONTENT_FIELD]
     except (KeyError, IndexError, TypeError, ValueError) as exc:
         raise CompletionError(
             f"could not read a completion out of the response: {_excerpt(body)}"
         ) from exc
 
-    answer = str(content).strip()
-    if not answer:
-        raise CompletionError("the endpoint returned an empty completion")
+    said = str(content or "")
+    answer = _without_reasoning(said)
+    if answer:
+        return answer
 
-    return answer
+    raise CompletionError(_nothing_said(choice, message, said))
+
+
+def _without_reasoning(said: str) -> str:
+    """
+    What the model actually answered, with any thinking cut off the front.
+
+    Complete blocks first, then an unclosed one, because a model that ran out of
+    budget mid-thought leaves an opening tag and no partner for it — and the
+    text after that tag is thinking however it ends.
+    """
+    return UNCLOSED_REASONING.sub("", REASONING_BLOCK.sub("", said)).strip()
+
+
+def _nothing_said(choice: Any, message: Any, said: str) -> str:
+    """
+    Why a 200 carried no answer, in the words of whoever has to fix it.
+
+    Worth telling apart, because one of these is a setting and the others are
+    not. A model that reasons before it answers spends `max_tokens` on the
+    reasoning; run out mid-thought and the reasoning is all there is, which
+    reads as a broken endpoint and is a number in the config file.
+    """
+    beside = message.get(REASONING_FIELD) if isinstance(message, dict) else None
+
+    # Everything it said was thinking: whatever survived the tags was nothing.
+    inline = bool(said.strip())
+
+    truncated = (
+        isinstance(choice, dict) and choice.get(FINISH_REASON_FIELD) == TRUNCATED
+    )
+
+    if beside or inline:
+        return (
+            f"the model spent its whole {llm_cfg.max_output_tokens}-token budget "
+            f"reasoning and never began the answer. Raise "
+            f"'{SETTINGS_KEY}.{LLM_SECTION}.{MAX_OUTPUT_TOKENS_KEY}', or set "
+            f"'{SETTINGS_KEY}.{LLM_SECTION}.{THINKING_KEY}: false' to stop it "
+            f"reasoning at all"
+        )
+
+    if truncated:
+        return (
+            f"the answer was cut off at {llm_cfg.max_output_tokens} tokens with "
+            f"nothing usable in it; raise "
+            f"'{SETTINGS_KEY}.{LLM_SECTION}.{MAX_OUTPUT_TOKENS_KEY}'"
+        )
+
+    return "the endpoint returned an empty completion"
 
 
 def _endpoint() -> str:
