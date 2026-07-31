@@ -596,6 +596,11 @@ class TranscriptConfig:
     filename_date_format: str = "%Y-%m-%d"
     filename_date_length: int = len("YYYY-MM-DD")
 
+    # Chaining needs the moment, and reads it off the front the same way. Both
+    # lengths are here because a name may carry an ordinal on the end, and
+    # neither reader should have to know how long that ordinal is.
+    filename_timestamp_length: int = len("YYYY-MM-DDTHH-MM-SS")
+
     @property
     def retention_enabled(self) -> bool:
         return self.retention_days >= 1

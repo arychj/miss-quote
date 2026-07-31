@@ -446,17 +446,49 @@ A session under `minimum_utterances` is not summarized: a summary of four lines 
 
 **"Miss Quote, what happened last session"** and the bot tells you, out loud, having run the stored summary through a second prompt that turns a thing you read into a thing you say.
 
-It answers with the most recent summary **for that channel**. A session still in progress has no summary yet — one is written when the transcript seals — so this is the previous conversation even when it is asked for in the middle of one, which is exactly what "last session" means.
+It answers **for that channel**, with the whole of the evening asked about. A session still in progress has no summary yet — one is written when the transcript seals — so this is the previous conversation even when it is asked for in the middle of one, which is exactly what "last session" means.
 
 Asking takes **both** a name and a trigger, the name first, in one breath. An unaddressed "what happened last session" is somebody talking to the room, and answering it would be a minute of narration nobody asked for. Punctuation is ignored on both sides, and several spellings of the name ship by default, because an ASR guesses phonetically at a name it has never been told and "Miss Quote" comes back as one word about as often as two.
 
+##### One evening is not always one session
+
+A transcript is one **connection** to a voice channel, and the resume window that covers a blip is five seconds. A room that empties while everyone refills a glass, or a pod that restarts mid-deploy, files the rest of the night separately and summarizes it separately — and answering with the newest of those retells the last forty minutes of a four-hour evening.
+
+So what is looked up is the **run** of consecutive sessions with no more than `session_gap_minutes` between one ending and the next beginning. They are read in order, set end to end, and handed to the reteller as one piece of text; the model is told they may arrive that way, via `{retelling_instructions}`, because each was written as a standalone account and three in a row otherwise open three times.
+
+Three details make that hold up:
+
+- **The gap is measured close-to-open, not open-to-open.** A filename is only when a session *started*. Four hours of conversation followed five minutes later by more of it is one evening, and anything comparing the two names alone sees four hours between them and says otherwise. When a session ended survives on disk only as the timestamp of the last line in its JSONL, so this reads transcripts as well as names.
+- **Sessions with no summary still count.** One nobody spoke in, or one under `minimum_utterances`, is exactly what bridges the two halves around a reconnect. Enumerating summaries alone would break the chain at the point something has to hold it together.
+- **An unknown ending stops the chain.** A session whose transcript has been pruned out from under its summary — which is what a longer `summaries.retention_days` asks for — is read as having closed when it opened. That is the safe way to be wrong: it degrades to the old one-session behaviour rather than stitching an unrelated conversation onto somebody's evening.
+
+`session_gap_minutes` is **not** `settings.transcripts.resume_seconds` and should not be set to match it. The resume window holds a session open and delays every summary and post behind it; this is read long afterwards, off files already on disk. Widening the resume window also cannot replace it, because shutdown seals every session regardless — a deploy mid-evening always splits the file.
+
+##### Asking for a particular evening
+
+Sessions get skipped, and other things happen in a voice channel in between, so the most recent evening is not always the one being asked about. A trigger is therefore the **start** of a question rather than the whole of one, and what follows it says which evening:
+
+| Said after a trigger | Means |
+|---|---|
+| nothing, `last time`, `last session`, `last night`, `last one` | The most recent evening |
+| `last week`, `a week ago`, `two weeks ago` … `eight weeks ago` | The evening nearest that date, within three days either way |
+| `on the twelfth`, `the twenty fifth`, `the 12th` | That day exactly |
+
+The ordinals are spelled out because that is what comes back: a transcriber writes "the twenty fifth" for a spoken date, not "the 25th". Digits are understood too, for the one that does, but a **bare** number is not a date — "recap the three things" is a request about something else.
+
+A named day is read as one of the last two months: earlier this month if it has already been, and the month before if it has not. Today counts as "has not", since a day that has not finished is not an evening anybody has notes from yet. A day the resolved month does not have — the thirty-first of a month with thirty — is nobody's evening and gets the `missing` line rather than sliding to a neighbouring date nobody named.
+
+Counting back weeks gets a few days of latitude because a channel that meets on a night of the week does not meet on a date; a tie between two equally close evenings goes to the later one. Naming a day gets none. A day with two conversations on it resolves to the later, on the same reading that makes "last time" the most recent rather than the first.
+
+This is also why the trigger list is short. `what happened` covers every row of that table, so there is no line per date anybody might name — and because the stems no longer carry a date, a trigger has to be followed by one of those clauses **or by nothing at all**. That is what keeps "Miss Quote, what happened to my beer" from being a question about last Thursday.
+
 The part worth explaining is the silence. Inference takes seconds, so the bot plays a pre-rendered *"Sure! Let me go look at my notes."* — and **starts the inference before it starts saying it**, so the announcement covers the wait rather than being followed by one. Three things make that work:
 
-- **The lookup happens first.** Reading the newest file is instant, so the bot never announces that it is going to look and then finds nothing. With nothing to find it says the `empty` line and stops.
+- **The lookup happens first.** Reading the files is instant, so the bot never announces that it is going to look and then finds nothing. With nothing to find it says the `empty` line — or the `missing` one, if the trouble is the night that was named rather than the channel — and stops.
 - **The completion is started before the preamble is played, not after.** Playback returns when the clip has finished, so asking the model on the next line would put the inference *after* the announcement meant to cover it. `tests/test_summary.py` guards this as a deadlock rather than a timing assertion: the fake preamble will not finish until the model has started, so getting the order wrong hangs the test instead of quietly passing.
-- **The preamble and the `empty` line are rendered at startup**, so both begin on a file read rather than a synthesizer round trip.
+- **The preamble, the `empty` line and the `missing` one are rendered at startup**, so each begins on a file read rather than a synthesizer round trip.
 
-A second ask while a retelling is still going is dropped rather than queued — what is queued behind a minute of narration is a minute of the same narration — and `backoff_seconds` is how soon after one the channel can be told again.
+A second ask while a retelling is still going is dropped rather than queued — what is queued behind a minute of narration is a minute of the same narration — and `backoff_seconds` is how soon after one the channel can be told it again. The window is per **evening**, not per channel: what it exists to stop is the same story twice, and somebody asking about a different night is asking a second question with a different answer.
 
 **The story ends itself.** A retelling runs to a minute and ends wherever the model chose to end it, so a channel that has been listening has no way to tell "finished" from "stopped" — which is a thing to ask the prompt for rather than a thing to bolt on after it. `bard` is told to close on a line that means the tale is over, in the voice it has been telling it in, and that sign-off is what the room hears. A custom retelling prompt gets the same instruction by writing `{retelling_closing}`.
 
@@ -476,7 +508,7 @@ Prompts are named and selected by name. Three ship, as prose in `src/miss_quote/
 
 `prompts:` adds your own to those, and one written under a shipped name replaces it — which is how a server that likes the structure of `recap` and not its tone changes the tone without inventing a name for it. It sits at the tool level rather than inside a channel because a prompt is a library entry, and restating a paragraph of instructions once per room is how two of them end up saying different things by accident.
 
-A prompt of your own can pull in the text the shipped ones share by naming it in braces. The prefix says which job the fragment is for, because the two are handed different things: `{transcript_instructions}` is the paragraph describing the script format, which any prompt summarizing a session wants and no retelling prompt should carry — a retelling is given the summary `recap` already wrote, not a transcript. `{retelling_closing}` is the instruction to end on a line that means the story is over.
+A prompt of your own can pull in the text the shipped ones share by naming it in braces. The prefix says which job the fragment is for, because the two are handed different things: `{transcript_instructions}` is the paragraph describing the script format, which any prompt summarizing a session wants and no retelling prompt should carry — a retelling is given the summary `recap` already wrote, not a transcript. `{retelling_instructions}` says that an evening can arrive as several accounts set end to end and is to be told as one story. `{retelling_closing}` is the instruction to end on a line that means the story is over.
 
 `{words}` is filled separately, per channel, from `retelling_words`, and cannot be used as a fragment name. Any other braces are left exactly as written, so an example of the JSON you want back survives. A shipped prompt naming a fragment that does not exist stops the bot at startup; one of your own is left alone, since braces in it are usually deliberate.
 
@@ -491,12 +523,14 @@ A prompt of your own can pull in the text the shipped ones share by naming it in
 | `retelling_prompt` | `bard` | Which prompt turns a stored summary into something to say out loud |
 | `retelling_words` | `200` | Roughly how long the spoken retelling should be — a target the prompt is told to aim at, not a cap it is cut to. About a minute out loud |
 | `minimum_utterances` | `5` | Below this a session is not a conversation and is not summarized |
-| `backoff_seconds` | `120` | How soon the channel can be told its notes again. `0`, or below, tells it every time |
+| `backoff_seconds` | `120` | How soon the channel can be told the same evening again. `0`, or below, tells it every time |
+| `session_gap_minutes` | `10` | How long the room can sit quiet before the rest of the night is a different evening. Not `resume_seconds`, and not to be set to match it |
 | `preamble` | `Sure! Let me go look at my notes.` | What plays while the model is thinking |
-| `empty` | `I don't have any notes from this channel yet.` | What plays when there is nothing to tell |
+| `empty` | `I don't have any notes from this channel yet.` | What plays when nothing has ever been written down in this room |
+| `missing` | `I don't have any notes from then.` | What plays when there are notes, just not from the evening that was named |
 | `closing` | — | A fixed line played once the story is told, for a server that wants the same words every time. Unset, and the retelling prompt's own sign-off is what says it finished |
 | `name` | `miss quote`, `misquote`, `missquote`, `mis quote`, `ms quote`, `mizquote` | What the bot answers to, in the spellings a transcriber returns for a name it has never been told. **Replaces** the default |
-| `triggers` | `what happened last session`, and four more | What asking looks like. **Replaces** the default |
+| `triggers` | `what happened`, `what did we do`, `recap`, `read me your notes`, `tell me about` | How asking **starts**; which evening is a clause after it. **Replaces** the default |
 
 ### scoreboard
 

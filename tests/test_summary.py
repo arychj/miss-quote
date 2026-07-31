@@ -3,14 +3,16 @@
 import asyncio
 import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
 import miss_quote.llm.client as llm_module
 import miss_quote.summary.store as store_module
-from miss_quote.config import SummaryConfig
+import miss_quote.tools.summary as summary_module
+from miss_quote.config import SummaryConfig, TranscriptConfig, transcript_cfg
 from miss_quote.llm.client import CompletionError
 from miss_quote.tools.base import Tool, ToolContext, Toolbox
 from miss_quote.tools.summary import Summary
@@ -33,12 +35,19 @@ RETELLING = "So there they were, arguing about the rules, and nobody won."
 
 PREAMBLE = "Sure! Let me go look at my notes."
 EMPTY = "I don't have any notes from this channel yet."
+MISSING = "I don't have any notes from then."
 CLOSING = "I wonder what'll happen tonight?"
 
 ASKER = "Erik"
 ENOUGH_UTTERANCES = 12
 
 PATIENCE_SECONDS = 2.0
+
+# The day every question in here is asked on. Late enough in a long month that
+# an ordinal has somewhere to land in it, and a Friday, so counting back weeks
+# lands on a weekday a channel plausibly meets on.
+TODAY = date(2026, 7, 31)
+ZONE = ZoneInfo(transcript_cfg.timezone)
 
 WATCHED_SOURCE = Source(
     guild_id=1, guild_alias=SERVER, channel_id=10, channel=WATCHED
@@ -117,10 +126,24 @@ class Session:
 
 @pytest.fixture(autouse=True)
 def summaries(tmp_path, monkeypatch):
-    """A summary directory under the test's own tree."""
+    """
+    Both trees under the test's own, and a fixed day to ask questions on.
+
+    The store reads transcripts as well as summaries now — an evening filed in
+    pieces is put back together from when each piece stopped being talked in,
+    and that is only in the JSONL. A date somebody names is resolved against
+    today, so today is pinned rather than left to the calendar the suite happens
+    to run on.
+    """
     monkeypatch.setattr(
         store_module, "summary_cfg", SummaryConfig(directory=tmp_path / "summaries")
     )
+    monkeypatch.setattr(
+        store_module,
+        "transcript_cfg",
+        TranscriptConfig(directory=tmp_path / "transcripts"),
+    )
+    monkeypatch.setattr(summary_module, "_today", lambda: TODAY)
 
     return tmp_path
 
@@ -221,6 +244,37 @@ def _transcript(root: Path, source: Source, lines: int = ENOUGH_UTTERANCES) -> T
 
 def _said(text: str) -> Utterance:
     return Utterance(timestamp=OPENED, user_id=1, user=ASKER, text=text)
+
+
+def _filed(
+    root: Path,
+    opened: datetime,
+    *,
+    spoken: datetime,
+    summary: str,
+    source: Source = WATCHED_SOURCE,
+) -> None:
+    """
+    One session already on disk, without going through the summarizing.
+
+    Both halves, because an evening is put back together from when each of its
+    pieces stopped being talked in and that only exists in the transcript.
+    """
+    stem = opened.strftime(transcript_cfg.filename_timestamp_format)
+    line = {"ts": spoken.isoformat(), "user_id": 1, "user": ASKER, "text": "and so on"}
+
+    transcript = root / "transcripts" / source.relative_directory / f"{stem}.jsonl"
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    transcript.write_text(json.dumps(line) + "\n", encoding="utf-8")
+
+    written = root / "summaries" / source.relative_directory / f"{stem}.txt"
+    written.parent.mkdir(parents=True, exist_ok=True)
+    written.write_text(summary, encoding="utf-8")
+
+
+def _evening(*parts: int) -> datetime:
+    """A moment in the timezone the transcripts are named in."""
+    return datetime(*parts, tzinfo=ZONE)
 
 
 # ── the gate ──────────────────────────────────
@@ -355,7 +409,7 @@ async def test_the_retelling_is_the_most_recent_summary(summaries, model):
     )
 
     assert speech.played == [PREAMBLE, RETELLING, CLOSING]
-    assert model.asked[-1][1] == SUMMARY
+    assert SUMMARY in model.asked[-1][1]
 
 
 async def test_with_no_notes_it_says_so_and_asks_nothing(summaries, model):
@@ -398,6 +452,10 @@ async def test_the_spellings_an_asr_might_return_all_ask(summaries, model, said)
         "what happened last session",
         "has anyone seen Miss Quote",
         "what happened last session, and where is miss quote",
+        # A stem with something after it that is not a date. The stems are short
+        # now that they no longer carry one, and this is what keeps them honest.
+        "Miss Quote, what happened to my beer",
+        "miss quote, recap the rules for me",
     ],
 )
 async def test_a_name_or_a_trigger_on_its_own_is_not_a_question(summaries, model, said):
@@ -406,6 +464,156 @@ async def test_a_name_or_a_trigger_on_its_own_is_not_a_question(summaries, model
     await tool.handle_utterance(_said(said), Session(WATCHED_SOURCE))
 
     assert speech.played == []
+
+
+async def test_a_stem_on_its_own_asks_for_the_last_one(summaries, model):
+    """"Miss Quote, what happened" is the same question with the clause left off."""
+    tool, speech = _tool()
+    model.answers = [SUMMARY, RETELLING]
+    await tool.handle_finished(_transcript(summaries, WATCHED_SOURCE))
+
+    await tool.handle_utterance(
+        _said("Miss Quote, what happened?"), Session(WATCHED_SOURCE)
+    )
+
+    assert speech.played == [PREAMBLE, RETELLING, CLOSING]
+
+
+# ── one evening, several sessions ─────────────
+
+
+async def test_an_evening_filed_in_halves_is_retold_as_one(summaries, model):
+    """
+    A room that empties and refills files the rest of the night separately, and
+    it is one evening. The model is handed both halves and told nothing about
+    there having been two.
+    """
+    tool, speech = _tool()
+    model.answers = [RETELLING]
+
+    _filed(
+        summaries,
+        _evening(2026, 7, 30, 19, 0, 0),
+        spoken=_evening(2026, 7, 30, 21, 0, 0),
+        summary="the first half",
+    )
+    _filed(
+        summaries,
+        _evening(2026, 7, 30, 21, 6, 0),
+        spoken=_evening(2026, 7, 30, 23, 0, 0),
+        summary="the second half",
+    )
+
+    await tool.handle_utterance(
+        _said("Miss Quote, what happened last time?"), Session(WATCHED_SOURCE)
+    )
+
+    _, given = model.asked[-1]
+    assert "the first half" in given
+    assert "the second half" in given
+    assert speech.played == [PREAMBLE, RETELLING, CLOSING]
+
+
+async def test_a_channel_can_set_how_long_a_break_is(summaries, model):
+    """Six minutes is one evening at the default and two at one minute."""
+    tool, speech = _tool(session_gap_minutes=1)
+    model.answers = [RETELLING]
+
+    _filed(
+        summaries,
+        _evening(2026, 7, 30, 19, 0, 0),
+        spoken=_evening(2026, 7, 30, 21, 0, 0),
+        summary="the first half",
+    )
+    _filed(
+        summaries,
+        _evening(2026, 7, 30, 21, 6, 0),
+        spoken=_evening(2026, 7, 30, 23, 0, 0),
+        summary="the second half",
+    )
+
+    await tool.handle_utterance(
+        _said("Miss Quote, what happened last time?"), Session(WATCHED_SOURCE)
+    )
+
+    assert "the first half" not in model.asked[-1][1]
+
+
+# ── an evening somebody named ─────────────────
+
+
+async def test_a_named_day_is_retold(summaries, model):
+    tool, speech = _tool()
+    model.answers = [RETELLING]
+
+    _filed(
+        summaries,
+        _evening(2026, 7, 12, 20, 0, 0),
+        spoken=_evening(2026, 7, 12, 22, 0, 0),
+        summary="the twelfth",
+    )
+    _filed(
+        summaries,
+        _evening(2026, 7, 26, 20, 0, 0),
+        spoken=_evening(2026, 7, 26, 22, 0, 0),
+        summary="the twenty sixth",
+    )
+
+    await tool.handle_utterance(
+        _said("Miss Quote, what happened on the twelfth?"), Session(WATCHED_SOURCE)
+    )
+
+    assert "the twelfth" in model.asked[-1][1]
+    assert "the twenty sixth" not in model.asked[-1][1]
+
+
+async def test_counting_back_weeks_is_retold(summaries, model):
+    tool, speech = _tool()
+    model.answers = [RETELLING]
+
+    _filed(
+        summaries,
+        _evening(2026, 7, 16, 20, 0, 0),
+        spoken=_evening(2026, 7, 16, 22, 0, 0),
+        summary="two weeks back",
+    )
+    _filed(
+        summaries,
+        _evening(2026, 7, 30, 20, 0, 0),
+        spoken=_evening(2026, 7, 30, 22, 0, 0),
+        summary="last night",
+    )
+
+    await tool.handle_utterance(
+        _said("Miss Quote, what happened two weeks ago?"), Session(WATCHED_SOURCE)
+    )
+
+    assert "two weeks back" in model.asked[-1][1]
+
+
+async def test_a_day_with_no_notes_says_so_rather_than_saying_there_are_none(
+    summaries, model
+):
+    """
+    Two different answers. One says the bot has never written anything down
+    here, and the other says it was not listening that night; a channel told the
+    first when the second is true goes looking for a fault that is not there.
+    """
+    tool, speech = _tool()
+
+    _filed(
+        summaries,
+        _evening(2026, 7, 26, 20, 0, 0),
+        spoken=_evening(2026, 7, 26, 22, 0, 0),
+        summary=SUMMARY,
+    )
+
+    await tool.handle_utterance(
+        _said("Miss Quote, what happened on the second?"), Session(WATCHED_SOURCE)
+    )
+
+    assert speech.played == [MISSING]
+    assert model.asked == []
 
 
 async def test_it_is_not_told_twice_inside_the_backoff(summaries, model):
@@ -418,6 +626,38 @@ async def test_it_is_not_told_twice_inside_the_backoff(summaries, model):
     await tool.handle_utterance(asked, Session(WATCHED_SOURCE))
 
     assert speech.played == [PREAMBLE, RETELLING, CLOSING]
+
+
+async def test_a_different_evening_inside_the_backoff_is_still_answered(summaries, model):
+    """
+    The window holds off one story, not one channel. Somebody asking about last
+    Thursday is asking a second question, and it has a different answer.
+    """
+    tool, speech = _tool(backoff_seconds=300)
+    model.answers = [RETELLING]
+
+    _filed(
+        summaries,
+        _evening(2026, 7, 12, 20, 0, 0),
+        spoken=_evening(2026, 7, 12, 22, 0, 0),
+        summary="the twelfth",
+    )
+    _filed(
+        summaries,
+        _evening(2026, 7, 30, 20, 0, 0),
+        spoken=_evening(2026, 7, 30, 22, 0, 0),
+        summary="last night",
+    )
+
+    await tool.handle_utterance(
+        _said("Miss Quote, what happened last time?"), Session(WATCHED_SOURCE)
+    )
+    await tool.handle_utterance(
+        _said("Miss Quote, what happened on the twelfth?"), Session(WATCHED_SOURCE)
+    )
+
+    assert speech.played.count(RETELLING) == 2
+    assert "the twelfth" in model.asked[-1][1]
 
 
 async def test_a_second_ask_mid_retelling_is_dropped(summaries, model):
@@ -517,7 +757,7 @@ async def test_a_closing_nobody_asked_for_is_not_rendered_either(summaries, mode
 
     await tool.prewarm()
 
-    assert sorted(speech.warmed) == sorted([PREAMBLE, EMPTY])
+    assert sorted(speech.warmed) == sorted([PREAMBLE, EMPTY, MISSING])
 
 
 async def test_a_retelling_is_followed_by_a_fixed_closing(summaries, model):
@@ -541,7 +781,7 @@ async def test_the_closing_is_rendered_in_advance_with_the_rest(summaries, model
 
     await tool.prewarm()
 
-    assert sorted(speech.warmed) == sorted([PREAMBLE, EMPTY, CLOSING])
+    assert sorted(speech.warmed) == sorted([PREAMBLE, EMPTY, MISSING, CLOSING])
 
 
 async def test_nothing_to_tell_gets_no_closing(summaries, model):
