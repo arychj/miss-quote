@@ -98,19 +98,20 @@ class Phrase:
     the same in one pipeline is how the wrong one gets imported.
     """
 
-    __slots__ = ("_cache", "_text")
+    __slots__ = ("_cache", "_text", "_keep")
 
-    def __init__(self, cache: SpeechCache, text: str) -> None:
+    def __init__(self, cache: SpeechCache, text: str, keep: bool = True) -> None:
         self._cache = cache
         self._text = text
+        self._keep = keep
 
     def packets(self) -> AsyncIterator[bytes]:
         """The phrase encoded, which is how it is stored and how Discord takes it."""
-        return self._cache.encoded(self._text)
+        return self._cache.encoded(self._text, keep=self._keep)
 
     def pcm(self) -> AsyncIterator[bytes]:
         """The phrase as samples, for a clip that has to be changed on the way out."""
-        return self._cache.samples(self._text)
+        return self._cache.samples(self._text, keep=self._keep)
 
 
 class SpeechCache:
@@ -135,7 +136,7 @@ class SpeechCache:
 
         self._reap()
 
-    def stream(self, text: str) -> Phrase:
+    def stream(self, text: str, *, keep: bool = True) -> Phrase:
         """
         A phrase, for the speaker to take whichever way it needs.
 
@@ -144,10 +145,16 @@ class SpeechCache:
         load-bearing rather than incidental — a clip is queued behind whatever is
         already playing, and by the time it is drained an identical phrase ahead
         of it may already have filled the cache.
-        """
-        return Phrase(self, text)
 
-    async def encoded(self, text: str) -> AsyncIterator[bytes]:
+        `keep` is for a phrase that will never be said twice. The cache exists so
+        that a phrase said again costs a file read, and a sentence composed for
+        one moment is never said again by anybody: looking it up cannot hit,
+        storing it cannot help, and what it leaves behind is a large file on a
+        retention clock that only its own age will ever clear.
+        """
+        return Phrase(self, text, keep)
+
+    async def encoded(self, text: str, *, keep: bool = True) -> AsyncIterator[bytes]:
         """
         Opus packets for a phrase, from disk or synthesized.
 
@@ -162,17 +169,20 @@ class SpeechCache:
         """
         key = self._key(text)
 
-        stored = await self._read(key)
-        if stored is not None:
-            await self._touch(key)
-            for packet in stored:
-                yield packet
-            return
+        # A phrase nothing keeps is one nothing can have kept, so the lookup is
+        # skipped rather than performed and missed.
+        if keep:
+            stored = await self._read(key)
+            if stored is not None:
+                await self._touch(key)
+                for packet in stored:
+                    yield packet
+                return
 
-        async for packet in self._synthesize(key, text):
+        async for packet in self._synthesize(key, text, keep=keep):
             yield packet
 
-    async def samples(self, text: str) -> AsyncIterator[bytes]:
+    async def samples(self, text: str, *, keep: bool = True) -> AsyncIterator[bytes]:
         """
         Playback PCM for a phrase, for a clip that cannot be sent as it is.
 
@@ -197,7 +207,7 @@ class SpeechCache:
         decoder = opus.Decoder()
         batch: list[bytes] = []
 
-        async for packet in self.encoded(text):
+        async for packet in self.encoded(text, keep=keep):
             batch.append(packet)
 
             if len(batch) >= DECODE_BATCH_PACKETS:
@@ -247,7 +257,9 @@ class SpeechCache:
 
     # ── synthesis ─────────────────────────────────
 
-    async def _synthesize(self, key: str, text: str) -> AsyncIterator[bytes]:
+    async def _synthesize(
+        self, key: str, text: str, *, keep: bool = True
+    ) -> AsyncIterator[bytes]:
         """
         Speak a phrase for the first time, keeping it on the way past.
 
@@ -286,10 +298,12 @@ class SpeechCache:
             return
 
         stored = tuple(packets)
-        await self._write(key, stored)
+        if keep:
+            await self._write(key, stored)
 
         logger.info(
-            "Synthesized and cached %r (%.1fs, %d KiB).",
+            "Synthesized %s %r (%.1fs, %d KiB).",
+            "and cached" if keep else "without keeping",
             text,
             opus.seconds(stored),
             sum(len(packet) for packet in stored) // BYTES_PER_KIB,

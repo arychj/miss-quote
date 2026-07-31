@@ -79,9 +79,9 @@ def synthesizer(monkeypatch) -> FakeSynthesizer:
     return fake
 
 
-async def _collect(cache: SpeechCache, text: str = PHRASE) -> bytes:
+async def _collect(cache: SpeechCache, text: str = PHRASE, keep: bool = True) -> bytes:
     """The phrase as samples, which is what most of these assert against."""
-    return b"".join([chunk async for chunk in cache.stream(text).pcm()])
+    return b"".join([chunk async for chunk in cache.stream(text, keep=keep).pcm()])
 
 
 async def _packets(cache: SpeechCache, text: str = PHRASE) -> list[bytes]:
@@ -609,3 +609,47 @@ async def test_a_clip_played_quieter_is_decoded_in_batches(synthesizer, tmp_path
 
     assert all(len(chunk) <= batch for chunk in chunks)
     assert len(chunks) < SOURCE_SAMPLES  # nowhere near one per packet
+
+
+# ── one-off phrases ───────────────────────────────
+
+
+async def test_a_phrase_nothing_keeps_is_not_written_to_disk(synthesizer, tmp_path):
+    """
+    A sentence composed for one moment — the account of one evening, read out
+    once. Storing it leaves a large file nothing will ever ask for again, on a
+    retention clock only its own age will clear.
+    """
+    cache = SpeechCache(directory=tmp_path)
+
+    await _collect(cache, keep=False)
+
+    assert synthesizer.calls == [PHRASE]
+    assert _cached_files(tmp_path) == []
+
+
+async def test_a_phrase_nothing_keeps_still_plays(synthesizer, tmp_path):
+    cache = SpeechCache(directory=tmp_path)
+
+    kept = await _collect(cache)
+    passing = await _collect(SpeechCache(directory=tmp_path), keep=False)
+
+    assert passing == kept
+
+
+async def test_a_phrase_nothing_keeps_is_not_looked_up_either(synthesizer, tmp_path):
+    """It cannot be a hit, so the filesystem is not asked."""
+    cache = SpeechCache(directory=tmp_path)
+    await _collect(cache)
+
+    await _collect(cache, keep=False)
+
+    assert synthesizer.calls == [PHRASE, PHRASE]
+
+
+async def test_keeping_a_phrase_stays_the_default(synthesizer, tmp_path):
+    cache = SpeechCache(directory=tmp_path)
+
+    await _collect(cache)
+
+    assert len(_cached_files(tmp_path)) == 1

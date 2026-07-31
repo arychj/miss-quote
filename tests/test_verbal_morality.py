@@ -162,7 +162,7 @@ class FakeSpeech:
         # otherwise, which is what a cache hit looks like.
         self.chunks: tuple[str, ...] | None = None
 
-    def stream(self, text: str) -> "FakePhrase":
+    def stream(self, text: str, *, keep: bool = True) -> "FakePhrase":
         """
         A phrase the speaker can take either way, as the real cache hands back.
 

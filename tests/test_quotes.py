@@ -181,7 +181,7 @@ class FakeSpeech:
         self.warmed: list[str] = []
         self.held: set[str] = set()
 
-    def stream(self, text: str) -> FakePhrase:
+    def stream(self, text: str, *, keep: bool = True) -> FakePhrase:
         self.asked.append(text)
 
         return FakePhrase(text)

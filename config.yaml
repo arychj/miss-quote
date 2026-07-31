@@ -369,6 +369,12 @@ servers:
               # preamble: "Sure! Let me go look at my notes."
               # empty: "I don't have any notes from this channel yet."
 
+              # What is said once the story is told. A retelling runs to a
+              # minute and ends wherever the model chose to, so without a fixed
+              # line the channel cannot tell finished from stopped.
+              #
+              # closing: "I wonder what'll happen tonight?"
+
               # What the bot answers to, and what asking looks like. Both
               # replace their defaults rather than adding to them: they are a
               # matching vocabulary, and renaming the bot should make the old
