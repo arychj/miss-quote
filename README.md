@@ -46,12 +46,15 @@ graph TD
     J -->|"handle_utterance"| L["Tools for this server"]
     K -.->|"handle_finished, on disconnect"| L
 
-    L -.->|"speaker.play"| M["Speech cache<br/><i>Ogg Opus in SPEECH_DIR/cache</i>"]
+    L -.->|"tts.play"| T["<b>tts</b> tool<br/><i>one per server</i>"]
+    T -.->|"a phrase"| M["Speech cache<br/><i>Ogg Opus in SPEECH_DIR/cache</i>"]
+    T -.->|"a chime, by name"| C["Chime library<br/><i>WAVs in SPEECH_DIR/chimes</i>"]
     M -.->|"on a miss"| N["Wyoming TTS<br/><i>TTS_HOST:TTS_PORT</i>"]
     M -.->|"Opus packets, sent unencoded"| A
+    C -.->|"samples, chained ahead of the words"| A
 ```
 
-The dotted half is optional and only exists for tools that answer out loud; a deployment with none never opens a TTS connection.
+The dotted half is optional and only exists for servers that enabled the `tts` tool; a deployment where none did never opens a TTS connection. Everything played into a channel goes through that one tool — it owns the cache, the chime library, the volume, and the voice connection, and the tools that decide *what* to say reach it through the toolbox.
 
 Everything runs on one event loop in one process. The split that matters is between the two halves of the pipeline: **audio handling is local and serial, transcription is remote and parallel.**
 
@@ -135,6 +138,8 @@ servers:
     tools:
       scoreboard:
         enabled: true
+      tts:
+        enabled: true
       verbal-morality:
         enabled: true
         config:
@@ -160,7 +165,7 @@ On startup the bot reconciles the file against the servers it is actually in, an
 
 `users` replaces the display name Discord reports for a speaker. Discord nicknames are freely editable and often not a name at all, which makes them poor labels in a transcript that a summarizer will later read. The roster is per server because the same person can be known differently in two places. IDs may be quoted or bare; both are read as integers.
 
-`tools` elects the server into the tools listed under it — see below. Each is opted into on its own, including the ones others depend on: `verbal-morality` hands its fines to `scoreboard`, and a server that enables the first and not the second gets the announcements without the tally.
+`tools` elects the server into the tools listed under it — see below. Each is opted into on its own, including the ones others depend on: `verbal-morality` hands its fines to `scoreboard` and its words to `tts`, and a server that enables the first and neither of the others is fining people silently and keeping no record of it. Each absence is reported at startup rather than left to be noticed.
 
 **A tool block holds `enabled` and `config`, and nothing else.** Every setting a tool takes goes under `config:`; written a level up, beside `enabled`, it is read by nothing. That is the one misconfiguration with no symptom — the tool starts, the log says it is enabled, and it runs on its defaults against a file that plainly asks for something else — so anything else in a tool block is named at startup alongside the other parsing problems:
 
@@ -192,7 +197,7 @@ class Example(Tool):
         """Started once the bot has connected, and left going."""
 ```
 
-A tool is also handed a `speaker`, which is how it answers out loud — see **Speech** below — a `topic`, which is somewhere to put one line where the channel can read it, its server's `users` roster, which is the only thing knowable about who might speak before anybody does, and a `tools` box holding the other tools that server has enabled.
+A tool is also handed a `topic`, which is somewhere to put one line where the channel can read it, its server's `users` roster, which is the only thing knowable about who might speak before anybody does, and a `tools` box holding the other tools that server has enabled. Answering out loud is not on that list: playing audio belongs to the `tts` tool, and every other tool reaches it through the box — see **Speech** below.
 
 None of the three exists on the base class, so their absence is meaningful: the runner inspects each instance once at startup and files it under the moments it handles. A tool that defines none of them is reported as configured-but-inert rather than silently doing nothing.
 
@@ -202,15 +207,30 @@ None of the three exists on the base class, so their absence is meaningful: the 
 
 All three are coroutines running on the bot's event loop; anything blocking is the tool's own business to push onto a thread. A tool is constructed **once per server** that elects into it, so it may hold state, but its handlers can be entered concurrently — utterances are transcribed in parallel and dispatched as they land, not in the order they were spoken.
 
-A tool may also define **`async def prewarm(self)`**, which the runner calls once per process in the background just after the bot connects, and **`async def close(self)`**, which it calls on the way down once every `run` has been cancelled. `prewarm` is for work a tool can do before anybody asks anything of it — rendering what it already knows it will have to say is the use that exists — and, being the first moment at which every tool on a server exists, is also where to complain about one that is missing. `close` is for whatever has to outlive the process. Neither is a moment: a tool defining only these handles nothing and is still reported as inert, and nothing is prepared for, or awaited on behalf of, a tool that can never run. Warming is **serial** across tools, unlike dispatch, because nothing is waiting on it and the tools with anything to warm are all talking to one synthesizer.
+A tool may also define **`async def prewarm(self)`**, which the runner calls once per process in the background just after the bot connects, and **`async def close(self)`**, which it calls on the way down once every `run` has been cancelled. `prewarm` is for work a tool can do before anybody asks anything of it — rendering what it already knows it will have to say is the use that exists — and, being the first moment at which every tool on a server exists, is also where to complain about one that is missing. `close` is for whatever has to outlive the process. Neither is a moment: a tool defining only these handles nothing and is still reported as inert, and nothing is prepared for, or awaited on behalf of, a tool that can never run. Warming is **serial** across tools, unlike dispatch, because nothing is waiting on it. What a tool does with the moment is hand `tts` the list of phrases it can already see coming; rendering them is `tts`'s own `run`, in the background, one at a time across the whole process.
 
-**One tool can call another.** Every tool a server has enabled shares one box, and a tool reaches its neighbour by class:
+**One tool can call another.** Every tool a server has enabled shares one box. A tool says which of its neighbours it uses, and reaches them by class:
 
 ```python
-board = self.tools.find(Scoreboard)
+class VerbalMorality(Tool):
+    name = "verbal-morality"
+    requires = (Scoreboard, Tts)
+
+    def _scoreboard(self) -> Scoreboard | None:
+        return self.tools.find(Scoreboard)
 ```
 
-Look **at the moment you need it, not in `__init__`**. The box is handed over before any of the server's tools exist and fills as each is built, so a tool that resolves a neighbour at construction finds it or does not depending on the order the config file happens to list them in; by the time anybody has spoken they are all there. Lookup is by class rather than by name so that what a tool depends on is an import a reader can follow, and a tool that is missing comes back as `None` rather than as an error — `verbal-morality` without a `scoreboard` announces fines and does not count them, which is a whole working configuration. A tool that can never run is not in the box at all, so a neighbour never settles for one that will never do anything.
+Look **at the moment you need it, not in `__init__`**. The box is handed over before any of the server's tools exist and fills as each is built, so a tool that resolves a neighbour at construction finds it or does not depending on the order the config file happens to list them in; by the time anybody has spoken they are all there. Lookup is by class rather than by name so that what a tool depends on is an import a reader can follow, and a tool that is missing comes back as `None` rather than as an error — `verbal-morality` without a `scoreboard` announces fines and does not count them, and without a `tts` counts them and says nothing; both are whole working configurations. A tool that can never run is not in the box at all, so a neighbour never settles for one that will never do anything.
+
+What each tool is given is a **view** of the box bound to its own class, serving only what `requires` names. Asking for anything else comes back `None` with a line in the log. That is not ceremony: `requires` is the graph the startup **cycle check** walks, and a declaration nothing enforces is one that drifts away from the call sites it describes, at which point the check is reading a graph the process does not have.
+
+Two tools that require each other are a stack that does not end. The runner walks the declarations for each server before it builds anything, and a circle is reported and **left unbuilt**:
+
+```
+Server 'first-server': tools chicken → egg → chicken require each other in a circle; none of them will be built.
+```
+
+Reported here it is a line in the startup report; discovered later it is the process. An edge pointing at a tool the server did not enable is not a circle — there is nothing in the box to call, and the lookup returns the same `None` it always would.
 
 Failures are contained. A tool that raises is logged and otherwise invisible: it cannot cost an utterance, delay a disconnect, or stop another tool from running, warming, or closing. A tool whose `run` raises is logged too, since nothing awaits that task and the exception would otherwise never be collected. A tool that will not construct is reported at startup and skipped.
 
@@ -294,7 +314,7 @@ Matching is **whole words, case-insensitive**, so `real` does not fire inside `r
 
 `{user}` is filled with the name the transcript uses — the roster name from `users` where a server has set one, the Discord display name otherwise — so nothing has to be configured twice.
 
-**The whole list is rendered at startup.** Unlike a fine, a quote is knowable in full before anybody speaks: the triggers are a closed set and so are the answers — every answer of every trigger, including the ones a trigger shares with another row — so on the way up the tool synthesizes every line in the file and leaves the results in the speech cache. A callback that arrives four seconds after the line it answers is not a callback. The exception is a line naming whoever set it off, which is rendered once per name on the roster; somebody the server has not written down waits for the synthesizer the first time, and nobody waits again. Warming happens in the background, one phrase at a time, and anything already cached is left alone.
+**The whole list is rendered at startup.** Unlike a fine, a quote is knowable in full before anybody speaks: the triggers are a closed set and so are the answers — every answer of every trigger, including the ones a trigger shares with another row — so on the way up the tool hands `tts` every line in the file. A callback that arrives four seconds after the line it answers is not a callback. The exception is a line naming whoever set it off, which is rendered once per name on the roster; somebody the server has not written down waits for the synthesizer the first time, and nobody waits again. Warming happens in the background, one phrase at a time, and anything already cached is left alone.
 
 #### Naming it
 
@@ -342,7 +362,7 @@ Somebody paid on a **tie** gets the second wording — `Eli, you are also awarde
 
 **Nothing this tool says is dropped for landing while something else is playing**, which is the one place it parts company with `verbal-morality`. A fine interrupts a conversation that was about something else, so a backlog of them is a channel being read things it has moved on from, and `verbal-morality` drops any fine earned mid-announcement. Everything `quotes` says is an answer to something it just said itself: the line, the award, the tie, the rebuke. Announcements wait their turn on the speaker's per-server lock and come out in the order they were earned.
 
-**Every wording is rendered at startup**, alongside the quotes: every template the server can hear, for every name on the roster, against every ending it can take. Which one comes up is decided when somebody answers; that all of them are already in the cache is decided on the way up. A template with a placeholder nothing fills stops the tool from starting, rather than being discovered at the moment there is a credit to explain.
+**Every wording is rendered at startup**, alongside the quotes: every template the server can hear, for every name on the roster, against every ending it can take. Which one comes up is decided when somebody answers; that all of them are already queued for rendering is decided on the way up. A template with a placeholder nothing fills stops the tool from starting, rather than being discovered at the moment there is a credit to explain.
 
 #### Naming your own line
 
@@ -401,6 +421,33 @@ A request Discord **refuses** — a `400`, or a missing permission — is not re
 
 The half that talks to Discord is `bot/topic.py`; the tool itself imports no discord, on the same terms as the speaker.
 
+### tts
+
+Says things out loud, and is the only thing that plays anything. It hears nothing and decides nothing; what it does is own the rendered-speech cache, the chime library, the volume, and the voice connection, so that everything a channel hears arrives by one route.
+
+```yaml
+tts:
+  enabled: true
+```
+
+There is nothing to configure per server. Which synthesizer, which voice, how long a clip is kept and how much of one is held back before playback are `settings.tts` and `TTS_HOST` / `TTS_PORT` / `TTS_VOICE`, because there is one synthesizer behind every server. All this setting says is whether **this** server is allowed to speak through it.
+
+**It is enabled separately from whatever is talking.** A server that enables `verbal-morality` and not this counts fines and says nothing; one that enables `quotes` and not this runs its rounds, pays them, and answers nobody. Both are said once at startup rather than left to be discovered by wondering why the channel is quiet.
+
+**Other tools speak through it.** `play` is the whole interface:
+
+```python
+speech = self.tools.find(Tts)
+if speech is not None:
+    await speech.play(session.source, wording, scale=0.5, chime="chime")
+```
+
+It returns once the clip has finished, so a tool that says two things in a row gets them in that order rather than on top of each other. `scale` is relative to the deployment's own loudness rather than absolute — `1.0` is however loud the channel asked to be interrupted, and a tool with a reason to be quieter has no business knowing what usual is. `chime` names a WAV in `SPEECH_DIR/chimes`, **without its extension**, played ahead of the words; a chime that is missing costs the chime and not the announcement.
+
+**How a clip reaches Discord is decided here, and it is the difference between free and not.** A phrase with nothing in front of it and nothing to be done to it is handed over exactly as it was stored — Opus packets, no decode, no encode, no resample, and no encoder even constructed. A chime, or any volume below the channel's own, means samples: there is nothing to join onto an encoded packet and nothing in one to multiply. So `quotes`, which never uses a chime and never turns itself down, takes the free path every time, and a backed-off fine with a flourish in front of it does not.
+
+**Rendering in advance is its `run`.** A tool that can work out at startup what it will have to say hands over the list — `enqueue` is synchronous and returns immediately — and this renders it in the background while the bot is already in the channel, one phrase at a time across the whole process. A phrase already queued is dropped; a phrase that will not synthesize is a line in the log and then the next phrase, never the end of the run.
+
 ### verbal-morality
 
 The Verbal Morality Bot, after *Demolition Man*. It listens for words the server has decided against and, on hearing one, announces the fine out loud in the channel it was said in. The credits are imaginary but they are counted, by somebody else: the fine is handed to the server's [`scoreboard`](#scoreboard), which is what keeps a balance, writes it down, and publishes the standings. **With no `scoreboard` enabled the fine is announced and not counted**, which the log says once at startup.
@@ -412,7 +459,7 @@ verbal-morality:
     words: [fiddlestick, poppycock]
     announcement: "{user}, you are fined {credits} for {violations} of the verbal morality statute."
     repeat_announcement: "{user}, you are also fined {credits} for {violations} of the verbal morality statute."
-    chime: chime.wav
+    chime: chime
 ```
 
 | Setting | Required | Purpose |
@@ -420,7 +467,7 @@ verbal-morality:
 | `words` | yes | Stems of what the server objects to. A lone one may be written unquoted rather than as a list |
 | `announcement` | no | What gets said. `{user}`, `{credits}`, and `{violations}` are the placeholders |
 | `repeat_announcement` | no | Said instead when the same speaker is fined again inside `settings.fines.repeat_seconds`. Same placeholders |
-| `chime` | no | A WAV in `SPEECH_DIR/chimes`, played ahead of the announcement |
+| `chime` | no | A WAV in `SPEECH_DIR/chimes`, played ahead of the announcement, named without its `.wav` |
 
 Both templates default to the lines above, which the tool carries, so a server that wants the defaults can leave them out. A template with a placeholder nothing fills is rejected at startup rather than at the moment someone swears, and the error names which of the two it was.
 
@@ -442,17 +489,17 @@ What does not scale is the number of announcements. Three violations in one utte
 
 **A repeat offender is announced more quietly.** Being fined is the joke, and the joke told fifteen times in five minutes is a denial of service on the conversation. Every violation inside a sliding `settings.fines.backoff_seconds` takes `settings.fines.backoff_percent` off the next announcement, down to `settings.fines.volume_floor` — at the defaults, 5% a violation over five minutes, floored at a quarter of `PLAYBACK_VOLUME`, so fifteen of them reach the bottom. `0` for the percent takes nothing off and turns the backoff off; `0` for the floor silences a repeat offender outright. The first swear in a window is announced at full volume: the backoff is for saying it again. Each forbidden word counts, on the same terms as the fine, so four in a sentence is four steps down however few announcements it took to say so. The window is per speaker and per server, held in memory only — a `settings.fines.backoff_seconds` after their last violation somebody is back to full volume, and a restart forgives whatever backoff they had earned. What it does **not** affect is the tally: what somebody owes is not a function of how loudly they were told about it.
 
-**The announcements are rendered at startup.** The roster is known before anybody speaks and so is the shape of the sentence, so on the way up the tool synthesizes every name in `users` against one, two, and three violations, in both the first-fine and the repeat wording, and leaves the results in the speech cache. Synthesis is the slow part of answering; paying for it before anyone is waiting is what lets the fine land while the offence is still what the channel is talking about. It happens in the background, one phrase at a time — the bot is in the channel and listening while it runs, and a synthesizer asked for a hundred phrases at once is one that is not answering whoever is speaking right now.
+**The announcements are rendered at startup.** The roster is known before anybody speaks and so is the shape of the sentence, so on the way up the tool hands `tts` every name in `users` against one, two, and three violations, in both the first-fine and the repeat wording. Synthesis is the slow part of answering; paying for it before anyone is waiting is what lets the fine land while the offence is still what the channel is talking about. It happens in the background, one phrase at a time — the bot is in the channel and listening while it runs, and a synthesizer asked for a hundred phrases at once is one that is not answering whoever is speaking right now.
 
 Three violations because that is what a sentence usually holds; a fourth is remarkable enough to wait for the synthesizer. Anything already cached, from an earlier run or a real fine, is left alone rather than rendered again — including the second wording where a server has set both templates to the same string. What cannot be warmed is anyone **not** on the roster: they are announced under whatever Discord reports, which is not knowable at startup and not a closed set, so they pay for their first fine and nobody pays for it again. Warming also does not count as playing, so a pre-rendered announcement nobody ever earns ages out of the cache on the usual terms and is warmed again at the next startup.
 
-`chime` is resolved **inside** `SPEECH_DIR/chimes` — a bare name, or a path below it; anything that climbs out is refused at startup. It must be a **16-bit WAV**, at any sample rate and in mono or stereo, both of which are converted on the way in. WAV rather than MP3 because playing audio without ffmpeg is the point of this path, and nothing in the image can decode anything else. The clip is read once, kept for the life of the process, and never evicted to make room for a phrase. A chime that is missing or will not parse is reported and costs the chime, not the announcement.
+`chime` is resolved **inside** `SPEECH_DIR/chimes` — a bare name, or a path below it; anything that climbs out is refused at startup. The **extension is left off**: `chime` is `chime.wav`, because WAV is the only format there is here and writing it out said nothing. It must be a **16-bit WAV**, at any sample rate and in mono or stereo, both of which are converted on the way in. WAV rather than MP3 because playing audio without ffmpeg is the point of this path, and nothing in the image can decode anything else. The clip is read once, kept for the life of the process, and never evicted to make room for a phrase. A chime that is missing or will not parse is reported and costs the chime, not the announcement.
 
 A server electing in with no `words` is enabled and listening for nothing, which is reported at startup rather than left to be discovered by swearing at it.
 
 ## Speech
 
-Tools answer out loud through a `Speaker`, which the bot implements against the voice channel an utterance came from. Nothing in `tools/` imports discord: a speaker is somewhere to play audio, and it happens to be a voice channel.
+Tools answer out loud through the [`tts`](#tts) tool, which is where the cache, the chime library, the volume and the voice connection all live. Below it is a `Speaker`, which the bot implements against the voice channel an utterance came from. Nothing in `tools/` imports discord: a speaker is somewhere to play audio, and it happens to be a voice channel.
 
 Synthesis is a second Wyoming server (`TTS_HOST`, `TTS_PORT`) — recognition and synthesis are both Wyoming, but they are two servers and only one of them wants a GPU. The voice is process-wide: a bot that answers in two voices is a bot nobody can tell is one bot.
 
@@ -483,6 +530,8 @@ A hit is a file read — 0.85 ms end to end for a three-second clip, against a 2
 **`SPEECH_DIR/cache` is therefore load-bearing, not an optimisation.** Mount a writable volume at `SPEECH_DIR`. Without one, every phrase is synthesized again every time it is said and `prewarm` does nothing at all — which is a round trip to the TTS server per announcement instead of a file read, and is reported as an error at startup rather than a warning. Writes go through a temporary file and a rename, because a process killed mid-write would otherwise cache a truncated clip forever, and a clip is only stored once the synthesizer says it is whole — a failure partway through plays what arrived and stores nothing. A file that is truncated anyway, by a torn volume rather than by this process, is refused on the way in rather than played as a clip that stops early: the container's end-of-stream marker is what says the last page is the last page.
 
 > **Upgrading from `TTS_CACHE_DIR`.** One directory used to hold both rendered speech and the clips an operator put there by hand; it is now `SPEECH_DIR` with a subdirectory for each. Point the volume at `/speech` and the cache rebuilds itself on the usual terms — nothing is lost but the first synthesis of each phrase, and `prewarm` pays most of that before anyone is waiting. **A chime has to be moved by hand** into `SPEECH_DIR/chimes`, because nothing reads the old path any more; one left behind is reported at startup as missing rather than guessed at. The old directory is not read, not migrated, and not deleted — it is yours to remove once you are satisfied.
+
+> **Upgrading to the `tts` tool.** Playing audio used to be something every tool could do; it is now one tool, and **a server that does not enable `tts` says nothing.** Add `tts: {enabled: true}` beside whatever already speaks. Fines are still counted and rounds are still paid without it, and the log says so once at startup, so a server that goes quiet after an upgrade has a line explaining why. **A `chime:` setting also loses its extension** — `chime.wav` becomes `chime` — and one left as it was is called out by name rather than reported as a file that is not there.
 >
 > Clips written by a version older still are `.wav` and cannot be read at all. Anything left in the new cache directory ages out on the retention clock whatever it is named, so nothing has to be cleaned up by hand.
 
@@ -494,7 +543,7 @@ A hit is a file read — 0.85 ms end to end for a three-second clip, against a 2
 
 ### Chimes
 
-`SPEECH_DIR/chimes` holds **clips nobody synthesized** — a flourish a tool plays ahead of what it has to say. Drop a 16-bit WAV in and name it from the tool's config; it is read once, converted to playback PCM, and held for the life of the process.
+`SPEECH_DIR/chimes` holds **clips nobody synthesized** — a flourish a tool plays ahead of what it has to say. Drop a 16-bit WAV in and name it from the tool's config, without the extension; it is read once, converted to playback PCM, and held for the life of the process.
 
 It is a separate directory from the cache and that is the whole point: nothing writes here and nothing reaps here, so a clip somebody put there deliberately is never on a retention clock meant for a phrase said once. Names are resolved against the directory rather than taken at their word — a bare name or a path below it, and anything that climbs out is refused — so a setting cannot be pointed at an arbitrary file on the host. The directory does not have to exist; an absent one is a missing chime, reported by whichever tool asked for it, rather than a failure to start.
 
@@ -706,6 +755,7 @@ miss-quote/
 │       │   ├── runner.py      # Per-server instances, dispatch, failure isolation
 │       │   ├── quotes.py      # Answers a trigger phrase with the line it belongs to
 │       │   ├── scoreboard.py  # The tally, to disk and to the channel topic
+│       │   ├── tts.py         # Says things out loud; the only thing that plays anything
 │       │   └── verbal_morality.py  # Fines a speaker, out loud, for the wrong thing
 │       ├── transcript/
 │       │   └── writer.py      # Per-session JSONL appender + retention

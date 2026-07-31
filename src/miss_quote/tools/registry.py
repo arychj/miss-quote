@@ -16,11 +16,13 @@ from collections.abc import Mapping
 from miss_quote.tools.base import Tool
 from miss_quote.tools.quotes import Quotes
 from miss_quote.tools.scoreboard import Scoreboard
+from miss_quote.tools.tts import Tts
 from miss_quote.tools.verbal_morality import VerbalMorality
 
 TOOLS: Mapping[str, type[Tool]] = {
     Quotes.name: Quotes,
     Scoreboard.name: Scoreboard,
+    Tts.name: Tts,
     VerbalMorality.name: VerbalMorality,
 }
 

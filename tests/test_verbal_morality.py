@@ -7,7 +7,9 @@ from pathlib import Path
 
 import pytest
 
+import miss_quote.tools.tts as tts_tool
 import miss_quote.tools.verbal_morality as verbal_morality
+from miss_quote.audio.chimes import CHIME_SUFFIX
 from miss_quote.config import (
     SILENT_VOLUME,
     UNITY_VOLUME,
@@ -21,13 +23,13 @@ from miss_quote.ledger.credits import CreditLedger
 from miss_quote.tools.base import ToolContext, Toolbox
 from miss_quote.tools.runner import ToolRunner
 from miss_quote.tools.scoreboard import Scoreboard
+from miss_quote.tools.tts import Tts
 from miss_quote.tools.verbal_morality import (
     DEFAULT_ANNOUNCEMENT,
     DEFAULT_REPEAT_ANNOUNCEMENT,
     REPEATED_FINE,
     RecentViolations,
     VerbalMorality,
-    _lead,
 )
 from miss_quote.transcript.writer import Source, Utterance
 
@@ -57,7 +59,9 @@ REPEAT_WINDOW = morality_cfg.repeat_seconds
 # each in both the first-fine and the repeat wording.
 WARMED_PER_SPEAKER = 6
 
-CHIME_NAME = "chime.wav"
+# The name as a config file writes it, and the file it resolves to.
+CHIME_NAME = "chime"
+CHIME_FILE = f"{CHIME_NAME}{CHIME_SUFFIX}"
 CHIME_AUDIO = "♪"
 
 # A phrase in pieces, for tests about what is waited for before playback starts.
@@ -79,16 +83,31 @@ ENDINGS = ("s", "ed", "ing", "er", "ers")
 
 
 class RecordingSpeaker:
-    """A speaker that keeps what it was asked to say instead of playing it."""
+    """
+    A speaker that keeps what it was asked to say instead of playing it.
+
+    It takes a clip either way, because the real one does and the choice is the
+    point: a phrase with nothing in front of it and nothing to be done to it
+    arrives as something that can be had already encoded, and anything else
+    arrives as a stream. `encoded` records which it was, so a test can say that
+    the free path is still the free path.
+    """
 
     def __init__(self) -> None:
         self.played: list[tuple[Source, str]] = []
         self.scales: list[float] = []
+        self.encoded: list[bool] = []
 
     async def play(self, source, audio, scale: float = UNITY_VOLUME) -> None:
+        packets = hasattr(audio, "packets") and scale == UNITY_VOLUME
+
+        if hasattr(audio, "packets"):
+            audio = audio.packets() if packets else audio.pcm()
+
         spoken = "".join([chunk async for chunk in audio])
         self.played.append((source, spoken))
         self.scales.append(scale)
+        self.encoded.append(packets)
 
 
 class BlockingSpeaker(RecordingSpeaker):
@@ -176,7 +195,9 @@ class FakeChimes:
     Stands in for the chime library, which is a directory and nothing else.
 
     Clips are strings here too, so what a speaker collects is one readable
-    string rather than a mixture nothing can join.
+    string rather than a mixture nothing can join. The suffix is added the way
+    the real one adds it, so a name written here is a name a config file could
+    hold.
     """
 
     def __init__(self, directory: Path) -> None:
@@ -184,7 +205,7 @@ class FakeChimes:
         self.asked: list[str] = []
 
     def path(self, name: str) -> Path:
-        return self.directory / name
+        return self.directory / f"{name}{CHIME_SUFFIX}"
 
     async def clip(self, name: str) -> str:
         self.asked.append(name)
@@ -198,11 +219,16 @@ class FakeSession:
         self.source = source
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def speech(monkeypatch):
-    """Replace the process-wide cache so nothing reaches a synthesizer."""
+    """
+    Replace the process-wide cache so nothing reaches a synthesizer.
+
+    Autouse because the speaking tool builds one whether or not the test it is
+    standing beside cares what gets rendered.
+    """
     fake = FakeSpeech()
-    monkeypatch.setattr("miss_quote.tools.verbal_morality.shared_cache", lambda: fake)
+    monkeypatch.setattr(tts_tool, "shared_cache", lambda: fake)
     return fake
 
 
@@ -215,7 +241,7 @@ def chimes(monkeypatch, tmp_path):
     real library would resolve names against whatever the deployment mounted.
     """
     fake = FakeChimes(tmp_path)
-    monkeypatch.setattr("miss_quote.tools.verbal_morality.shared_chimes", lambda: fake)
+    monkeypatch.setattr(tts_tool, "shared_chimes", lambda: fake)
     return fake
 
 
@@ -237,7 +263,7 @@ def credits(monkeypatch, tmp_path) -> CreditLedger:
 @pytest.fixture
 def chime(chimes) -> str:
     """A clip sitting in the chime directory, as an operator would leave one."""
-    (chimes.directory / CHIME_NAME).write_text(CHIME_AUDIO, encoding="utf-8")
+    (chimes.directory / CHIME_FILE).write_text(CHIME_AUDIO, encoding="utf-8")
     return CHIME_NAME
 
 
@@ -252,30 +278,59 @@ def _tool(
     users=None,
     server: str = SERVER_ALIAS,
     counted: bool = True,
+    spoken: bool = True,
 ) -> VerbalMorality:
     """
-    The tool, with its server's board beside it in one box.
+    The tool, with its server's board and its server's voice beside it in one box.
 
-    Which is what the runner builds: the fine reaches the tally because both
-    tools are that server's, not because either knows about the other's
-    settings. `counted=False` is the server that enabled no board.
+    Which is what the runner builds: the fine reaches the tally and the channel
+    because all three tools are that server's, not because any of them knows
+    about the others' settings. `counted=False` is the server that enabled no
+    board, and `spoken=False` the one that enabled nothing to say it with.
     """
+    box = Toolbox()
     context = ToolContext(
         server=server,
         # `is None` rather than a falsy check: an empty config is a case under test.
         config={"words": WORDS} if config is None else config,
         speaker=speaker,
         users=users or {},
-        tools=Toolbox(),
+        tools=box,
     )
 
     if counted:
-        context.tools.add(Scoreboard(replace(context, config={})))
+        box.add(Scoreboard(replace(context, config={}, tools=box.view(Scoreboard))))
 
-    tool = VerbalMorality(context)
-    context.tools.add(tool)
+    if spoken:
+        box.add(Tts(replace(context, config={}, tools=box.view(Tts))))
+
+    tool = VerbalMorality(replace(context, tools=box.view(VerbalMorality)))
+    box.add(tool)
 
     return tool
+
+
+def _speaking(tool: VerbalMorality) -> Tts:
+    """The speaking tool beside one under test, for a test that drives it directly."""
+    return tool.tools.find(Tts)
+
+
+async def _render(tool: VerbalMorality) -> None:
+    """
+    Warm the tool up and let the renderer get to the end of the queue.
+
+    Two steps because they are two tools: warming lines phrases up and returns,
+    and rendering them is a service the runner starts separately.
+    """
+    await tool.prewarm()
+
+    speaking = _speaking(tool)
+    running = asyncio.create_task(speaking.run())
+
+    try:
+        await speaking.drained()
+    finally:
+        running.cancel()
 
 
 def _utterance(
@@ -959,7 +1014,7 @@ async def test_the_chime_and_the_words_are_one_clip(speech, speaker, chime):
 
 
 async def test_a_missing_chime_still_announces_the_fine(speech, speaker):
-    tool = _tool(speaker, {"words": WORDS, "chime": "not-there.wav"})
+    tool = _tool(speaker, {"words": WORDS, "chime": "not-there"})
 
     await _hear(tool, FORBIDDEN)
 
@@ -996,7 +1051,7 @@ async def test_the_words_are_waited_for_before_the_chime(speech, speaker, chime)
     speech.chunks = CHUNKS
     tool = _tool(speaker, {"words": WORDS, "chime": chime})
 
-    leading = await _first(tool._announce(DEFAULT_ANNOUNCEMENT))
+    leading = await _first(_speaking(tool)._announce(DEFAULT_ANNOUNCEMENT, chime))
 
     assert leading == CHIME_AUDIO
     assert speech.pulled == list(CHUNKS)
@@ -1004,13 +1059,11 @@ async def test_the_words_are_waited_for_before_the_chime(speech, speaker, chime)
 
 async def test_no_head_start_plays_on_the_first_chunk(speech, speaker, chime, monkeypatch):
     """A synthesizer that streams as it renders needs nothing held back."""
-    monkeypatch.setattr(
-        verbal_morality, "tts_cfg", replace(tts_cfg, lead_ms=NO_HEAD_START)
-    )
+    monkeypatch.setattr(tts_tool, "tts_cfg", replace(tts_cfg, lead_ms=NO_HEAD_START))
     speech.chunks = CHUNKS
     tool = _tool(speaker, {"words": WORDS, "chime": chime})
 
-    leading = await _first(tool._announce(DEFAULT_ANNOUNCEMENT))
+    leading = await _first(_speaking(tool)._announce(DEFAULT_ANNOUNCEMENT, chime))
 
     assert leading == CHIME_AUDIO
     assert speech.pulled == []
@@ -1024,26 +1077,6 @@ async def test_the_head_start_does_not_reorder_the_announcement(speech, speaker,
 
     _, spoken = speaker.played[0]
     assert spoken == CHIME_AUDIO + "".join(CHUNKS)
-
-
-async def test_a_head_start_stops_once_it_has_enough(speech):
-    speech.chunks = CHUNKS
-    words = speech.stream(DEFAULT_ANNOUNCEMENT).pcm()
-
-    held = await _lead(words, len(CHUNKS[0]) + 1)
-
-    assert held == [CHUNKS[0], CHUNKS[1]]
-    assert [chunk async for chunk in words] == [CHUNKS[2]]
-
-
-async def test_a_phrase_shorter_than_the_head_start_is_not_waited_on(speech):
-    """The stream ends; there is no more coming however much was asked for."""
-    speech.chunks = CHUNKS
-    words = speech.stream(DEFAULT_ANNOUNCEMENT).pcm()
-
-    held = await _lead(words, len("".join(CHUNKS)) + 1)
-
-    assert held == list(CHUNKS)
 
 
 # ── the pre-warm ──────────────────────────────────
@@ -1060,7 +1093,7 @@ def _wording(
 async def test_every_name_on_the_roster_is_warmed(speech, speaker):
     tool = _tool(speaker, users=ROSTER)
 
-    await tool.prewarm()
+    await _render(tool)
 
     assert len(speech.warmed) == len(ROSTER) * WARMED_PER_SPEAKER
     assert {wording.split(",")[0] for wording in speech.warmed} == {
@@ -1073,7 +1106,7 @@ async def test_a_speaker_is_warmed_for_one_two_and_three_violations(speech, spea
     """What a sentence usually holds; past that they can wait for the synthesizer."""
     tool = _tool(speaker, users={SPEAKER_ID: SPEAKER})
 
-    await tool.prewarm()
+    await _render(tool)
 
     assert speech.warmed == [
         _wording(SPEAKER, "1 credit", "a violation"),
@@ -1088,7 +1121,7 @@ async def test_a_speaker_is_warmed_for_one_two_and_three_violations(speech, spea
 async def test_the_repeat_wording_is_warmed_too(speech, speaker):
     """A speaker who swears twice in five seconds should not wait for the second."""
     tool = _tool(speaker, users={SPEAKER_ID: SPEAKER})
-    await tool.prewarm()
+    await _render(tool)
 
     await _hear(tool, FORBIDDEN)
     await _hear(tool, FORBIDDEN)
@@ -1099,7 +1132,7 @@ async def test_the_repeat_wording_is_warmed_too(speech, speaker):
 async def test_a_warmed_announcement_is_exactly_what_gets_said(speech, speaker):
     """A phrase differing by a space is one that gets synthesized twice."""
     tool = _tool(speaker, users={SPEAKER_ID: SPEAKER})
-    await tool.prewarm()
+    await _render(tool)
 
     await _hear(tool, f"{FORBIDDEN} and {ALSO_FORBIDDEN}")
 
@@ -1117,16 +1150,17 @@ async def test_a_custom_announcement_is_what_is_warmed(speech, speaker):
         users={SPEAKER_ID: SPEAKER},
     )
 
-    await tool.prewarm()
+    await _render(tool)
 
-    assert len(speech.warmed) == WARMED_PER_SPEAKER
-    assert set(speech.warmed) == {f"language, {SPEAKER}", f"language again, {SPEAKER}"}
+    # An announcement that names no count is the same sentence however many
+    # violations earned it, and the same sentence is rendered once.
+    assert speech.warmed == [f"language, {SPEAKER}", f"language again, {SPEAKER}"]
 
 
 async def test_a_speaker_who_is_not_on_the_roster_is_not_warmed(speech, speaker):
     """Their Discord name is not knowable from here, and not a closed set."""
     tool = _tool(speaker, users={SPEAKER_ID: SPEAKER})
-    await tool.prewarm()
+    await _render(tool)
 
     await _hear(tool, FORBIDDEN, user="Someone Else")
 
@@ -1134,7 +1168,7 @@ async def test_a_speaker_who_is_not_on_the_roster_is_not_warmed(speech, speaker)
 
 
 async def test_an_empty_roster_warms_nothing(speech, speaker):
-    await _tool(speaker).prewarm()
+    await _render(_tool(speaker))
 
     assert speech.warmed == []
 
@@ -1143,14 +1177,14 @@ async def test_one_name_under_two_ids_is_warmed_once(speech, speaker):
     """Two IDs and one name is one phrase, however it got written down."""
     tool = _tool(speaker, users={SPEAKER_ID: SPEAKER, OTHER_SPEAKER_ID: SPEAKER})
 
-    await tool.prewarm()
+    await _render(tool)
 
     assert len(speech.warmed) == WARMED_PER_SPEAKER
 
 
 async def test_warming_plays_nothing(speech, speaker):
     """It is preparation, not an announcement; nobody has earned one yet."""
-    await _tool(speaker, users=ROSTER).prewarm()
+    await _render(_tool(speaker, users=ROSTER))
 
     assert speaker.played == []
     assert speech.asked == []
@@ -1168,16 +1202,32 @@ async def test_the_runner_warms_a_configured_server(speech, speaker):
             alias=SERVER_ALIAS,
             users=ROSTER,
             tools={
-                VerbalMorality.name: ToolSettings(enabled=True, config={"words": WORDS})
+                VerbalMorality.name: ToolSettings(enabled=True, config={"words": WORDS}),
+                Tts.name: ToolSettings(enabled=True, config={}),
             },
         )
     }
-    runner = ToolRunner(servers, {VerbalMorality.name: VerbalMorality}, speaker)
+    registry = {VerbalMorality.name: VerbalMorality, Tts.name: Tts}
+    runner = ToolRunner(servers, registry, speaker)
 
     await runner.prewarm()
+    running = runner.start()
+    try:
+        await _drained(runner)
+    finally:
+        for task in running:
+            task.cancel()
 
     assert runner.problems == []
     assert len(speech.warmed) == len(ROSTER) * WARMED_PER_SPEAKER
+
+
+async def _drained(runner: ToolRunner) -> None:
+    """Wait out every renderer the runner started."""
+    for tool in runner._serving:
+        if isinstance(tool, Tts):
+            await tool.drained()
+
 
 async def test_the_runner_wires_a_fine_to_the_board(speech, speaker, credits):
     """
@@ -1193,10 +1243,15 @@ async def test_the_runner_wires_a_fine_to_the_board(speech, speaker, credits):
             tools={
                 VerbalMorality.name: ToolSettings(enabled=True, config={"words": WORDS}),
                 Scoreboard.name: ToolSettings(enabled=True, config={}),
+                Tts.name: ToolSettings(enabled=True, config={}),
             },
         )
     }
-    registry = {VerbalMorality.name: VerbalMorality, Scoreboard.name: Scoreboard}
+    registry = {
+        VerbalMorality.name: VerbalMorality,
+        Scoreboard.name: Scoreboard,
+        Tts.name: Tts,
+    }
     runner = ToolRunner(servers, registry, speaker)
 
     await runner.dispatch_utterance(FakeSession(SOURCE), _utterance(FORBIDDEN))

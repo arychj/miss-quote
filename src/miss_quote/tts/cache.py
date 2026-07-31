@@ -79,6 +79,10 @@ BYTES_PER_KIB = 1024
 # cache and 0 is a no-op rather than "delete everything".
 MINIMUM_RETENTION_DAYS = 1
 
+# Holds warming to one phrase at a time across every server in the process. See
+# `SpeechCache.warm`; nothing on the path to playback ever takes it.
+_rendering = asyncio.Lock()
+
 
 class Phrase:
     """
@@ -215,6 +219,12 @@ class SpeechCache:
         same as wanted — a warm-up renders whatever it can think of, in an order
         that means nothing — and a phrase nobody ever earns should age out on the
         usual terms.
+
+        One at a time across the whole process. There is a warm-up per server and
+        one synthesizer behind all of them, and a server asked for a hundred
+        phrases at once is one not answering whoever is speaking right now. The
+        lock is only here: a phrase being played is a channel waiting, and it has
+        no business queueing behind a backlog nobody is listening to.
         """
         # Nowhere to keep it makes this a synthesis nobody will ever be served.
         if self._directory is None:
@@ -224,8 +234,14 @@ class SpeechCache:
         if self._stored(key):
             return False
 
-        async for _ in self._synthesize(key, text):
-            pass
+        async with _rendering:
+            # Checked again inside the lock: a phrase two servers both want is
+            # one somebody else may have rendered while this one was waiting.
+            if self._stored(key):
+                return False
+
+            async for _ in self._synthesize(key, text):
+                pass
 
         return True
 

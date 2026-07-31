@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import miss_quote.tools.tts as tts_tool
 from miss_quote.config import (
     BUNDLED_QUOTES,
     UNITY_VOLUME,
@@ -41,6 +42,7 @@ from miss_quote.tools.quotes import (
 )
 from miss_quote.tools.runner import ToolRunner
 from miss_quote.tools.scoreboard import Scoreboard
+from miss_quote.tools.tts import Tts
 from miss_quote.transcript.writer import Source, Utterance
 
 SERVER_ALIAS = "first-server"
@@ -130,16 +132,45 @@ NOW = 1_000.0
 
 
 class RecordingSpeaker:
-    """A speaker that keeps what it was asked to say instead of playing it."""
+    """
+    A speaker that keeps what it was asked to say instead of playing it.
+
+    It takes a clip either way, because the real one does. Nothing this tool
+    says has a chime in front of it or is played quieter, so everything here
+    should arrive as something that can be sent exactly as it was stored.
+    """
 
     def __init__(self) -> None:
         self.played: list[tuple[Source, str]] = []
         self.scales: list[float] = []
+        self.encoded: list[bool] = []
 
     async def play(self, source, audio, scale: float = UNITY_VOLUME) -> None:
+        packets = hasattr(audio, "packets") and scale == UNITY_VOLUME
+
+        if hasattr(audio, "packets"):
+            audio = audio.packets() if packets else audio.pcm()
+
         spoken = "".join([chunk async for chunk in audio])
         self.played.append((source, spoken))
         self.scales.append(scale)
+        self.encoded.append(packets)
+
+
+class FakePhrase:
+    """One phrase from `FakeSpeech`, in whichever form is asked for."""
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+
+    async def _chunks(self):
+        yield self._text
+
+    def pcm(self):
+        return self._chunks()
+
+    def packets(self):
+        return self._chunks()
 
 
 class FakeSpeech:
@@ -150,9 +181,10 @@ class FakeSpeech:
         self.warmed: list[str] = []
         self.held: set[str] = set()
 
-    async def stream(self, text: str):
+    def stream(self, text: str) -> FakePhrase:
         self.asked.append(text)
-        yield text
+
+        return FakePhrase(text)
 
     async def warm(self, text: str) -> bool:
         self.warmed.append(text)
@@ -183,11 +215,16 @@ class FakeSession:
         self.source = source
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def speech(monkeypatch) -> FakeSpeech:
-    """Replace the process-wide cache so nothing reaches a synthesizer."""
+    """
+    Replace the process-wide cache so nothing reaches a synthesizer.
+
+    Autouse because the speaking tool builds one whether or not the test it is
+    standing beside cares what gets rendered.
+    """
     fake = FakeSpeech()
-    monkeypatch.setattr("miss_quote.tools.quotes.shared_cache", lambda: fake)
+    monkeypatch.setattr(tts_tool, "shared_cache", lambda: fake)
     return fake
 
 
@@ -261,16 +298,57 @@ def board(monkeypatch, tmp_path) -> Scoreboard:
     return Scoreboard(ToolContext(server=SERVER_ALIAS, users=ROSTER))
 
 
-def _tool(speaker, users=None, config=None, board=None) -> Quotes:
-    return Quotes(
-        ToolContext(
-            server=SERVER_ALIAS,
-            config=config or {},
-            speaker=speaker,
-            users=users or {},
-            tools=Toolbox([board] if board is not None else []),
-        )
+def _tool(
+    speaker,
+    users=None,
+    config=None,
+    board=None,
+    spoken: bool = True,
+    server: str = SERVER_ALIAS,
+) -> Quotes:
+    """
+    The tool, with its server's voice — and its board, where it keeps one —
+    beside it in one box.
+
+    Which is what the runner builds. `spoken=False` is the server that enabled
+    nothing to say anything with.
+    """
+    box = Toolbox([board] if board is not None else [])
+    context = ToolContext(
+        server=server,
+        config=config or {},
+        speaker=speaker,
+        users=users or {},
+        tools=box,
     )
+
+    if spoken:
+        box.add(Tts(replace(context, config={}, tools=box.view(Tts))))
+
+    return Quotes(replace(context, tools=box.view(Quotes)))
+
+
+def _speaking(tool: Quotes) -> Tts:
+    """The speaking tool beside one under test, for a test that drives it directly."""
+    return tool.tools.find(Tts)
+
+
+async def _render(tool: Quotes) -> None:
+    """
+    Warm the tool up and let the renderer get to the end of the queue.
+
+    Two steps because they are two tools: warming lines phrases up and returns,
+    and rendering them is a service the runner starts separately.
+    """
+    await tool.prewarm()
+
+    speaking = _speaking(tool)
+    running = asyncio.create_task(speaking.run())
+
+    try:
+        await speaking.drained()
+    finally:
+        running.cancel()
 
 
 def _utterance(text: str, user: str = SPEAKER, user_id: int = SPEAKER_ID) -> Utterance:
@@ -635,7 +713,7 @@ async def test_every_answer_a_trigger_can_give_is_warmed(
         f"{MOVIE},{TRIGGER},{OTHER_QUOTE}",
     )
 
-    await _tool(speaker).prewarm()
+    await _render(_tool(speaker))
 
     assert speech.warmed == [QUOTE, OTHER_QUOTE]
 
@@ -715,7 +793,7 @@ async def test_the_backoff_is_the_trigger_rather_than_the_speaker(
 async def test_two_servers_cool_down_separately(quotes_file, speech, speaker):
     """Two channels arriving at the same line have each made the joke once."""
     here = _tool(speaker)
-    elsewhere = Quotes(ToolContext(server="second-server", speaker=speaker))
+    elsewhere = _tool(speaker, server="second-server")
 
     await _hear(here, TRIGGER)
     await _hear(elsewhere, TRIGGER)
@@ -779,7 +857,7 @@ def test_the_window_comes_from_the_deployment(monkeypatch):
 
 
 async def test_every_quote_is_warmed(quotes_file, speech, speaker):
-    await _tool(speaker).prewarm()
+    await _render(_tool(speaker))
 
     assert speech.warmed == [QUOTE, OTHER_QUOTE]
 
@@ -787,7 +865,7 @@ async def test_every_quote_is_warmed(quotes_file, speech, speaker):
 async def test_a_quote_naming_nobody_is_warmed_once_however_many_speakers(
     quotes_file, speech, speaker
 ):
-    await _tool(speaker, users=ROSTER).prewarm()
+    await _render(_tool(speaker, users=ROSTER))
 
     assert speech.warmed == [QUOTE, OTHER_QUOTE, *_warmed_awards(SPEAKER, OTHER_SPEAKER)]
 
@@ -797,7 +875,7 @@ async def test_a_quote_naming_the_speaker_is_warmed_per_name(
 ):
     _written(monkeypatch, tmp_path, HEADER, f"{MOVIE},{PERSONAL_TRIGGER},{PERSONAL_QUOTE}")
 
-    await _tool(speaker, users=ROSTER).prewarm()
+    await _render(_tool(speaker, users=ROSTER))
 
     assert speech.warmed == [
         PERSONAL_QUOTE.format(user=SPEAKER),
@@ -810,7 +888,7 @@ async def test_both_wordings_of_the_award_are_warmed_per_name(
     quotes_file, speech, speaker
 ):
     """A tie is announced as one, and nobody should wait for the synthesizer for it."""
-    await _tool(speaker, users=ROSTER).prewarm()
+    await _render(_tool(speaker, users=ROSTER))
 
     assert _announced(SPEAKER, tied=True) in speech.warmed
 
@@ -820,7 +898,7 @@ async def test_no_award_is_warmed_where_nothing_is_being_asked(
 ):
     tool = _tool(speaker, users=ROSTER, config={ANSWER_SECONDS_KEY: NO_WINDOW})
 
-    await tool.prewarm()
+    await _render(tool)
 
     assert speech.warmed == [QUOTE, OTHER_QUOTE]
 
@@ -831,7 +909,7 @@ async def test_a_quote_naming_the_speaker_warms_nothing_without_a_roster(
     """Their Discord name is not knowable from here, and not a closed set."""
     _written(monkeypatch, tmp_path, HEADER, f"{MOVIE},{PERSONAL_TRIGGER},{PERSONAL_QUOTE}")
 
-    await _tool(speaker).prewarm()
+    await _render(_tool(speaker))
 
     assert speech.warmed == []
 
@@ -839,7 +917,7 @@ async def test_a_quote_naming_the_speaker_warms_nothing_without_a_roster(
 async def test_a_warmed_quote_is_exactly_what_gets_said(quotes_file, speech, speaker):
     """A phrase differing by a space is one that gets synthesized twice."""
     tool = _tool(speaker, users=ROSTER)
-    await tool.prewarm()
+    await _render(tool)
 
     await _hear(tool, TRIGGER)
 
@@ -848,7 +926,7 @@ async def test_a_warmed_quote_is_exactly_what_gets_said(quotes_file, speech, spe
 
 async def test_warming_plays_nothing(quotes_file, speech, speaker):
     """It is preparation; nobody has said anything yet."""
-    await _tool(speaker, users=ROSTER).prewarm()
+    await _render(_tool(speaker, users=ROSTER))
 
     assert speaker.played == []
     assert speech.asked == []
@@ -860,12 +938,23 @@ async def test_the_runner_warms_a_configured_server(quotes_file, speech, speaker
         SOURCE.guild_id: ServerConfig(
             alias=SERVER_ALIAS,
             users=ROSTER,
-            tools={Quotes.name: ToolSettings(enabled=True, config={})},
+            tools={
+                Quotes.name: ToolSettings(enabled=True, config={}),
+                Tts.name: ToolSettings(enabled=True, config={}),
+            },
         )
     }
-    runner = ToolRunner(servers, {Quotes.name: Quotes}, speaker)
+    runner = ToolRunner(servers, {Quotes.name: Quotes, Tts.name: Tts}, speaker)
 
     await runner.prewarm()
+    running = runner.start()
+    try:
+        for tool in runner._serving:
+            if isinstance(tool, Tts):
+                await tool.drained()
+    finally:
+        for task in running:
+            task.cancel()
 
     assert runner.problems == []
     assert speech.warmed == [QUOTE, OTHER_QUOTE, *_warmed_awards(SPEAKER, OTHER_SPEAKER)]
@@ -1284,7 +1373,7 @@ async def test_every_ending_is_warmed(quotes_file, speech, speaker):
     """Which one comes up is decided when somebody wins, not at startup."""
     tool = _tool(speaker, users=ROSTER, config={REMARKS_KEY: [ADDED_REMARK]})
 
-    await tool.prewarm()
+    await _render(tool)
 
     assert speech.warmed == [
         QUOTE,
@@ -1299,7 +1388,7 @@ async def test_a_tie_wording_with_no_ending_is_warmed_once(
     quotes_file, speech, speaker
 ):
     """A template carrying no remark is one phrase however many are written."""
-    await _tool(speaker, users=ROSTER).prewarm()
+    await _render(_tool(speaker, users=ROSTER))
 
     assert speech.warmed.count(_announced(SPEAKER, tied=True)) == 1
 
@@ -1483,7 +1572,7 @@ async def test_a_server_that_allows_it_warms_no_rebuke(quotes_file, speech, spea
         speaker, users=ROSTER, config={PENALIZE_SELF_ANSWERS_KEY: False}
     )
 
-    await tool.prewarm()
+    await _render(tool)
 
     assert speech.warmed == [
         QUOTE,
@@ -1493,7 +1582,7 @@ async def test_a_server_that_allows_it_warms_no_rebuke(quotes_file, speech, spea
 
 
 async def test_the_rebuke_is_warmed_per_name(quotes_file, speech, speaker):
-    await _tool(speaker, users=ROSTER).prewarm()
+    await _render(_tool(speaker, users=ROSTER))
 
     assert _rebuked(SPEAKER) in speech.warmed
 

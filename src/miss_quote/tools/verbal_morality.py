@@ -10,6 +10,12 @@ down, and puts the worst of it in the voice channel topic. A server that has not
 enabled one gets the announcement and no tally, which is said once at startup
 rather than left to be noticed.
 
+Saying it out loud is somebody else's as well. This tool decides what the fine
+is and how loudly to announce it; the server's `tts` tool owns the words, the
+chime in front of them, and the voice connection they go out over. A server with
+no `tts` counts fines and says nothing, on the same terms and reported the same
+way.
+
 A repeat offender is announced more and more quietly. Being fined is the joke,
 and a joke told fifteen times in five minutes is a denial of service on the
 conversation, so the announcement backs off toward `settings.fines.volume_floor`
@@ -41,21 +47,19 @@ from __future__ import annotations
 
 import re
 import time
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import Sequence
 from typing import Any
 
-from miss_quote.audio.chimes import shared_chimes
 from miss_quote.config import (
     PERCENT,
     UNITY_VOLUME,
     morality_cfg,
     scoreboard_cfg,
-    tts_cfg,
 )
 from miss_quote.tools.base import Tool, ToolContext
 from miss_quote.tools.scoreboard import Scoreboard
+from miss_quote.tools.tts import Tts
 from miss_quote.transcript.writer import TranscriptSession, Utterance
-from miss_quote.tts.cache import shared_cache
 from miss_quote.utils.logging import get_logger
 from miss_quote.utils.stems import expand, plural
 
@@ -93,8 +97,6 @@ CREDITS_FIELD = "credits"
 VIOLATIONS_FIELD = "violations"
 
 FIELD_SEPARATOR = ", "
-
-NO_AUDIO = b""
 
 # Matching on whole words only. A substring match fines the innocent, and the
 # canonical example — Scunthorpe — is a place people live.
@@ -223,6 +225,7 @@ class VerbalMorality(Tool):
     """Fines a speaker, out loud, for saying something the server forbids."""
 
     name = "verbal-morality"
+    requires = (Scoreboard, Tts)
 
     def __init__(self, context: ToolContext) -> None:
         super().__init__(context)
@@ -237,9 +240,7 @@ class VerbalMorality(Tool):
             REPEAT_ANNOUNCEMENT_KEY,
             config.get(REPEAT_ANNOUNCEMENT_KEY) or DEFAULT_REPEAT_ANNOUNCEMENT,
         )
-        self._speech = shared_cache()
-        self._chimes = shared_chimes()
-        self._chime = self._located(config.get(CHIME_KEY))
+        self._chime = _named(config.get(CHIME_KEY))
         self._recent = RecentViolations()
         self._announcing = False
 
@@ -249,33 +250,6 @@ class VerbalMorality(Tool):
             len(self._vocabulary),
             OFFENCE_SEPARATOR.join(self._vocabulary),
         )
-
-    def _located(self, chime: Any) -> str | None:
-        """
-        The clip to play ahead of an announcement, if one is configured.
-
-        Looked for at startup so a name that is not there is a line in the log
-        on the way up rather than a discovery made the first time someone
-        swears, but reported rather than raised on, and kept either way: a
-        missing chime should cost the chime, and the file may yet arrive in a
-        directory that is usually a mounted volume.
-        """
-        if chime is None:
-            return None
-
-        name = str(chime).strip()
-        if not name:
-            return None
-
-        path = self._chimes.path(name)
-        if path is None or not path.is_file():
-            logger.warning(
-                "[%s] No chime at '%s'; fines will be announced without one.",
-                self.server,
-                path or name,
-            )
-
-        return name
 
     async def prewarm(self) -> None:
         """
@@ -292,18 +266,35 @@ class VerbalMorality(Tool):
         and not a closed set; they pay for their first fine, and nobody pays for
         it again.
 
-        Serial, and unhurried. Nothing is waiting on this, and a synthesizer
-        asked for a hundred phrases at once is a synthesizer not answering
-        whoever is speaking right now.
+        Handed over as a list rather than rendered here. What it costs to say
+        something is the speaking tool's business, and it is the one that knows
+        what has already been said; this is the moment at which that tool is
+        known to exist, which is also why the chime is looked for here.
         """
+        speech = self._tts()
+
         if self._scoreboard() is None:
             # The first moment at which every tool on the server exists, so the
             # first at which the absence of one means anything.
+            # Says nothing about whether they will be announced, because the
+            # server may be missing that tool too and two lines contradicting
+            # each other is worse than either on its own.
             logger.warning(
-                "[%s] No scoreboard is enabled, so fines will be announced and not "
-                "counted. Enable the 'scoreboard' tool to keep a tally.",
+                "[%s] No scoreboard is enabled, so fines will not be counted. "
+                "Enable the 'scoreboard' tool to keep a tally.",
                 self.server,
             )
+
+        if speech is None:
+            logger.warning(
+                "[%s] No '%s' tool is enabled, so fines will be counted and not "
+                "announced. Enable it to say them out loud.",
+                self.server,
+                Tts.name,
+            )
+            return
+
+        self._chime = speech.locate(self._chime)
 
         names = sorted(set(self.users.values()))
         if not names:
@@ -318,19 +309,13 @@ class VerbalMorality(Tool):
             for count in range(SINGLE_OFFENCE, FORESEEN_OFFENCES + 1)
             for repeat in (FIRST_FINE, REPEATED_FINE)
         ]
-        rendered = 0
-
-        for wording in wordings:
-            if await self._speech.warm(wording):
-                rendered += 1
 
         logger.info(
-            "[%s] Pre-warmed announcements for %d speaker(s): "
-            "%d rendered, %d already cached.",
+            "[%s] Queued %d announcement(s) for %d speaker(s) to be rendered in "
+            "advance.",
             self.server,
+            speech.enqueue(wordings),
             len(names),
-            rendered,
-            len(wordings) - rendered,
         )
 
     async def handle_utterance(
@@ -381,6 +366,18 @@ class VerbalMorality(Tool):
             )
             return
 
+        speech = self._tts()
+        if speech is None:
+            logger.info(
+                "🚨 [%s] %s said %s; fined %s with nothing to announce it (%s).",
+                self.server,
+                utterance.user,
+                said,
+                fine,
+                standing,
+            )
+            return
+
         logger.info(
             "🚨 [%s] %s said %s; announcing a fine of %s at %d%% volume (%s).",
             self.server,
@@ -393,13 +390,24 @@ class VerbalMorality(Tool):
 
         self._announcing = True
         try:
-            await self.speaker.play(
+            await speech.play(
                 session.source,
-                self._announce(self._wording(utterance.user, len(offences), repeat)),
-                scale,
+                self._wording(utterance.user, len(offences), repeat),
+                scale=scale,
+                chime=self._chime,
             )
         finally:
             self._announcing = False
+
+    def _tts(self) -> Tts | None:
+        """
+        The tool that says things out loud, if the server has one.
+
+        Looked for on the way past rather than held, on the same terms as the
+        scoreboard: a tool's neighbours are only all built once every one of
+        them is; see `Toolbox`.
+        """
+        return self.tools.find(Tts)
 
     def _scoreboard(self) -> Scoreboard | None:
         """
@@ -447,61 +455,19 @@ class VerbalMorality(Tool):
             }
         )
 
-    async def _announce(self, announcement: str) -> AsyncIterator[bytes]:
-        """
-        The chime and then the words, as one clip rather than two.
-
-        Samples rather than the packets the cache holds, and unavoidably: the
-        chime is a hand-placed WAV, a fine is usually being played quieter than
-        full volume, and both of those want audio that can be added to and
-        multiplied. The decode that costs is a few milliseconds on a clip that
-        is about to be spoken over a channel.
-
-        Two calls to the speaker would play in order — it holds one lock per
-        server — but each arms the player afresh, and the gap between them is
-        audible. Chaining them puts the chime in front of the same stream.
-
-        The words are given a head start before the chime is handed over. A
-        synthesizer is free to render a phrase whole before sending any of it,
-        and the chime is short; starting it the moment it is read would leave
-        the player waiting between the flourish and the sentence it introduces.
-        Waiting first spends that time before anything is playing.
-        """
-        chime = await self._chimes.clip(self._chime) if self._chime else NO_AUDIO
-        words = self._speech.stream(announcement).pcm()
-        lead = await _lead(words, tts_cfg.lead_bytes)
-
-        if chime:
-            yield chime
-
-        for chunk in lead:
-            yield chunk
-
-        async for chunk in words:
-            yield chunk
-
-
-async def _lead(speech: AsyncIterator[bytes], wanted: int) -> list[bytes]:
+def _named(chime: Any) -> str | None:
     """
-    Pull from a stream until it has given up `wanted` bytes or run out.
+    The clip a server asked to open its fines with, if it asked for one.
 
-    The chunks are handed back rather than joined, so nothing is copied and a
-    short phrase that ends inside the head start is not padded out to it. The
-    stream is left where it stopped for the caller to finish draining.
+    A setting left blank is a setting nobody filled in, not a clip called
+    nothing. Settled here rather than where it is played, so a server that put
+    an empty string in its config file is a server with no chime from the
+    moment the tool is built.
     """
-    if wanted <= 0:
-        return []
+    if chime is None:
+        return None
 
-    lead: list[bytes] = []
-    held = 0
-
-    async for chunk in speech:
-        lead.append(chunk)
-        held += len(chunk)
-        if held >= wanted:
-            break
-
-    return lead
+    return str(chime).strip() or None
 
 
 def _vocabulary(words: Any) -> tuple[str, ...]:

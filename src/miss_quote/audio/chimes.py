@@ -13,6 +13,10 @@ anyway, so there is nothing to be gained from storing them the way Discord takes
 them — and nothing in the image can decode anything else, which is the point of
 a playback path with no ffmpeg in it.
 
+Because there is only one format, a name does not carry an extension: `chime`
+is `chime.wav`, and the suffix is added here rather than written out in every
+config file that names one.
+
 Names arrive from configuration and are resolved against the directory rather
 than taken at their word, so a setting cannot be pointed at an arbitrary file on
 the host and have the bot read it out.
@@ -37,6 +41,9 @@ WAVE_READ = "rb"
 BITS_PER_BYTE = 8
 NOTHING = b""
 
+# The only format there is, so a name never says it.
+CHIME_SUFFIX = ".wav"
+
 
 class ChimeLibrary:
     """
@@ -58,9 +65,24 @@ class ChimeLibrary:
         self._clips: dict[str, bytes] = {}
 
     def path(self, name: str) -> Path | None:
-        """Where a named clip lives, if it lives inside the chime directory."""
+        """
+        Where a named clip lives, if it lives inside the chime directory.
+
+        The suffix is added rather than expected. A name that already carries it
+        is almost certainly a config written against the version that did expect
+        it, and `chime.wav.wav` reported as missing sends somebody to look at the
+        volume mount; saying which setting is wrong is cheaper.
+        """
+        if name.endswith(CHIME_SUFFIX):
+            logger.warning(
+                "Chime '%s' names its own extension, which is no longer written "
+                "out; use '%s'.",
+                name,
+                name[: -len(CHIME_SUFFIX)],
+            )
+
         root = self._directory.resolve()
-        path = (root / name).resolve()
+        path = (root / f"{name}{CHIME_SUFFIX}").resolve()
 
         if not path.is_relative_to(root):
             logger.error("Clip '%s' resolves outside %s; ignoring it.", name, root)

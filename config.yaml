@@ -18,6 +18,10 @@
 settings:
   # Speech synthesis. Where the synthesizer *is* is TTS_HOST and TTS_PORT, and
   # which voice it uses is TTS_VOICE.
+  #
+  # Not to be confused with the `tts` tool a server enables further down. This
+  # is one synthesizer for the whole deployment; that is whether a given server
+  # is allowed to speak through it.
   tts:
     # How long to wait on the synthesizer for the next piece of a clip. A budget
     # for a single wait rather than for the whole clip, so a long phrase
@@ -257,6 +261,21 @@ servers:
       scoreboard:
         enabled: false
 
+      # Says things out loud. Every other tool that answers a channel goes
+      # through this one, so a server without it hears nothing: fines are still
+      # counted, rounds are still paid, and neither is spoken. Which is said
+      # once at startup rather than left to be noticed.
+      #
+      # It owns the rendered-speech cache, the chime directory, and the voice
+      # connection. How it synthesizes — the host, the voice, the head start,
+      # how long a clip is kept — is settings.tts above, because that is one
+      # synthesizer for the whole deployment; this only says whether this server
+      # is allowed to use it.
+      #
+      # There is nothing to configure per server, so there is no `config` block.
+      tts:
+        enabled: false
+
       # Announces a fine, out loud, when someone says one of `words`.
       #
       # The words below are placeholders. What a server objects to is its own
@@ -306,7 +325,10 @@ servers:
           # relative to SPEECH_DIR/chimes — put the file there by hand. Mono or
           # stereo, any sample rate.
           #
-          # chime: chime.wav
+          # The name leaves the extension off: `chime` is `chime.wav`. WAV is
+          # the only format there is here, so writing it out said nothing.
+          #
+          # chime: chime
 
   876543210987654321:
     alias: second-server
