@@ -297,3 +297,54 @@ def test_an_unreadable_setting_falls_back_rather_than_stopping_the_pod(
 
     assert reloaded.quotes_cfg.backoff_seconds == 300.0
     assert reloaded.file_cfg.problems
+
+
+def test_the_endpoint_comes_from_the_environment(monkeypatch) -> None:
+    monkeypatch.setenv("LLM_API_BASE", "http://gateway.internal/v1")
+    monkeypatch.setenv("LLM_MODEL", "a-model")
+    monkeypatch.setenv("SUMMARY_DIR", "/somewhere/else")
+
+    import miss_quote.config as config
+
+    reloaded = importlib.reload(config)
+
+    assert reloaded.llm_cfg.base_url == "http://gateway.internal/v1"
+    assert reloaded.llm_cfg.model == "a-model"
+    assert reloaded.llm_cfg.configured
+    assert str(reloaded.summary_cfg.directory) == "/somewhere/else"
+
+
+def test_an_endpoint_without_a_model_is_not_configured(monkeypatch) -> None:
+    """A model name is a deployment's own; guessing one is a 404 that reads wrong."""
+    monkeypatch.setenv("LLM_API_BASE", "http://gateway.internal/v1")
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+
+    import miss_quote.config as config
+
+    assert not importlib.reload(config).llm_cfg.configured
+
+
+def test_the_completion_budget_and_the_summary_retention_are_settings(
+    monkeypatch, tmp_path
+) -> None:
+    reloaded = _reload_with(
+        monkeypatch,
+        tmp_path,
+        "settings:\n"
+        "  llm:\n    timeout_seconds: 45\n    max_tokens: 256\n"
+        "  summaries:\n    retention_days: 365\n",
+    )
+
+    assert reloaded.llm_cfg.timeout_seconds == 45.0
+    assert reloaded.llm_cfg.max_tokens == 256
+    assert reloaded.llm_cfg.temperature == 0.7
+    assert reloaded.summary_cfg.retention_days == 365
+    assert reloaded.summary_cfg.retention_enabled
+
+
+def test_summaries_are_kept_forever_unless_a_window_is_set(monkeypatch, tmp_path) -> None:
+    """Any value below 1 keeps them, so a mis-set setting cannot destroy the archive."""
+    reloaded = _reload_without_settings(monkeypatch, tmp_path)
+
+    assert reloaded.summary_cfg.retention_days == -1
+    assert not reloaded.summary_cfg.retention_enabled

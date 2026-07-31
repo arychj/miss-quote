@@ -113,6 +113,39 @@ settings:
     #
     # resume_seconds: 5
 
+  # Only used by `summary`. Where the endpoint is, what key it wants, and which
+  # model to ask for are LLM_API_BASE, LLM_API_KEY, and LLM_MODEL — one endpoint
+  # for the whole deployment, whatever is serving it.
+  llm:
+    # Budget for one completion, end to end. Generous next to the ASR's: a
+    # summary is several hundred tokens of output rather than a sentence.
+    #
+    # Keep it well under the deployment's termination grace period. A session
+    # that seals as the pod goes down is summarized inside the shutdown, and
+    # what does not finish there is lost — the transcript survives either way.
+    #
+    # timeout_seconds: 120
+
+    # A ceiling on what comes back, so a model that will not stop cannot
+    # produce a summary longer than the conversation it came from.
+    #
+    # max_tokens: 1024
+
+    # How much licence the model has. Higher than a mechanical transform would
+    # want, because the output is prose somebody reads for pleasure.
+    #
+    # temperature: 0.7
+
+  # Where summaries are written is SUMMARY_DIR. The tree inside it is the
+  # transcripts' tree — a directory per server and per channel — and each file
+  # is named for the transcript it summarizes.
+  summaries:
+    # Days of summaries to keep. -1, or any value below 1, keeps them forever.
+    # Longer than the transcripts is a sensible thing to want: a summary is a
+    # fraction of the size and most of the value.
+    #
+    # retention_days: -1
+
 # Servers the bot may join, by ID. Everything about a server lives under its ID.
 #
 # The ID appears here and nowhere else: transcript directories are named for the
@@ -260,6 +293,86 @@ servers:
       # topic. The four furthest into the red are what fits.
       scoreboard:
         enabled: false
+
+      # Writes down what happened in a voice channel once the bot leaves it,
+      # and reads it back out loud when somebody asks.
+      #
+      # Everything is per voice channel, under `monitored_channels`, and that
+      # mapping is also the switch: a channel that is not in it is not
+      # summarized, not posted, and does not answer the question either. The
+      # keys are matched the way transcript directories are named, so
+      # `General Voice` and `general-voice` are the same channel and the key is
+      # always the directory the summaries land in.
+      #
+      # Where the endpoint is and how long it gets is settings.llm above.
+      summary:
+        enabled: false
+        config:
+          # Prompts of your own, added to the shipped `recap`, `minutes`, and
+          # `bard`. One under a shipped name replaces it. Written here rather
+          # than inside a channel because a prompt is a library entry, and
+          # restating a paragraph of instructions once per room is how two of
+          # them end up saying different things by accident.
+          #
+          # prompts:
+          #   terse: |
+          #     Summarize the conversation in three sentences.
+
+          monitored_channels:
+            general-voice:
+              # The text channel to post the summary in, by name. Leave it out
+              # to write summaries to disk and post nothing.
+              channel: session-summaries
+
+              # Which prompt summarizes a sealed session. `recap` is an account
+              # of the evening for the people who were there; `minutes` is
+              # topics, decisions, and open questions.
+              #
+              # prompt: recap
+
+              # Which prompt turns a stored summary into something to say out
+              # loud, and how long it is allowed to be. `bard` is written for a
+              # synthesizer: no markdown, no bullets, no emoji.
+              #
+              # retelling_prompt: bard
+              # retelling_words: 200
+
+              # Below this many utterances a session is not a conversation, and
+              # a summary of it would be longer than the transcript.
+              #
+              # minimum_utterances: 5
+
+              # How soon the channel can be told its notes again. 0, or below,
+              # tells it every time it is asked.
+              #
+              # backoff_seconds: 120
+
+              # What plays while the model is still thinking, and what plays
+              # when there is nothing to think about. Both are rendered at
+              # startup, so the announcement starts straight away and covers
+              # the wait rather than following it.
+              #
+              # preamble: "Sure! Let me go look at my notes."
+              # empty: "I don't have any notes from this channel yet."
+
+              # What the bot answers to, and what asking looks like. Both
+              # replace their defaults rather than adding to them: they are a
+              # matching vocabulary, and renaming the bot should make the old
+              # name stop working.
+              #
+              # Punctuation is ignored on both sides, so several spellings are
+              # listed because an ASR guesses at a name it has never been told.
+              # The name has to come first and the trigger after it, in the same
+              # breath — an unaddressed "what happened last session" is somebody
+              # talking to the room.
+              #
+              # name: [miss quote, misquote, ms quote, mizquote]
+              # triggers:
+              #   - what happened last session
+              #   - what happened last time
+              #   - what did we do last session
+              #   - recap the last session
+              #   - read me your notes
 
       # Says things out loud. Every other tool that answers a channel goes
       # through this one, so a server without it hears nothing: fines are still

@@ -119,6 +119,26 @@ Timestamps carry an explicit UTC offset, resolved through `TZ`.
 
 ---
 
+## Summaries
+
+A transcript is raw material and nobody wants to read one. [`summary`](#summary) turns a sealed session into an account of it, and files that account in a tree with the same shape under its own root:
+
+```
+SUMMARY_DIR/
+└── first-server/
+    └── general-voice/
+        ├── 2026-07-26T20-14-03.txt
+        └── 2026-07-27T09-31-55.txt
+```
+
+The same guild and channel directories, from the same code that names the transcripts', and **a file named for the transcript it summarizes** rather than for the moment it was written. So the two are found from each other by changing one path segment and one extension, a session that took a `-2` to avoid a collision keeps it here, and a summary written late — by a backfill, or by a deployment pointed at a working endpoint after the fact — still lands on the right name.
+
+A separate root rather than a directory inside the transcripts, because the two are different things to hand somebody: a transcript is everything anybody said, and a summary is something you would show people. They can be mounted, backed up, and shared on different terms, and `settings.summaries.retention_days` is its own clock — keeping summaries for a year and transcripts for a month is a reasonable thing to want.
+
+Plain text, not JSON. What is in the file is what the model wrote and what was posted to the channel, so the archive is readable with `cat` and greppable without a parser.
+
+---
+
 ## Configuration
 
 Everything about how the bot behaves, and which servers it behaves that way in, is `config.yaml`, mounted at `/config/config.yaml` from a ConfigMap. Point `CONFIG_FILE` elsewhere to override the location. The file is read once at startup, so editing it means restarting the pod. The IDs in the repo copy are placeholders.
@@ -197,7 +217,9 @@ class Example(Tool):
         """Started once the bot has connected, and left going."""
 ```
 
-A tool is also handed a `topic`, which is somewhere to put one line where the channel can read it, its server's `users` roster, which is the only thing knowable about who might speak before anybody does, and a `tools` box holding the other tools that server has enabled. Answering out loud is not on that list: playing audio belongs to the `tts` tool, and every other tool reaches it through the box — see **Speech** below.
+A tool is also handed a `topic`, which is somewhere to put one line where the channel can read it, an `announcer`, which is somewhere to post something longer in a text channel it names, its server's `users` roster, which is the only thing knowable about who might speak before anybody does, and a `tools` box holding the other tools that server has enabled. Answering out loud is not on that list: playing audio belongs to the `tts` tool, and every other tool reaches it through the box — see **Speech** below.
+
+A topic and an announcer are different things and not two spellings of one. A topic is a single line that replaces the last one under a voice channel's name — a tally worth glancing at. An announcement is a message that joins the ones before it in a channel somebody scrolls back through — a summary worth reading later. `scoreboard` uses the first and `summary` the second.
 
 None of the three exists on the base class, so their absence is meaningful: the runner inspects each instance once at startup and files it under the moments it handles. A tool that defines none of them is reported as configured-but-inert rather than silently doing nothing.
 
@@ -377,6 +399,93 @@ Refused rather than quietly ignored, because a rule nobody is told about is one 
 An attempt **neither wins the round nor spoils it**: it does not claim the round and does not start the tie window, so whoever names it next is the first answer and is paid in full. The bar is per round, not per person — setting one line off does not disqualify you from naming the next one.
 
 `penalize_self_answers: false` drops the rule entirely. The trigger's speaker becomes an answerer like anybody else, the rebuke is never said, and it is not rendered at startup either.
+
+### summary
+
+Writes down what happened in a voice channel once the bot leaves it, and reads it back out loud when somebody asks. It is the only tool that uses the finished-transcript moment; everything else works on the utterance stream while a conversation is still going.
+
+```yaml
+summary:
+  enabled: true
+  config:
+    monitored_channels:
+      general-voice:
+        channel: session-summaries
+```
+
+That is a working block. Everything below has a default.
+
+#### Which channels
+
+**Everything is per voice channel, under `monitored_channels`, and that mapping is also the switch.** A channel that is not in it is not summarized, is not posted, and does not answer the question either — one rule rather than two, so a room left off the list is left off entirely.
+
+Per channel rather than per server because a server's rooms are not interchangeable. One is where a game night happens and one is where two people are debugging something, and a bot that summarizes every room it was ever dragged into is writing files nobody asked for and posting them where everybody can read them. Opting a channel in is a line in the config file; that is the whole of the decision.
+
+Keys are matched through the same slug that names the transcript directory, so `General Voice` and `general-voice` are the same channel, and **the key you write is always exactly the directory the summaries land in**.
+
+#### Writing it down
+
+When a session seals — after the resume window, or immediately on shutdown — the JSONL is reduced to the two fields a summarizer wants:
+
+```
+Erik: that should work
+Eli: it did not
+```
+
+`user_id` goes because a model cannot look anybody up by it. The timestamp goes because the lines are already in the order they were spoken and every prompt says so, which makes a stamp on each one a token per line spent restating what the shape of the input already guarantees. Consecutive lines from one speaker are joined, because the segmenter cuts on a pause rather than on a sentence and three attributions in a row reads as an exchange that never happened.
+
+That goes to the endpoint with the channel's `prompt`, and what comes back is written to `SUMMARY_DIR` and posted to the text channel named in `channel:` — by **name**, resolved against the server when it is posted. A name is what the tool has and what the person writing the config file has in front of them; the cost is that a renamed channel silently stops receiving posts, which is why an unresolvable one is reported at startup rather than at the end of the first session worth keeping. Leaving `channel:` out writes summaries to disk and posts nothing, which is a whole working configuration for a server that only wants the spoken recap.
+
+A session under `minimum_utterances` is not summarized: a summary of four lines is longer than the four lines. **A failure anywhere costs the summary and nothing else** — nothing partial is written and nothing partial is posted, and the transcript is untouched, so a session missed because the endpoint was down can be summarized by hand later.
+
+**A whole session is sent in one request, and it is not truncated.** A long evening is tens of thousands of tokens, and an endpoint whose context will not take it refuses the request — which is a failure like any other: logged, no file, no post, transcript intact. That is deliberate rather than unfinished. Silently cutting a transcript would produce a summary that reads as complete and covers the first hour, which is worse than not having one; splitting it into chunks and summarizing the summaries is a different feature with its own failure modes. Point `LLM_MODEL` at something with the context to hold a session, and if one is refused, the log says which file it was.
+
+> **On shutdown.** A session sealed as the pod goes down is summarized inside the shutdown, before the gateway connection closes, so a whole LLM round trip runs inside the termination grace period and can be killed by it. That is accepted — the transcript survives and the summary is the derived artifact — but it is why `settings.llm.timeout_seconds` should stay well under `terminationGracePeriodSeconds`.
+
+#### Reading it back
+
+**"Miss Quote, what happened last session"** and the bot tells you, out loud, having run the stored summary through a second prompt that turns a thing you read into a thing you say.
+
+It answers with the most recent summary **for that channel**. A session still in progress has no summary yet — one is written when the transcript seals — so this is the previous conversation even when it is asked for in the middle of one, which is exactly what "last session" means.
+
+Asking takes **both** a name and a trigger, the name first, in one breath. An unaddressed "what happened last session" is somebody talking to the room, and answering it would be a minute of narration nobody asked for. Punctuation is ignored on both sides, and several spellings of the name ship by default, because an ASR guesses phonetically at a name it has never been told and "Miss Quote" comes back as one word about as often as two.
+
+The part worth explaining is the silence. Inference takes seconds, so the bot plays a pre-rendered *"Sure! Let me go look at my notes."* — and **starts the inference before it starts saying it**, so the announcement covers the wait rather than being followed by one. Three things make that work:
+
+- **The lookup happens first.** Reading the newest file is instant, so the bot never announces that it is going to look and then finds nothing. With nothing to find it says the `empty` line and stops.
+- **The completion is started before the preamble is played, not after.** Playback returns when the clip has finished, so asking the model on the next line would put the inference *after* the announcement meant to cover it. `tests/test_summary.py` guards this as a deadlock rather than a timing assertion: the fake preamble will not finish until the model has started, so getting the order wrong hangs the test instead of quietly passing.
+- **The preamble and the `empty` line are rendered at startup**, so both begin on a file read rather than a synthesizer round trip.
+
+A second ask while a retelling is still going is dropped rather than queued — what is queued behind a minute of narration is a minute of the same narration — and `backoff_seconds` is how soon after one the channel can be told again.
+
+#### Prompts
+
+Prompts are named and selected by name. Three ship:
+
+| Name | For | Output goes to |
+|---|---|---|
+| `recap` | The default. An account of the evening for the people who were there, in the order it happened, naming names | A Discord message, so Markdown is fine |
+| `minutes` | Topics, decisions, and open questions, as headed sections | A Discord message |
+| `bard` | The default retelling. A short spoken account, warm and a little wry | **A speech synthesizer**, so it forbids Markdown, bullets, and emoji at some length — a synthesizer reads an asterisk out as a word |
+
+`prompts:` adds your own to those, and one written under a shipped name replaces it — which is how a server that likes the structure of `recap` and not its tone changes the tone without inventing a name for it. It sits at the tool level rather than inside a channel because a prompt is a library entry, and restating a paragraph of instructions once per room is how two of them end up saying different things by accident.
+
+**A prompt named by a name nothing answers to stops the tool from starting**, reported alongside every other startup problem. A tool running on instructions nobody asked for produces summaries that look fine and are not what the file requested, which is worse than a tool that refuses.
+
+#### Per-channel settings
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `channel` | — | Text channel to post in, by name. Unset writes to disk and posts nothing |
+| `prompt` | `recap` | Which prompt summarizes a sealed session |
+| `retelling_prompt` | `bard` | Which prompt turns a stored summary into something to say out loud |
+| `retelling_words` | `200` | How long the spoken retelling is allowed to be |
+| `minimum_utterances` | `5` | Below this a session is not a conversation and is not summarized |
+| `backoff_seconds` | `120` | How soon the channel can be told its notes again. `0`, or below, tells it every time |
+| `preamble` | `Sure! Let me go look at my notes.` | What plays while the model is thinking |
+| `empty` | `I don't have any notes from this channel yet.` | What plays when there is nothing to tell |
+| `name` | `miss quote`, `misquote`, `ms quote`, `mizquote` | What the bot answers to. **Replaces** the default |
+| `triggers` | `what happened last session`, and four more | What asking looks like. **Replaces** the default |
 
 ### scoreboard
 
@@ -600,6 +709,24 @@ Where transcripts are written is `TRANSCRIPT_DIR`, and what clock they are stamp
 | `retention_days` | `-1` | Days to keep. `-1`, or any value below `1`, keeps forever |
 | `resume_seconds` | `5.0` | How long a transcript is held open for a reconnect to the same channel. `0` seals it on disconnect |
 
+### `llm`
+
+Only used by `summary`. Where the endpoint *is*, what key it wants, and which model to ask for are `LLM_API_BASE`, `LLM_API_KEY`, and `LLM_MODEL`.
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `timeout_seconds` | `120.0` | Budget for one completion, end to end. Generous next to the ASR's, a summary being several hundred tokens of output rather than a sentence. Keep it well under the deployment's termination grace period — see **summary** above |
+| `max_tokens` | `1024` | A ceiling on what comes back, so a model that will not stop cannot produce a summary longer than the conversation it came from |
+| `temperature` | `0.7` | How much licence the model has. Higher than a mechanical transform would want, because the output is prose somebody reads for pleasure |
+
+### `summaries`
+
+Where summaries are written is `SUMMARY_DIR`.
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `retention_days` | `-1` | Days to keep. `-1`, or any value below `1`, keeps forever. Its own clock, separate from the transcripts': keeping summaries for a year and transcripts for a month is a reasonable thing to want |
+
 ---
 
 ## Environment
@@ -655,11 +782,24 @@ Only used by `scoreboard`. A deployment with it enabled nowhere never reads or w
 |---|---|---|
 | `CREDITS_FILE` | `/credits/credits.json` | The running tally, as JSON. One file behind every server's board. Mount a volume at its directory to keep what everybody owes across restarts |
 
+### LLM
+
+Only used by `summary`. A deployment with it enabled nowhere never opens a connection.
+
+An OpenAI-compatible chat-completions endpoint and nothing more specific than that: a root, an optional bearer token, and a model name. `/chat/completions` is the whole of the API surface used, which is the part every endpoint claiming compatibility actually implements — so a hosted API, a gateway in front of one, and a model on the next machine over are the same three variables.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `LLM_API_BASE` | `http://localhost:8080/v1` | The API root, with `/chat/completions` appended. There is no default that will work out of the box, in the same way there is none for the ASR |
+| `LLM_API_KEY` | — | Sent as a bearer token when there is one. Empty sends **no `Authorization` header at all**, rather than an empty credential for an endpoint to decide what to do with. Never logged and never in an error message |
+| `LLM_MODEL` | — | What to ask for. **Required** by `summary`; there is no default, a model name being a deployment's own and a guess being a 404 that reads like a broken endpoint |
+
 ### Transcripts
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `TRANSCRIPT_DIR` | `/transcripts` | Directory the session files are written to |
+| `SUMMARY_DIR` | `/summaries` | Directory the summaries are written to, in a tree the same shape as the transcripts'. A separate root so the two can be mounted and shared on different terms — see **Summaries** above |
 | `TZ` | `America/Los_Angeles` | Timezone for session filenames and the offset stamped on each line |
 
 ### Speech segmentation
@@ -731,7 +871,8 @@ miss-quote/
 │       │   ├── client.py      # Bot setup, voice lifecycle, auto-join policy
 │       │   ├── audio_sink.py  # AudioSink + resampling bridge
 │       │   ├── speaker.py     # Playback into a voice channel, fed while it plays
-│       │   └── topic.py       # A line under the name of the channel the bot is in
+│       │   ├── topic.py       # A line under the name of the channel the bot is in
+│       │   └── announcer.py   # A body of text in a text channel named by a tool
 │       ├── audio/
 │       │   ├── resampler.py   # soxr, both directions
 │       │   ├── opus.py        # Encode to what Discord sends, and the Ogg it is kept in
@@ -745,6 +886,8 @@ miss-quote/
 │       │   ├── wyoming_client.py  # Per-utterance Wyoming round-trip
 │       │   └── models/
 │       │       └── silero_vad.onnx  # Vendored (~2 MB)
+│       ├── llm/
+│       │   └── client.py      # An OpenAI-compatible chat completion
 │       ├── ledger/
 │       │   └── credits.py     # What everybody has left, per server
 │       ├── resources/
@@ -755,8 +898,13 @@ miss-quote/
 │       │   ├── runner.py      # Per-server instances, dispatch, failure isolation
 │       │   ├── quotes.py      # Answers a trigger phrase with the line it belongs to
 │       │   ├── scoreboard.py  # The tally, to disk and to the channel topic
+│       │   ├── summary.py     # An account of a session, written down and read back
 │       │   ├── tts.py         # Says things out loud; the only thing that plays anything
 │       │   └── verbal_morality.py  # Fines a speaker, out loud, for the wrong thing
+│       ├── summary/
+│       │   ├── prompts.py     # What the model is told to do, by name
+│       │   ├── dialogue.py    # A transcript as the text a model reads
+│       │   └── store.py       # Summaries on disk, and finding the last one
 │       ├── transcript/
 │       │   └── writer.py      # Per-session JSONL appender + retention
 │       ├── tts/
@@ -764,6 +912,7 @@ miss-quote/
 │       │   └── cache.py       # Render a phrase once, keep it encoded in SPEECH_DIR/cache
 │       └── utils/
 │           ├── logging.py
+│           ├── phrases.py     # Matching a set phrase against what an ASR wrote
 │           └── stems.py       # A stem and the endings it is said with
 └── tests/
 ```
@@ -823,6 +972,7 @@ Runtime requirements:
 
 - **A reachable Wyoming ASR server** — set `WYOMING_HOST` and `WYOMING_PORT`. There is no default that will work out of the box.
 - **A writable volume at `TRANSCRIPT_DIR`.** Use a shared (`ReadWriteMany`) volume if anything else will need to read the transcripts; a single-writer volume locks them to this pod and forces an export step later.
+- **A writable volume at `SUMMARY_DIR`**, if `summary` is enabled anywhere. Without one the summaries are lost at every restart, which costs the archive rather than the feature — each one is still posted to its channel when it is written. The same **reachable OpenAI-compatible endpoint** is what `LLM_API_BASE` and `LLM_MODEL` have to point at; there is no default that will work.
 - **A writable volume at the directory holding `CREDITS_FILE`**, if `scoreboard` is enabled anywhere. Without one the tally is forgiven at every restart, which costs the accounting rather than the feature. **Set Voice Channel Status** on each voice channel is what lets the tally reach it; without it the bot keeps counting and says so in the log.
 - **A single replica.** Two instances would double-join the voice channel and double-write the transcript.
 - **No GPU and no node constraints** — transcription is a network call.

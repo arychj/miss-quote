@@ -58,7 +58,7 @@ import csv
 import random
 import re
 import time
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypeVar
@@ -69,6 +69,7 @@ from miss_quote.tools.scoreboard import Scoreboard
 from miss_quote.tools.tts import Tts
 from miss_quote.transcript.writer import TranscriptSession, Utterance
 from miss_quote.utils.logging import get_logger
+from miss_quote.utils.phrases import NOTHING, WORD_BOUNDARY, normalized, pattern
 from miss_quote.utils.stems import plural
 
 logger = get_logger(__name__)
@@ -102,11 +103,6 @@ USER_PLACEHOLDER = f"{{{USER_FIELD}}}"
 
 # Stands in for a speaker while a quote is checked at load.
 PROBE_NAME = "someone"
-
-# Matching on whole words only, so "real" does not fire inside "really". The
-# triggers are ordinary English and several are substrings of ordinary speech.
-WORD_BOUNDARY = r"\b"
-ALTERNATION = "|"
 
 TRIGGER_SEPARATOR = ", "
 
@@ -217,15 +213,6 @@ LEADING_ARTICLE = re.compile(rf"^{ARTICLE}\s+")
 # an answer should not turn on which of the two the transcriber wrote down.
 VERSUS = r"(?:vs|versus)"
 SAID_ALIKE = {"vs": VERSUS, "versus": VERSUS}
-
-# Everything that is not a letter or a digit, for the normalizing that lets a
-# title be written with the punctuation it deserves. An apostrophe closes the
-# gap rather than opening one, so "what's" is "whats" and a possessive title
-# answers to a transcript that dropped the mark: "hitchhikers guide".
-ELIDED = re.compile(r"['‘’ʼ`]+")
-UNSPOKEN = re.compile(r"[^a-z0-9]+")
-SPACE = " "
-NOTHING = ""
 
 # What holds the words of a title apart in the pattern built from it. Whitespace
 # rather than a literal space, so the pattern reads the same as the rest of them.
@@ -396,7 +383,7 @@ class Round:
         neither wins anything nor spoils it for the channel — it costs them, and
         the round goes on being open to everybody else.
         """
-        if not self._naming.search(_normalized(utterance.text)):
+        if not self._naming.search(normalized(utterance.text)):
             return None
 
         moment = time.monotonic() if now is None else now
@@ -436,7 +423,7 @@ class Quotes(Tool):
 
         config = self.config
         self._quotes = _load(quotes_cfg.file)
-        self._triggers = _pattern(self._quotes)
+        self._triggers = pattern(self._quotes)
         self._recent = RecentQuotes()
         self._window = _seconds(
             ANSWER_SECONDS_KEY, config.get(ANSWER_SECONDS_KEY), DEFAULT_ANSWER_SECONDS
@@ -614,7 +601,7 @@ class Quotes(Tool):
         server has said not to police it, in which case the round is told
         `ANYBODY` and they are an answerer like anybody else.
         """
-        if not self._asking() or not _normalized(quote.movie):
+        if not self._asking() or not normalized(quote.movie):
             return
 
         self._rounds[quote.movie] = Round(
@@ -953,17 +940,6 @@ def _chosen(options: Sequence[T]) -> T:
     return random.choice(options)
 
 
-def _normalized(text: str) -> str:
-    """
-    Text as it is matched: letters and digits, lowercase, single-spaced.
-
-    Punctuation is dropped rather than escaped, which is what makes "What's
-    Firefly?" and "what is firefly" the same answer, and what lets a title be
-    written with the apostrophes and colons it deserves.
-    """
-    return UNSPOKEN.sub(SPACE, ELIDED.sub(NOTHING, text.casefold())).strip()
-
-
 def _naming(movie: str) -> re.Pattern[str]:
     """
     An expression matching an utterance that names one title as a question.
@@ -977,7 +953,7 @@ def _naming(movie: str) -> re.Pattern[str]:
     Built a word at a time rather than escaped whole, because a few of them are
     written one way and said another; see `SAID_ALIKE`.
     """
-    title = LEADING_ARTICLE.sub(NOTHING, _normalized(movie))
+    title = LEADING_ARTICLE.sub(NOTHING, normalized(movie))
     spoken = WORD_SEPARATOR.join(_spoken(word) for word in title.split())
 
     return re.compile(
@@ -1124,19 +1100,3 @@ def _quote(path: Path, number: int, row: Mapping[str, str]) -> Quote | None:
         return None
 
     return Quote(movie=movie, trigger=trigger.casefold(), text=text)
-
-
-def _pattern(triggers: Iterable[str]) -> re.Pattern[str]:
-    """
-    One expression matching any trigger.
-
-    Compiled once at startup rather than per utterance. Longest first, because
-    Python's alternation takes the first branch that matches at a position
-    rather than the longest: with "monday" ahead of "case of the mondays", a
-    case of the Mondays would answer the more general line, and the more
-    specific trigger is in the file precisely because it deserves its own.
-    """
-    ordered = sorted(triggers, key=len, reverse=True)
-    alternatives = ALTERNATION.join(re.escape(trigger) for trigger in ordered)
-
-    return re.compile(f"{WORD_BOUNDARY}(?:{alternatives}){WORD_BOUNDARY}", re.IGNORECASE)
