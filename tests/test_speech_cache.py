@@ -2,7 +2,6 @@
 
 import os
 import time
-import wave
 from dataclasses import replace
 from datetime import timedelta
 
@@ -387,148 +386,6 @@ async def test_warming_with_nowhere_to_keep_it_synthesizes_nothing(
     assert synthesizer.calls == []
 
 
-# ── clips kept by hand ────────────────────────────
-
-
-CLIP_NAME = "chime.wav"
-STEREO_CHANNELS = 2
-EIGHT_BIT_WIDTH = 1
-PLAYBACK_BYTES_PER_FRAME = audio_cfg.playback_channels * audio_cfg.sample_width
-
-
-def _write_clip(
-    path,
-    rate: int = SOURCE_RATE,
-    channels: int = 1,
-    width: int = audio_cfg.sample_width,
-) -> bytes:
-    """A WAV in the cache directory, as an operator would leave one."""
-    mono = _tone()
-    frames = (
-        np.repeat(np.frombuffer(mono, dtype=np.int16), channels).tobytes()
-        if channels > 1
-        else mono
-    )
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with wave.open(str(path), "wb") as handle:
-        handle.setnchannels(channels)
-        handle.setsampwidth(width)
-        handle.setframerate(rate)
-        handle.writeframes(frames)
-
-    return mono
-
-
-async def test_a_clip_is_read_and_made_playable(tmp_path):
-    _write_clip(tmp_path / CLIP_NAME)
-    cache = SpeechCache(directory=tmp_path)
-
-    playback = await cache.clip(CLIP_NAME)
-
-    expected = SOURCE_SAMPLES * audio_cfg.playback_sample_rate // SOURCE_RATE
-    assert len(playback) // PLAYBACK_BYTES_PER_FRAME == pytest.approx(expected, abs=2)
-
-
-async def test_a_clip_is_read_off_disk_only_once(tmp_path):
-    path = tmp_path / CLIP_NAME
-    _write_clip(path)
-    cache = SpeechCache(directory=tmp_path)
-
-    first = await cache.clip(CLIP_NAME)
-    path.unlink()
-    second = await cache.clip(CLIP_NAME)
-
-    assert first == second
-
-
-async def test_a_clip_is_held_however_much_speech_goes_past(synthesizer, tmp_path):
-    """A clip was put there deliberately, and nothing ages it out."""
-    _write_clip(tmp_path / CLIP_NAME)
-    cache = SpeechCache(directory=tmp_path)
-
-    held = await cache.clip(CLIP_NAME)
-    await _collect(cache, PHRASE)
-    await _collect(cache, OTHER_PHRASE)
-
-    assert await cache.clip(CLIP_NAME) == held
-
-
-async def test_a_stereo_clip_is_folded_down(tmp_path):
-    """Discord wants stereo, but the playback path widens mono to get there."""
-    _write_clip(tmp_path / CLIP_NAME)
-    mono = await SpeechCache(directory=tmp_path).clip(CLIP_NAME)
-
-    _write_clip(tmp_path / CLIP_NAME, channels=STEREO_CHANNELS)
-    stereo = await SpeechCache(directory=tmp_path).clip(CLIP_NAME)
-
-    assert _largest_difference(mono, stereo) <= FILTER_TOLERANCE
-
-
-async def test_a_clip_already_at_the_playback_rate_is_not_resampled(tmp_path):
-    source = _write_clip(tmp_path / CLIP_NAME, rate=audio_cfg.playback_sample_rate)
-
-    playback = await SpeechCache(directory=tmp_path).clip(CLIP_NAME)
-
-    assert len(playback) == len(source) * audio_cfg.playback_channels
-
-
-async def test_a_missing_clip_plays_nothing(tmp_path, caplog):
-    playback = await SpeechCache(directory=tmp_path).clip(CLIP_NAME)
-
-    assert playback == b""
-    assert "No clip" in caplog.text
-
-
-async def test_a_clip_that_is_not_a_wav_plays_nothing(tmp_path, caplog):
-    (tmp_path / CLIP_NAME).write_bytes(b"ID3\x04\x00not actually a wav")
-
-    playback = await SpeechCache(directory=tmp_path).clip(CLIP_NAME)
-
-    assert playback == b""
-    assert "unplayable" in caplog.text
-
-
-async def test_a_clip_that_is_not_16_bit_plays_nothing(tmp_path, caplog):
-    _write_clip(tmp_path / CLIP_NAME, width=EIGHT_BIT_WIDTH)
-
-    playback = await SpeechCache(directory=tmp_path).clip(CLIP_NAME)
-
-    assert playback == b""
-    assert "8-bit" in caplog.text
-
-
-async def test_a_clip_may_live_in_a_subdirectory(tmp_path):
-    _write_clip(tmp_path / "chimes" / CLIP_NAME)
-
-    playback = await SpeechCache(directory=tmp_path).clip(f"chimes/{CLIP_NAME}")
-
-    assert playback != b""
-
-
-async def test_a_clip_above_the_cache_directory_is_refused(tmp_path, caplog):
-    """A name from configuration is not a licence to read the host."""
-    elsewhere = tmp_path / "elsewhere"
-    _write_clip(elsewhere / CLIP_NAME)
-    cache = SpeechCache(directory=tmp_path / "cache")
-
-    playback = await cache.clip(f"../elsewhere/{CLIP_NAME}")
-
-    assert playback == b""
-    assert "resolves outside" in caplog.text
-
-
-async def test_an_absolute_clip_path_is_refused(tmp_path, caplog):
-    elsewhere = tmp_path / "elsewhere"
-    _write_clip(elsewhere / CLIP_NAME)
-    cache = SpeechCache(directory=tmp_path / "cache")
-
-    playback = await cache.clip(str(elsewhere / CLIP_NAME))
-
-    assert playback == b""
-    assert "resolves outside" in caplog.text
-
-
 # ── retention ─────────────────────────────────────
 
 
@@ -537,7 +394,7 @@ ONE_DAY_PAST_IT = RETAIN_DAYS + 1
 LONG_ENOUGH_AGO = timedelta(days=ONE_DAY_PAST_IT).total_seconds()
 RETENTION_OFF = 0
 
-# A name only this cache produces, which is what makes a file safe to reap.
+# A name this cache produces, for standing in for a clip it wrote.
 DIGEST = "a" * 64
 
 
@@ -594,20 +451,41 @@ async def test_a_clip_inside_the_window_is_left_alone(synthesizer, tmp_path):
     assert len(_cached_files(tmp_path)) == 1
 
 
-async def test_a_clip_kept_by_hand_is_never_reaped(synthesizer, tmp_path):
-    """A chime was put there deliberately, and nothing here rendered it."""
-    _write_clip(tmp_path / CLIP_NAME)
-    _age(tmp_path / CLIP_NAME)
+async def test_a_stale_file_the_cache_did_not_write_is_reaped(synthesizer, tmp_path):
+    """
+    The directory is the cache's, so everything in it is on the same clock.
+
+    Nothing else is supposed to be here — chimes have their own directory — and
+    a file that ended up here anyway is one nothing will ever read.
+    """
+    stray = tmp_path / "left-here-somehow"
+    stray.write_bytes(b"whatever this is")
+    _age(stray)
 
     SpeechCache(directory=tmp_path, retention_days=RETAIN_DAYS)
 
-    assert (tmp_path / CLIP_NAME).is_file()
+    assert not stray.exists()
 
 
-async def test_a_clip_in_a_subdirectory_is_never_reaped(synthesizer, tmp_path):
-    held = tmp_path / "chimes" / CLIP_NAME
-    _write_clip(held)
+async def test_an_orphaned_partial_is_reaped(synthesizer, tmp_path):
+    """A process killed mid-write leaves one, and nothing else collects it."""
+    orphan = tmp_path / f"{DIGEST}.partial"
+    orphan.write_bytes(b"half an ogg container")
+    _age(orphan)
+
+    SpeechCache(directory=tmp_path, retention_days=RETAIN_DAYS)
+
+    assert not orphan.exists()
+
+
+async def test_a_subdirectory_is_left_alone(synthesizer, tmp_path):
+    """The scan does not descend, so a directory here is one you still have."""
+    nested = tmp_path / "somebodys-directory"
+    nested.mkdir()
+    held = nested / "kept"
+    held.write_bytes(b"not the reaper's business")
     _age(held)
+    _age(nested)
 
     SpeechCache(directory=tmp_path, retention_days=RETAIN_DAYS)
 
@@ -677,17 +555,6 @@ async def test_a_clip_from_the_wav_era_is_reaped(synthesizer, tmp_path):
     SpeechCache(directory=tmp_path, retention_days=RETAIN_DAYS)
 
     assert not stale.exists()
-
-
-async def test_a_hand_placed_clip_is_still_never_reaped(synthesizer, tmp_path):
-    """It is named, not hashed, so sweeping the old suffix cannot touch it."""
-    chime = tmp_path / "chime.wav"
-    chime.write_bytes(b"a chime somebody put here")
-    _age(chime)
-
-    SpeechCache(directory=tmp_path, retention_days=RETAIN_DAYS)
-
-    assert chime.exists()
 
 
 async def test_a_truncated_clip_is_re_synthesized(synthesizer, tmp_path):

@@ -44,6 +44,7 @@ import time
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
+from miss_quote.audio.chimes import shared_chimes
 from miss_quote.config import (
     PERCENT,
     UNITY_VOLUME,
@@ -237,6 +238,7 @@ class VerbalMorality(Tool):
             config.get(REPEAT_ANNOUNCEMENT_KEY) or DEFAULT_REPEAT_ANNOUNCEMENT,
         )
         self._speech = shared_cache()
+        self._chimes = shared_chimes()
         self._chime = self._located(config.get(CHIME_KEY))
         self._recent = RecentViolations()
         self._announcing = False
@@ -265,7 +267,7 @@ class VerbalMorality(Tool):
         if not name:
             return None
 
-        path = self._speech.clip_path(name)
+        path = self._chimes.path(name)
         if path is None or not path.is_file():
             logger.warning(
                 "[%s] No chime at '%s'; fines will be announced without one.",
@@ -465,7 +467,7 @@ class VerbalMorality(Tool):
         the player waiting between the flourish and the sentence it introduces.
         Waiting first spends that time before anything is playing.
         """
-        chime = await self._speech.clip(self._chime) if self._chime else NO_AUDIO
+        chime = await self._chimes.clip(self._chime) if self._chime else NO_AUDIO
         words = self._speech.stream(announcement).pcm()
         lead = await _lead(words, tts_cfg.lead_bytes)
 

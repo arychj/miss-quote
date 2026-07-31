@@ -133,10 +133,8 @@ class FakeSpeech:
     string rather than a mixture nothing can join.
     """
 
-    def __init__(self, directory: Path) -> None:
-        self.directory = directory
+    def __init__(self) -> None:
         self.asked: list[str] = []
-        self.clips_asked: list[str] = []
         self.pulled: list[str] = []
         self.warmed: list[str] = []
         self.held: set[str] = set()
@@ -172,12 +170,25 @@ class FakeSpeech:
         self.held.add(text)
         return True
 
-    def clip_path(self, name: str) -> Path:
+
+class FakeChimes:
+    """
+    Stands in for the chime library, which is a directory and nothing else.
+
+    Clips are strings here too, so what a speaker collects is one readable
+    string rather than a mixture nothing can join.
+    """
+
+    def __init__(self, directory: Path) -> None:
+        self.directory = directory
+        self.asked: list[str] = []
+
+    def path(self, name: str) -> Path:
         return self.directory / name
 
     async def clip(self, name: str) -> str:
-        self.clips_asked.append(name)
-        path = self.clip_path(name)
+        self.asked.append(name)
+        path = self.path(name)
 
         return path.read_text(encoding="utf-8") if path.is_file() else ""
 
@@ -188,10 +199,23 @@ class FakeSession:
 
 
 @pytest.fixture
-def speech(monkeypatch, tmp_path):
+def speech(monkeypatch):
     """Replace the process-wide cache so nothing reaches a synthesizer."""
-    fake = FakeSpeech(tmp_path)
+    fake = FakeSpeech()
     monkeypatch.setattr("miss_quote.tools.verbal_morality.shared_cache", lambda: fake)
+    return fake
+
+
+@pytest.fixture(autouse=True)
+def chimes(monkeypatch, tmp_path):
+    """
+    Replace the process-wide chime library with an empty directory.
+
+    Autouse because a tool with no chime configured still builds one, and the
+    real library would resolve names against whatever the deployment mounted.
+    """
+    fake = FakeChimes(tmp_path)
+    monkeypatch.setattr("miss_quote.tools.verbal_morality.shared_chimes", lambda: fake)
     return fake
 
 
@@ -211,9 +235,9 @@ def credits(monkeypatch, tmp_path) -> CreditLedger:
 
 
 @pytest.fixture
-def chime(speech) -> str:
-    """A clip sitting in the cache directory, as an operator would leave one."""
-    (speech.directory / CHIME_NAME).write_text(CHIME_AUDIO, encoding="utf-8")
+def chime(chimes) -> str:
+    """A clip sitting in the chime directory, as an operator would leave one."""
+    (chimes.directory / CHIME_NAME).write_text(CHIME_AUDIO, encoding="utf-8")
     return CHIME_NAME
 
 
@@ -908,11 +932,11 @@ async def test_a_speaker_that_raises_does_not_wedge_the_channel(speech, speaker)
 # ── the chime ─────────────────────────────────────
 
 
-async def test_no_chime_is_played_when_none_is_configured(speech, speaker):
+async def test_no_chime_is_played_when_none_is_configured(speech, chimes, speaker):
     await _hear(_tool(speaker), FORBIDDEN)
 
     _, spoken = speaker.played[0]
-    assert speech.clips_asked == []
+    assert chimes.asked == []
     assert spoken.startswith(SPEAKER)
 
 
@@ -943,12 +967,12 @@ async def test_a_missing_chime_still_announces_the_fine(speech, speaker):
     assert spoken == speech.asked[0]
 
 
-async def test_an_empty_chime_is_the_same_as_none(speech, speaker):
+async def test_an_empty_chime_is_the_same_as_none(speech, chimes, speaker):
     tool = _tool(speaker, {"words": WORDS, "chime": "  "})
 
     await _hear(tool, FORBIDDEN)
 
-    assert speech.clips_asked == []
+    assert chimes.asked == []
 
 
 # ── the head start ────────────────────────────────

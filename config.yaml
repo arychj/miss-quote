@@ -36,10 +36,10 @@ settings:
     #
     # lead_ms: 500
 
-    # Days a rendered clip survives in TTS_CACHE_DIR without being played,
+    # Days a rendered clip survives in SPEECH_DIR/cache without being played,
     # counted from the last time it was. 0, or any value below 1, keeps them
-    # forever. Clips left in the directory by hand, such as a chime, are never
-    # reaped.
+    # forever. Chimes live in SPEECH_DIR/chimes and are never reaped, whatever
+    # this says.
     #
     # cache_retention_days: 90
 
@@ -303,8 +303,8 @@ servers:
           # repeat_announcement: "{user}, you are also fined {credits} for {violations} of the verbal morality statute."
 
           # Optional. A 16-bit WAV played ahead of the announcement, named
-          # relative to TTS_CACHE_DIR — put the file in the same volume the
-          # rendered speech is kept in. Mono or stereo, any sample rate.
+          # relative to SPEECH_DIR/chimes — put the file there by hand. Mono or
+          # stereo, any sample rate.
           #
           # chime: chime.wav
 
