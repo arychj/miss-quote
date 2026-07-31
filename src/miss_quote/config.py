@@ -99,6 +99,8 @@ CREDITS_SECTION = "credits"
 FINES_SECTION = "fines"
 QUOTES_SECTION = "quotes"
 TRANSCRIPTS_SECTION = "transcripts"
+LLM_SECTION = "llm"
+SUMMARIES_SECTION = "summaries"
 
 TIMEOUT_SECONDS_KEY = "timeout_seconds"
 STALL_SECONDS_KEY = "stall_seconds"
@@ -113,6 +115,8 @@ BACKOFF_PERCENT_KEY = "backoff_percent"
 VOLUME_FLOOR_KEY = "volume_floor"
 RETENTION_DAYS_KEY = "retention_days"
 RESUME_SECONDS_KEY = "resume_seconds"
+MAX_TOKENS_KEY = "max_tokens"
+TEMPERATURE_KEY = "temperature"
 
 # Every setting there is, and what each one has to be. A name absent from here
 # is read by nothing, which is the quiet failure worth catching: the alternative
@@ -142,6 +146,14 @@ SETTINGS_SCHEMA: Mapping[str, Mapping[str, type]] = {
     TRANSCRIPTS_SECTION: {
         RETENTION_DAYS_KEY: int,
         RESUME_SECONDS_KEY: float,
+    },
+    LLM_SECTION: {
+        TIMEOUT_SECONDS_KEY: float,
+        MAX_TOKENS_KEY: int,
+        TEMPERATURE_KEY: float,
+    },
+    SUMMARIES_SECTION: {
+        RETENTION_DAYS_KEY: int,
     },
 }
 
@@ -448,6 +460,61 @@ class TTSConfig:
 
 
 # ──────────────────────────────────────────────
+# LLM  (OpenAI-compatible chat completions)
+# ──────────────────────────────────────────────
+@dataclass(frozen=True)
+class LLMConfig:
+    """
+    Where the text a tool sends off to be rewritten goes, and on what terms.
+
+    An OpenAI-compatible chat-completions endpoint and nothing more specific
+    than that: a root, a key, and a model name. Which of them is running behind
+    it is the deployment's business, on the same reasoning as the two Wyoming
+    servers — this points at one, it does not know what one is.
+    """
+
+    # The API root, with '/chat/completions' appended to it. There is no default
+    # that works out of the box, in the same way there is none for the ASR.
+    base_url: str = field(
+        default_factory=lambda: _env_str("LLM_API_BASE", "http://localhost:8080/v1")
+    )
+
+    # Sent as a bearer token when there is one. An empty key sends no
+    # Authorization header at all, so an endpoint that wants none is not handed
+    # an empty credential to reject.
+    api_key: str = field(default_factory=lambda: _env_str("LLM_API_KEY", ""))
+
+    # What to ask for. No default: a model name is a deployment's own, and
+    # guessing one produces a 404 that reads like a broken endpoint.
+    model: str = field(default_factory=lambda: _env_str("LLM_MODEL", ""))
+
+    # Budget for one completion, end to end. Generous next to the ASR's, because
+    # a summary is several hundred tokens of output rather than a sentence, and
+    # nothing is waiting on it in a voice channel — except the retelling, which
+    # covers the wait with an announcement.
+    timeout_seconds: float = field(
+        default_factory=lambda: file_cfg.setting(LLM_SECTION, TIMEOUT_SECONDS_KEY, 120.0)
+    )
+
+    # A ceiling on what comes back, so a model that will not stop cannot produce
+    # a summary longer than the conversation it came from.
+    max_tokens: int = field(
+        default_factory=lambda: file_cfg.setting(LLM_SECTION, MAX_TOKENS_KEY, 1024)
+    )
+
+    # How much licence the model has. Higher than a mechanical transform would
+    # want, because the output is prose somebody reads for pleasure.
+    temperature: float = field(
+        default_factory=lambda: file_cfg.setting(LLM_SECTION, TEMPERATURE_KEY, 0.7)
+    )
+
+    @property
+    def configured(self) -> bool:
+        """Whether there is enough here to ask anything of anybody."""
+        return bool(self.base_url and self.model)
+
+
+# ──────────────────────────────────────────────
 # Transcripts
 # ──────────────────────────────────────────────
 @dataclass(frozen=True)
@@ -490,6 +557,44 @@ class TranscriptConfig:
     @property
     def resume_enabled(self) -> bool:
         return self.resume_window_seconds > 0
+
+
+# ──────────────────────────────────────────────
+# Summaries
+# ──────────────────────────────────────────────
+@dataclass(frozen=True)
+class SummaryConfig:
+    """
+    Where an account of a session is kept.
+
+    Its own root rather than a directory inside the transcripts, so the two can
+    be mounted, backed up, and shared on different terms: a transcript is
+    everything anybody said and a summary is something you would show people.
+    The tree inside it is the same either way — the same guild and channel
+    directories, and a file named for the session it describes — so a summary
+    and its transcript are found from each other by changing one path segment.
+    """
+
+    directory: Path = field(
+        default_factory=lambda: Path(_env_str("SUMMARY_DIR", "/summaries"))
+    )
+
+    # Days of summaries to keep, on the same terms as the transcripts they came
+    # from: any value below 1 keeps them forever, so a mis-set setting cannot
+    # destroy the archive. Longer than a transcript's is a sensible thing to
+    # want, a summary being a fraction of the size and most of the value.
+    retention_days: int = field(
+        default_factory=lambda: file_cfg.setting(
+            SUMMARIES_SECTION, RETENTION_DAYS_KEY, -1
+        )
+    )
+
+    # Plain text, named for the transcript it summarizes.
+    filename_suffix: str = ".txt"
+
+    @property
+    def retention_enabled(self) -> bool:
+        return self.retention_days >= 1
 
 
 # ──────────────────────────────────────────────
@@ -941,7 +1046,9 @@ speech_cfg = SpeechConfig()
 vad_cfg = VADConfig()
 stt_cfg = STTConfig()
 tts_cfg = TTSConfig()
+llm_cfg = LLMConfig()
 transcript_cfg = TranscriptConfig()
+summary_cfg = SummaryConfig()
 process_cfg = ProcessConfig()
 scoreboard_cfg = ScoreboardConfig()
 morality_cfg = MoralityConfig()

@@ -13,6 +13,7 @@ import discord
 import discord.ext.voice_recv
 from discord.ext import commands
 
+from miss_quote.bot.announcer import DiscordAnnouncer
 from miss_quote.bot.audio_sink import STTAudioSink
 from miss_quote.bot.speaker import DiscordSpeaker
 from miss_quote.bot.topic import DiscordTopic
@@ -127,7 +128,10 @@ class STTBot:
         self._writer = TranscriptWriter()
         self._speaker = DiscordSpeaker(self._guild)
         self._topic = DiscordTopic(self._guild)
-        self._tools = ToolRunner(speaker=self._speaker, topic=self._topic)
+        self._announcer = DiscordAnnouncer(self._guild)
+        self._tools = ToolRunner(
+            speaker=self._speaker, topic=self._topic, announcer=self._announcer
+        )
         self._processor = STTProcessor(self._tools)
         self._sessions: dict[int, TranscriptSession] = {}
         self._expiries: dict[int, asyncio.Task] = {}

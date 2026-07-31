@@ -1,3 +1,6 @@
+# Already installed as a dependency of discord.py; declared here because this
+# package imports it directly, for the summary tool's completions endpoint.
+aiohttp>=3.9,<4.0
 discord-ext-voice-recv @ git+https://github.com/imayhaveborkedit/discord-ext-voice-recv@ac04ea7b0941112e83767cf1c1469b408fa06748
 discord.py[voice]>=2.4,<3.0
 numpy>=1.26,<3.0

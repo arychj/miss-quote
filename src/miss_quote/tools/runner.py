@@ -25,9 +25,11 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 
 from miss_quote.config import ServerConfig, file_cfg
 from miss_quote.tools.base import (
+    Announcer,
     Closer,
     FinishedHandler,
     Service,
+    SilentAnnouncer,
     SilentSpeaker,
     SilentTopic,
     Speaker,
@@ -63,12 +65,14 @@ class ToolRunner:
         registry: Mapping[str, type[Tool]] | None = None,
         speaker: Speaker | None = None,
         topic: Topic | None = None,
+        announcer: Announcer | None = None,
     ) -> None:
         servers = file_cfg.servers if servers is None else servers
         registry = TOOLS if registry is None else registry
 
         self._speaker = SilentSpeaker() if speaker is None else speaker
         self._topic = SilentTopic() if topic is None else topic
+        self._announcer = SilentAnnouncer() if announcer is None else announcer
         self._on_utterance: dict[int, list[Tool]] = {}
         self._on_finished: dict[int, list[Tool]] = {}
         self._warming: list[Tool] = []
@@ -120,6 +124,7 @@ class ToolRunner:
                         users=server.users,
                         tools=toolbox.view(tool_class),
                         topic=self._topic,
+                        announcer=self._announcer,
                     )
                 )
             except Exception as exc:

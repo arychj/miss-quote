@@ -78,6 +78,7 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/app/src \
     TRANSCRIPT_DIR=/transcripts \
+    SUMMARY_DIR=/summaries \
     SPEECH_DIR=/speech \
     CREDITS_FILE=/credits/credits.json \
     QUOTES_FILE=/app/src/miss_quote/resources/quotes.csv
@@ -88,11 +89,14 @@ ENV PYTHONUNBUFFERED=1 \
 # restart, which costs a delay rather than a failure, and forgives every fine
 # anybody has earned.
 #
-# Both subdirectories are made rather than just the root, so that a deployment
-# mounting one volume at /speech still has somewhere to put a chime by hand.
+# Both speech subdirectories are made rather than just the root, so that a
+# deployment mounting one volume at /speech still has somewhere to put a chime
+# by hand. Summaries get their own root rather than a directory inside the
+# transcripts, so the account of an evening and the record of everything said in
+# it can be mounted and shared on different terms.
 RUN useradd --create-home --uid 1000 bot \
-    && mkdir -p /transcripts /speech/cache /speech/chimes /credits \
-    && chown -R bot:bot /transcripts /speech /credits
+    && mkdir -p /transcripts /summaries /speech/cache /speech/chimes /credits \
+    && chown -R bot:bot /transcripts /summaries /speech /credits
 
 USER bot
 

@@ -38,10 +38,12 @@ a moment: a tool defining only these handles nothing, and is still reported as
 inert.
 
 A tool is handed a `Topic`, which is how it puts one line where the channel can
-read it. Nothing in this package imports discord: a topic is somewhere to put a
-line, and the bot supplies one against a voice channel. A `Speaker` — somewhere
-to play audio — is handed over on the same terms, but only the tool that owns
-playback reads it; everything else answers out loud by asking that tool.
+read it, and an `Announcer`, which is how it posts something longer somewhere it
+will still be later. Nothing in this package imports discord: both are somewhere
+to put words, and the bot supplies them against a voice channel and a named text
+channel. A `Speaker` — somewhere to play audio — is handed over on the same
+terms, but only the tool that owns playback reads it; everything else answers out
+loud by asking that tool.
 
 It is also handed a `Toolbox` — the other tools its server has enabled — so that
 the tool which counts something and the tool which hears it can be two tools. A
@@ -127,6 +129,61 @@ class SilentTopic:
 
     async def publish(self, server: str, line: str) -> bool:
         logger.debug("Nowhere to publish '%s' for %s.", line, server)
+
+        return False
+
+
+@runtime_checkable
+class Announcer(Protocol):
+    """Somewhere a tool can post something worth reading later."""
+
+    async def post(self, server: str, channel: str, text: str) -> bool:
+        """
+        Put a body of text in one named channel, saying whether it landed.
+
+        The other half of `Topic`, and a different thing from it: a topic is one
+        line that replaces the last one, and this is a message that joins them.
+        A summary is written once and read afterwards, which is a post rather
+        than a status.
+
+        The channel is named rather than identified, because the tool that asks
+        holds a server alias and a channel name and nothing that could resolve
+        an ID. Whoever implements this decides what a name means.
+
+        False is worth reporting to whoever asked; nothing retries on its own,
+        since what would be sent again is a summary somebody may have already
+        read half of.
+        """
+        ...
+
+
+@runtime_checkable
+class Finder(Protocol):
+    """An announcer that can say whether a channel name points anywhere."""
+
+    def resolve(self, server: str, channel: str) -> Any | None:
+        """
+        Whatever the name names, or None if it names nothing.
+
+        Separate from `Announcer` because it is a different kind of thing: one
+        posts and the other only looks, and a tool wants to look at startup so
+        that a typo in a channel name is a line in the report rather than a
+        discovery made when there is finally something to post. An announcer
+        with nothing to look through does not have to answer this at all.
+        """
+        ...
+
+
+class SilentAnnouncer:
+    """
+    An announcer with nowhere to post.
+
+    The runner's default, so a tool that posts always has one and never has to
+    check. False, because nothing was posted.
+    """
+
+    async def post(self, server: str, channel: str, text: str) -> bool:
+        logger.debug("Nowhere to post %d characters for %s.", len(text), server)
 
         return False
 
@@ -271,6 +328,7 @@ class ToolContext:
     users: Mapping[int, str] = field(default_factory=dict)
     tools: Toolbox = field(default_factory=Toolbox)
     topic: Topic = field(default_factory=SilentTopic)
+    announcer: Announcer = field(default_factory=SilentAnnouncer)
 
 
 class Tool:
@@ -308,6 +366,7 @@ class Tool:
         self.users = context.users
         self.tools = context.tools
         self.topic = context.topic
+        self.announcer = context.announcer
 
     def __repr__(self) -> str:
         return f"<{type(self).__name__} {self.name!r} for {self.server!r}>"
