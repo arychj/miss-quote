@@ -3,19 +3,24 @@
 .venv/
 venv/
 
-__pycache__/
-*.py[cod]
+# Leading **/ is load-bearing: a bare `__pycache__/` matches only the one at the
+# root, and the copies below src/ and tests/ would ride into the image carrying
+# absolute paths from whichever machine wrote them.
+**/__pycache__/
+**/*.py[cod]
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 
 assets/
 design/
-tests/
-pytest.ini
 pyproject.toml
 setup.cfg
-requirements-dev.txt
+
+# tests/, pytest.ini, requirements-dev.txt and config.yaml are deliberately not
+# here. The test stage copies them, and a path excluded from the context cannot
+# be copied by any stage. The published image is a separate stage and takes
+# none of them.
 
 .env
 .env.*
@@ -24,4 +29,3 @@ requirements-dev.txt
 *.log
 README.md
 todo.md
-config.yaml

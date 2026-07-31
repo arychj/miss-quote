@@ -24,26 +24,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-          cache: pip
-
-      # The same package the image installs, and for the same reason: rendered
-      # speech is encoded with libopus rather than handed to discord.py as
-      # samples, so the tests need it loadable. discord.py ships a binary for
-      # macOS and Windows and falls back to the system library on Linux, which
-      # is why this passes locally and fails here without it.
-      - name: Install libopus
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y libopus0
-
-      - name: Install dependencies
-        run: pip install -r requirements-dev.txt
-
+      # Nothing is installed on the runner. The suite runs in a stage of the
+      # same Dockerfile the published image comes from, which is what puts the
+      # pinned dependencies and the system Opus library in front of it — and
+      # what makes a run here and a run on a laptop the same run.
       - name: Run tests
-        run: pytest -q
+        run: make test
 
   build:
     needs: test

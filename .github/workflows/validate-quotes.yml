@@ -35,7 +35,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # No dependency install and no cache: the validator is standard library
-      # only, and the runner's own Python is enough to run it.
+      # No container, no dependency install and no cache: the validator is
+      # standard library only, so there is no environment to reproduce, and the
+      # runner's own Python is enough to run it. QUOTES_FILE reaches the
+      # Makefile through the environment.
       - name: Check the quote file
-        run: python scripts/validate_quotes.py "$QUOTES_FILE"
+        run: make validate-quotes

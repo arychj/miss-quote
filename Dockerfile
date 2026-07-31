@@ -10,7 +10,50 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
 
-FROM python:3.12-slim
+# The test stage sits between the two so that the image the registry gets stays
+# the last stage in the file: a bare `docker build` still resolves to it, and
+# nothing that only the tests need reaches it.
+FROM python:3.12-slim AS test
+
+# The same reason the runtime stage installs it, and the reason the tests cannot
+# run on a bare runner: discord.py ships an Opus binary for macOS and Windows
+# and falls back to the system library on Linux.
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y libopus0 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /install /usr/local
+
+WORKDIR /app
+
+# Only the packages the runtime set does not already have. The runtime set
+# itself came in with the layer above, and re-reading requirements.txt here
+# would send pip back to git for the pinned revision in it.
+COPY requirements-test.txt ./
+
+RUN pip install --no-cache-dir -r requirements-test.txt
+
+COPY pytest.ini ./
+
+# The shipped config is a fixture as much as a default — one test parses it to
+# hold the example in the repository to the same rules the parser enforces.
+COPY config.yaml ./
+
+COPY src/ src/
+COPY scripts/ scripts/
+COPY tests/ tests/
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+# Split so that `docker run <image> -k some_test` appends to the arguments
+# rather than replacing the command.
+ENTRYPOINT ["pytest"]
+
+CMD ["-q"]
+
+
+FROM python:3.12-slim AS runtime
 
 # libopus0 is required in both directions: discord-ext-voice-recv decodes Opus
 # in-process, and tools that answer out loud encode it on the way back.

@@ -657,10 +657,14 @@ Added: `AUTOJOIN`, `TRANSCRIPT_DIR`, `TZ`, `WYOMING_HOST`, `WYOMING_PORT`, `MAX_
 
 ```
 miss-quote/
+├── Makefile                   # How the tests are run, and the image is built
+├── Dockerfile                 # The published image, and the stage tests run in
 ├── pyproject.toml             # What builds the package, and nothing else
 ├── setup.cfg                  # The package itself: metadata and where it lives
 ├── pytest.ini
 ├── requirements.txt           # What the image installs
+├── requirements-test.txt      # What the test stage adds on top of it
+├── requirements-dev.txt       # Both of the above, for a working copy
 ├── config.yaml                # A sample of the mounted file
 ├── scripts/
 │   └── validate_quotes.py     # Checks a quote file in CI; stdlib only, imports nothing
@@ -720,12 +724,23 @@ The Silero model is vendored rather than installed, because the `silero-vad` pac
 ## Development
 
 ```bash
-python3.12 -m venv .venv && source .venv/bin/activate
-pip install -r requirements-dev.txt
-pytest
+make test
 ```
 
-Changing the quote list needs neither of those — `python scripts/validate_quotes.py` is standard library only and is what CI runs against it.
+The suite runs in the container, not on the machine. `make test` builds the `test` stage of the same Dockerfile the published image comes from and runs pytest inside it, which is exactly what CI does — there is no second recipe that can drift from this one, and no host Python to be the wrong version. The stage carries what a test run needs and the published image does not: pytest, the tests themselves, `scripts/`, and the sample `config.yaml` that one of them parses.
+
+It also settles the awkward dependency. Rendered speech is encoded with libopus rather than handed to discord.py as samples, so `tests/test_opus.py` needs the library loadable; discord.py ships a binary for macOS and Windows and falls back to the system one on Linux, which is how a suite that passes on a laptop fails on a bare runner. The image has it either way.
+
+A narrower run goes through the same target:
+
+```bash
+make test PYTEST_ARGS="-k config -vv"
+make shell                              # a prompt inside the test image
+```
+
+`make help` lists the rest. Working on the code with an editor that wants the imports resolved still wants a local environment, and `requirements-dev.txt` is that environment — it is not what the tests run against.
+
+Changing the quote list needs none of it. `make validate-quotes` is standard library only, runs against the host Python rather than the image, and is what CI runs on a quote-file change — the point being an answer in seconds instead of after an image build.
 
 The ASR path is the riskiest integration and is worth exercising on its own, before any Discord wiring. Point `WYOMING_HOST` at any reachable Wyoming server and send the bundled speech fixture through the client:
 

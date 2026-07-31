@@ -1,0 +1,7 @@
+# Separate from requirements-dev.txt so the test image can install these alone.
+# pip re-resolves an entire requirements file, and the runtime set it would drag
+# in contains a VCS pin — which means a git clone, and a git binary in an image
+# that already has the packages installed.
+
+pytest>=8.0,<9.0
+pytest-asyncio>=0.23,<1.0
