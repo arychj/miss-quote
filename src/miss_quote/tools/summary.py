@@ -106,7 +106,20 @@ DEFAULT_EMPTY = "I don't have any notes from this channel yet."
 # What the bot answers to. Several spellings because none of them is what an ASR
 # will necessarily have written down: a name it has never been told is guessed
 # at phonetically, and "Miss Quote" comes back as one word about as often as two.
-DEFAULT_NAME = ("miss quote", "misquote", "ms quote", "mizquote")
+#
+# "missquote" is here because it is what actually came back the first time
+# somebody asked out loud — the transcriber heard the two words, ran them
+# together, and kept both esses. The list is the cheapest place to be generous:
+# a spelling nobody ever says costs one branch of an alternation, and a spelling
+# that is missing costs somebody asking a bot twice while it ignores them.
+DEFAULT_NAME = (
+    "miss quote",
+    "misquote",
+    "missquote",
+    "mis quote",
+    "ms quote",
+    "mizquote",
+)
 
 # What asking looks like. Matched after the name and in the same breath, so an
 # unaddressed "what happened last session" in the middle of a conversation is

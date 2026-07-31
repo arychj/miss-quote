@@ -484,7 +484,7 @@ Prompts are named and selected by name. Three ship:
 | `backoff_seconds` | `120` | How soon the channel can be told its notes again. `0`, or below, tells it every time |
 | `preamble` | `Sure! Let me go look at my notes.` | What plays while the model is thinking |
 | `empty` | `I don't have any notes from this channel yet.` | What plays when there is nothing to tell |
-| `name` | `miss quote`, `misquote`, `ms quote`, `mizquote` | What the bot answers to. **Replaces** the default |
+| `name` | `miss quote`, `misquote`, `missquote`, `mis quote`, `ms quote`, `mizquote` | What the bot answers to, in the spellings a transcriber returns for a name it has never been told. **Replaces** the default |
 | `triggers` | `what happened last session`, and four more | What asking looks like. **Replaces** the default |
 
 ### scoreboard

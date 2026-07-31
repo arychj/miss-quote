@@ -360,7 +360,12 @@ async def test_with_no_notes_it_says_so_and_asks_nothing(summaries, model):
     [
         "Miss Quote, what happened last session?",
         "misquote what happened last time",
+        # What a transcriber actually returned the first time somebody asked:
+        # the two words run together with both esses kept.
+        "Missquote. What happened last session?",
+        "mis quote, what happened last session",
         "Ms. Quote — recap the last session",
+        "mizquote what happened last session",
         "hey miss quote, what did we do last session, out of interest",
     ],
 )
