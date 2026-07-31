@@ -1,8 +1,113 @@
-# Settings that do not flatten into environment variables.
+# Everything about how the bot behaves, and which servers it behaves that way in.
 #
 # Mounted into the pod at /config/config.yaml from a ConfigMap; override the
 # location with CONFIG_FILE. Read once at startup, so editing it means
 # restarting the pod. The values below are placeholders.
+#
+# What the environment still carries is what a deployment *points at* — hosts,
+# ports, directories, and the token — because those are what a manifest already
+# has and what a secret has to stay in. See .env.example.
+
+# Settings that apply to the whole deployment rather than to one server.
+#
+# Every one of them has a default, so this block is optional in its entirety and
+# so is any line in it; what is below is what you get by saying nothing. A name
+# nothing reads — a typo, or a setting written under the wrong section — is
+# reported at startup rather than ignored, and so is a value that will not
+# parse, which falls back to its default rather than stopping the pod.
+settings:
+  # Speech synthesis. Where the synthesizer *is* is TTS_HOST and TTS_PORT, and
+  # which voice it uses is TTS_VOICE.
+  tts:
+    # How long to wait on the synthesizer for the next piece of a clip. A budget
+    # for a single wait rather than for the whole clip, so a long phrase
+    # arriving steadily is not cut off for taking a long time.
+    #
+    # timeout_seconds: 30
+
+    # How long the player waits mid-clip before giving up on the rest of it.
+    #
+    # stall_seconds: 10
+
+    # How much speech to have in hand before a clip starts, in milliseconds.
+    # Covers a synthesizer that renders a phrase whole before sending any of it,
+    # which otherwise leaves a gap between a chime and the words behind it. 0
+    # starts on the first chunk.
+    #
+    # lead_ms: 500
+
+    # Days a rendered clip survives in TTS_CACHE_DIR without being played,
+    # counted from the last time it was. 0, or any value below 1, keeps them
+    # forever. Clips left in the directory by hand, such as a chime, are never
+    # reaped.
+    #
+    # cache_retention_days: 90
+
+  # The running tally the `scoreboard` tool keeps. Where it is written down is
+  # CREDITS_FILE.
+  credits:
+    # What a balance is denominated in, in the singular; the plural is grown
+    # from it, so "penny" is announced as "2 pennies". Only the wording changes.
+    #
+    # currency: credit
+
+    # How often a changed tally is written to disk. Cheap, so it is quick: a pod
+    # killed outright loses this many seconds of fines. 0, or below, keeps the
+    # tally in memory and writes it only on shutdown.
+    #
+    # save_seconds: 5
+
+    # How often a changed tally is published to the voice channel topic.
+    # Discord's bucket for it is roughly six a second, so this is set by how
+    # often a tally is worth reading rather than by a rate limit. 0, or below,
+    # keeps the tally off the channel, and still counts and saves it.
+    #
+    # topic_seconds: 10
+
+  # How a fine from `verbal-morality` is announced. What one is worth is the
+  # scoreboard's business, above.
+  fines:
+    # How soon after being fined a speaker is told they are "also fined" rather
+    # than hearing the whole sentence again. 0 turns the second wording off.
+    #
+    # repeat_seconds: 5
+
+    # How long a violation counts against how loudly the next one is announced,
+    # and how much each one inside that window takes off. A sliding window, so
+    # somebody is back to full volume this long after their last violation. 0%
+    # takes nothing off, which turns the backoff off entirely.
+    #
+    # backoff_seconds: 300
+    # backoff_percent: 5
+
+    # The quietest a fine is announced, as a fraction of PLAYBACK_VOLUME, once
+    # somebody has sworn enough inside the window to earn the full backoff. At
+    # the defaults that is fifteen violations. 0 silences a repeat offender
+    # entirely; 1 turns the backoff off, there being nowhere to back off to.
+    #
+    # volume_floor: 0.25
+
+  # The `quotes` tool, for every server that enables it. The triggers and the
+  # lines themselves are a CSV at QUOTES_FILE.
+  quotes:
+    # How long a trigger stays spent after it fires, so a channel that keeps
+    # saying the same word hears the line once. 0, or below, answers every
+    # trigger every time.
+    #
+    # backoff_seconds: 300
+
+  # Where transcripts are written is TRANSCRIPT_DIR, and what clock they are
+  # stamped with is TZ.
+  transcripts:
+    # Days of transcripts to keep. -1, or any value below 1, keeps them forever.
+    #
+    # retention_days: -1
+
+    # How long a transcript is held open for a reconnect to the same channel. A
+    # channel that empties and refills inside the window is one conversation
+    # with a gap in it rather than two. 0 seals it on disconnect.
+    #
+    # resume_seconds: 5
 
 # Servers the bot may join, by ID. Everything about a server lives under its ID.
 #
@@ -49,8 +154,8 @@ servers:
       # QUOTES_FILE, because a film everybody in one channel has seen is one
       # everybody in the next has too. A trigger that has just fired goes quiet
       # for a while, so a channel that keeps saying the same word only hears the
-      # joke once; how long is QUOTE_BACKOFF_SECONDS, which is not per server
-      # either.
+      # joke once; how long is settings.quotes.backoff_seconds, which is not per
+      # server either.
       #
       # Once the line has been said, naming what it came from — "what is
       # Firefly" — earns a credit through `scoreboard` below, announced out
@@ -114,7 +219,7 @@ servers:
           #
           # `{user}` is their name from `users` above.
           # `{credits}` is what changed hands, already pluralized — "1 credit",
-          # "5 credits". What a credit is called is CREDIT_CURRENCY.
+          # "5 credits". What a credit is called is settings.credits.currency.
           # `{remark}` is one of the endings above, drawn fresh each time. A
           # wording without it says the same thing every round.
           #
@@ -141,9 +246,9 @@ servers:
       # It hears nothing on its own. Other tools count through it —
       # verbal-morality, which fines people, and quotes, which pays them for
       # naming a film — so a server that enables one of those and not this one
-      # gets everything except the tally. Nothing else is
-      # configured per server: where the file lives, what it counts in, and how
-      # often it is written and published are CREDITS_* in the environment.
+      # gets everything except the tally. Nothing else is configured per
+      # server: what it counts in and how often it is written and published are
+      # settings.credits above, and where the file lives is CREDITS_FILE.
       #
       # Everyone in `users` above starts on the board at nothing spent, and only
       # they are eligible for it: somebody the server has not written down is
@@ -162,8 +267,8 @@ servers:
       # said once at startup rather than left to be noticed.
       #
       # A repeat offender is announced more quietly, down to
-      # VIOLATION_VOLUME_FLOOR; none of that is per server, so it is set in the
-      # environment rather than here.
+      # settings.fines.volume_floor; none of that is per server, so it is set
+      # above rather than here.
       #
       # Every name in `users` above is rendered at startup, against one, two,
       # and three violations and in both wordings below, so the fine lands while
@@ -185,15 +290,15 @@ servers:
           # `{user}` is the speaker's name from `users` where one is set.
           # `{credits}` is the fine, already pluralized: one credit per
           # forbidden word in the utterance, so "1 credit" or "3 credits". What
-          # a credit is called is CREDIT_CURRENCY.
+          # a credit is called is settings.credits.currency.
           # `{violations}` is "a violation" or "multiple violations", to match.
           #
           # announcement: "{user}, you are fined {credits} for {violations} of the verbal morality statute."
 
           # Optional, and the same placeholders. Said instead when the same
-          # speaker is fined again inside REPEAT_FINE_SECONDS — reading the
-          # whole sentence out again sounds like a bot that has lost track of
-          # what it just said.
+          # speaker is fined again inside settings.fines.repeat_seconds —
+          # reading the whole sentence out again sounds like a bot that has lost
+          # track of what it just said.
           #
           # repeat_announcement: "{user}, you are also fined {credits} for {violations} of the verbal morality statute."
 

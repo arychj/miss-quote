@@ -146,8 +146,8 @@ class Scoreboard(Tool):
         """
         if self._interval <= NEVER:
             logger.info(
-                "[%s] CREDITS_SAVE_SECONDS is %s; the tally will be kept in memory "
-                "and written only on shutdown.",
+                "[%s] settings.credits.save_seconds is %s; the tally will be kept "
+                "in memory and written only on shutdown.",
                 self.server,
                 self._interval,
             )
@@ -155,7 +155,7 @@ class Scoreboard(Tool):
 
         if self._topic_interval <= NEVER:
             logger.info(
-                "[%s] CREDITS_TOPIC_SECONDS is %s; the tally will be kept and "
+                "[%s] settings.credits.topic_seconds is %s; the tally will be kept and "
                 "written, but never published to a channel topic.",
                 self.server,
                 self._topic_interval,

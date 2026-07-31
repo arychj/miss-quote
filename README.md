@@ -96,7 +96,7 @@ TRANSCRIPT_DIR/
 
 A session opens when the bot joins and closes when it leaves — because the channel emptied, because someone disconnected it, or because the pod terminated. The file is named for the moment it opened and keeps that name until it closes, so **a conversation spanning midnight stays in one file** and **rejoining starts a new one**. A session that opens in the same second as another in the same channel gets a `-2` on the end rather than appending to it.
 
-Rejoining is qualified by the **resume window** (`SESSION_RESUME_SECONDS`, 5 s). A channel that empties and refills inside it is treated as one conversation with a gap in it — someone's client dropped, or the last person stepped away — so the transcript is held open and appended to rather than sealed and replaced.
+Rejoining is qualified by the **resume window** (`settings.transcripts.resume_seconds`, 5 s). A channel that empties and refills inside it is treated as one conversation with a gap in it — someone's client dropped, or the last person stepped away — so the transcript is held open and appended to rather than sealed and replaced.
 
 The server directory is its **alias from `servers`**, fixed in configuration rather than read from Discord, so it cannot change underneath the tree. Channels use their Discord name.
 
@@ -118,9 +118,15 @@ Timestamps carry an explicit UTC offset, resolved through `TZ`.
 
 ## Configuration
 
-Mappings do not flatten into environment variables, so they live in `config.yaml`, mounted at `/config/config.yaml` from a ConfigMap. Point `CONFIG_FILE` elsewhere to override the location. The file is read once at startup, so editing it means restarting the pod. The IDs in the repo copy are placeholders.
+Everything about how the bot behaves, and which servers it behaves that way in, is `config.yaml`, mounted at `/config/config.yaml` from a ConfigMap. Point `CONFIG_FILE` elsewhere to override the location. The file is read once at startup, so editing it means restarting the pod. The IDs in the repo copy are placeholders.
 
 ```yaml
+settings:
+  quotes:
+    backoff_seconds: 300
+  fines:
+    volume_floor: 0.25
+
 servers:
   123456789012345678:
     alias: first-server
@@ -139,6 +145,10 @@ servers:
     users:
       234567890123456789: Someone Else
 ```
+
+The split against the environment is what a deployment **points at** versus how it **behaves**. Hosts, ports, directories, and the token stay variables: they are what a manifest already carries and what a secret has to stay in. Everything that is a number or a wording — how long a trigger stays spent, what a balance is called, how quiet a repeat offender gets — is `settings:`, because twenty of those spread across a pod spec is a worse thing to read than one file with comments in it. **Settings** below is the list.
+
+`settings:` is optional in its entirety, and so is every line in it: each setting has a default, and a file that mentions none of them is a working file. What it is **not** is a free-form block. A name nothing reads — a typo, or a setting written under the wrong section — is reported at startup rather than ignored, on the same reasoning as a stray key in a tool block: the alternative is a deployment running on a default against a file that plainly asks for something else. A value that will not parse falls back to its default and is reported too, rather than stopping the pod, because this is also the file that decides which servers get joined.
 
 Everything about a server lives under its ID, and the ID appears there and nowhere else. The `alias` names the transcript directory, so renaming a server on Discord changes nothing about where its transcripts land.
 
@@ -280,7 +290,7 @@ Matching is **whole words, case-insensitive**, so `real` does not fire inside `r
 
 **One line per utterance**, however many triggers were in the sentence: two quotes over the top of each other is a denial of service on the channel, and the pause while the second one plays has outlasted the joke either way. The one that answers is the **earliest in the sentence** rather than the first in the file, since that is the one whoever spoke arrived at. Where two triggers start at the same word the longer wins — `case of the mondays` is in the list precisely because it deserves a different answer from `monday`.
 
-**A trigger that has just fired goes quiet for `QUOTE_BACKOFF_SECONDS`**, five minutes by default. The joke is the recognition, and a channel that says "cool" four times in a minute does not want "Shiny." four times back. `0` answers every trigger every time, for a deployment that wants that. The window is keyed on the **trigger**, not the speaker and not the line: what wears out is the phrase, so two people arriving at the same word inside five minutes hear one answer, while two rows that share a line cool down separately. A trigger on backoff does not swallow a live one later in the same sentence — the earliest trigger that is still fresh is the one that answers. The window is per server and held in memory only, so two channels arriving at the same line have each made the joke once, and a restart forgives every backoff.
+**A trigger that has just fired goes quiet for `settings.quotes.backoff_seconds`**, five minutes by default. The joke is the recognition, and a channel that says "cool" four times in a minute does not want "Shiny." four times back. `0` answers every trigger every time, for a deployment that wants that. The window is keyed on the **trigger**, not the speaker and not the line: what wears out is the phrase, so two people arriving at the same word inside five minutes hear one answer, while two rows that share a line cool down separately. A trigger on backoff does not swallow a live one later in the same sentence — the earliest trigger that is still fresh is the one that answers. The window is per server and held in memory only, so two channels arriving at the same line have each made the joke once, and a restart forgives every backoff.
 
 `{user}` is filled with the name the transcript uses — the roster name from `users` where a server has set one, the Discord display name otherwise — so nothing has to be configured twice.
 
@@ -357,7 +367,7 @@ scoreboard:
   enabled: true
 ```
 
-There is nothing to configure per server. Where the tally lives, what it is counted in, and how often it is written and published are the `CREDITS_*` variables, because there is one file behind every server's board and how often it is written is a property of the file rather than of any one server.
+There is nothing to configure per server. What the tally is counted in and how often it is written and published are `settings.credits`, and where it lives is `CREDITS_FILE`, because there is one file behind every server's board and how often it is written is a property of the file rather than of any one server.
 
 **It is enabled separately from whatever is counting.** A server that wants fines announced but not tallied enables `verbal-morality` and not this; the fines are announced and nothing is kept, and the log says so once at startup rather than leaving it to be discovered by wondering why the channel topic is empty. The same goes for `quotes`, which asks the channel to name what a line came from and pays for it here.
 
@@ -385,7 +395,7 @@ There is **one file behind every server's board**, so the mark for whether it ha
 
 What it actually sets is the channel's **status**, not its topic. A voice channel has no topic: `PATCH /channels/{id}` with one is refused, and refused with `CHANNEL_TOPIC_INVALID`, *"Field contains at least one word that is not allowed"* — which reads like a profanity filter and is nothing of the kind, since it refuses a topic of `test` identically. The status is the line the client shows beneath a voice channel's name, which is what a topic looks like on a voice channel and what somebody setting one by hand would set. Settings and prose here say topic because that is what it is to everybody looking at it; only the call itself knows the difference. It needs **Set Voice Channel Status** on the channel — not Manage Channels — and without it the tool logs once per change and keeps counting.
 
-The **status is not set on every change.** Both the write and the edit are driven off a revision counter, so a tally that changed four times between two ticks costs one of each. They run on **separate intervals**, because they are limited by different things: writing a few hundred bytes is cheap and happens every `CREDITS_SAVE_SECONDS`, while a status edit is rate-limited — though not nearly as hard as a channel rename, at a bucket of roughly six a second — so `CREDITS_TOPIC_SECONDS` is a question of how often a tally is worth reading rather than of what the API will tolerate. Saving still happens first on every tick: an edit that lands in a bucket can hold the task while discord.py sleeps it out, and a pod terminated in the middle of one should still have the tally on disk from the tick before.
+The **status is not set on every change.** Both the write and the edit are driven off a revision counter, so a tally that changed four times between two ticks costs one of each. They run on **separate intervals**, because they are limited by different things: writing a few hundred bytes is cheap and happens every `settings.credits.save_seconds`, while a status edit is rate-limited — though not nearly as hard as a channel rename, at a bucket of roughly six a second — so `settings.credits.topic_seconds` is a question of how often a tally is worth reading rather than of what the API will tolerate. Saving still happens first on every tick: an edit that lands in a bucket can hold the task while discord.py sleeps it out, and a pod terminated in the middle of one should still have the tally on disk from the tick before.
 
 A request Discord **refuses** — a `400`, or a missing permission — is not retried, because retrying it every interval would spend the channel's rate limit on an answer that cannot change. A tally that then changes is published anyway, since what was refused was that text and the next text is not that text. Every failure is logged with the string it was trying to set, because a rejection caused by a name in the tally cannot be diagnosed from the fact of it. A tally that reached nowhere at all — the bot is in no voice channel yet — is left unpublished rather than marked done, so it lands in the next channel the bot joins instead of waiting for somebody to swear again.
 
@@ -409,7 +419,7 @@ verbal-morality:
 |---|---|---|
 | `words` | yes | Stems of what the server objects to. A lone one may be written unquoted rather than as a list |
 | `announcement` | no | What gets said. `{user}`, `{credits}`, and `{violations}` are the placeholders |
-| `repeat_announcement` | no | Said instead when the same speaker is fined again inside `REPEAT_FINE_SECONDS`. Same placeholders |
+| `repeat_announcement` | no | Said instead when the same speaker is fined again inside `settings.fines.repeat_seconds`. Same placeholders |
 | `chime` | no | A WAV in the speech cache directory, played ahead of the announcement |
 
 Both templates default to the lines above, which the tool carries, so a server that wants the defaults can leave them out. A template with a placeholder nothing fills is rejected at startup rather than at the moment someone swears, and the error names which of the two it was.
@@ -424,13 +434,13 @@ Doubling really turns on where the **stress** falls, and nothing here knows that
 
 Matching is **whole words, case-insensitive**. A substring match fines the innocent, and the canonical example, Scunthorpe, is a place people live.
 
-**The fine scales with the utterance**: one credit per forbidden word in it, so three of them is `3 credits` and one is `1 credit`. The count is filled into `{credits}` already pluralized, as a numeral — every synthesizer worth pointing this at reads `3` as a number, and `1 credits` is wrong in a way a listener hears. What a credit is *called* is `CREDIT_CURRENCY`, and the plural is grown from it by the same spelling rules the word list uses, so `penny` announces as `2 pennies` and no deployment can end up fining anybody `2 pennys`. `{violations}` agrees with the count, reading `a violation` for one and `multiple violations` for more, so the sentence is not left saying "fined 3 credits for a violation". It is a phrase rather than a second count: the number is already in the fine, and saying it twice makes the announcement sound like an invoice.
+**The fine scales with the utterance**: one credit per forbidden word in it, so three of them is `3 credits` and one is `1 credit`. The count is filled into `{credits}` already pluralized, as a numeral — every synthesizer worth pointing this at reads `3` as a number, and `1 credits` is wrong in a way a listener hears. What a credit is *called* is `settings.credits.currency`, and the plural is grown from it by the same spelling rules the word list uses, so `penny` announces as `2 pennies` and no deployment can end up fining anybody `2 pennys`. `{violations}` agrees with the count, reading `a violation` for one and `multiple violations` for more, so the sentence is not left saying "fined 3 credits for a violation". It is a phrase rather than a second count: the number is already in the fine, and saying it twice makes the announcement sound like an invoice.
 
 What does not scale is the number of announcements. Three violations in one utterance earn one, because three announcements over the top of each other is a denial of service on the channel. **A violation earned while an announcement is playing is counted and not announced at all** — the speaker plays one clip at a time and returns when it is finished, so the alternative is a queue, and a channel where three people swear over each other would spend the next minute being read fines for things it has moved on from. The tally is charged either way: what somebody owes is not a function of whether they were told about it.
 
-**Being fined twice in a row is worded differently.** A speaker fined again inside `REPEAT_FINE_SECONDS` gets `repeat_announcement` — "you are *also* fined" — because reading the whole sentence out again sounds like a bot that has lost track of what it just said. It is per speaker: somebody else swearing in the meantime does not make their first fine a repeat. Both wordings are pre-rendered, so the second one does not cost a synthesizer round trip at the moment it is needed.
+**Being fined twice in a row is worded differently.** A speaker fined again inside `settings.fines.repeat_seconds` gets `repeat_announcement` — "you are *also* fined" — because reading the whole sentence out again sounds like a bot that has lost track of what it just said. It is per speaker: somebody else swearing in the meantime does not make their first fine a repeat. Both wordings are pre-rendered, so the second one does not cost a synthesizer round trip at the moment it is needed.
 
-**A repeat offender is announced more quietly.** Being fined is the joke, and the joke told fifteen times in five minutes is a denial of service on the conversation. Every violation inside a sliding `VOLUME_BACKOFF_DURATION` takes `VOLUME_BACKOFF_PERCENT` off the next announcement, down to `VIOLATION_VOLUME_FLOOR` — at the defaults, 5% a violation over five minutes, floored at a quarter of `PLAYBACK_VOLUME`, so fifteen of them reach the bottom. `0` for the percent takes nothing off and turns the backoff off; `0` for the floor silences a repeat offender outright. The first swear in a window is announced at full volume: the backoff is for saying it again. Each forbidden word counts, on the same terms as the fine, so four in a sentence is four steps down however few announcements it took to say so. The window is per speaker and per server, held in memory only — a `VOLUME_BACKOFF_DURATION` after their last violation somebody is back to full volume, and a restart forgives whatever backoff they had earned. What it does **not** affect is the tally: what somebody owes is not a function of how loudly they were told about it.
+**A repeat offender is announced more quietly.** Being fined is the joke, and the joke told fifteen times in five minutes is a denial of service on the conversation. Every violation inside a sliding `settings.fines.backoff_seconds` takes `settings.fines.backoff_percent` off the next announcement, down to `settings.fines.volume_floor` — at the defaults, 5% a violation over five minutes, floored at a quarter of `PLAYBACK_VOLUME`, so fifteen of them reach the bottom. `0` for the percent takes nothing off and turns the backoff off; `0` for the floor silences a repeat offender outright. The first swear in a window is announced at full volume: the backoff is for saying it again. Each forbidden word counts, on the same terms as the fine, so four in a sentence is four steps down however few announcements it took to say so. The window is per speaker and per server, held in memory only — a `settings.fines.backoff_seconds` after their last violation somebody is back to full volume, and a restart forgives whatever backoff they had earned. What it does **not** affect is the tally: what somebody owes is not a function of how loudly they were told about it.
 
 **The announcements are rendered at startup.** The roster is known before anybody speaks and so is the shape of the sentence, so on the way up the tool synthesizes every name in `users` against one, two, and three violations, in both the first-fine and the repeat wording, and leaves the results in the speech cache. Synthesis is the slow part of answering; paying for it before anyone is waiting is what lets the fine land while the offence is still what the channel is talking about. It happens in the background, one phrase at a time — the bot is in the channel and listening while it runs, and a synthesizer asked for a hundred phrases at once is one that is not answering whoever is speaking right now.
 
@@ -446,9 +456,9 @@ Tools answer out loud through a `Speaker`, which the bot implements against the 
 
 Synthesis is a second Wyoming server (`TTS_HOST`, `TTS_PORT`) — recognition and synthesis are both Wyoming, but they are two servers and only one of them wants a GPU. The voice is process-wide: a bot that answers in two voices is a bot nobody can tell is one bot.
 
-**Audio streams.** The client yields chunks as the synthesizer produces them, and playback starts on the first one rather than waiting for the last — resampling and encoding both happen as the audio arrives, so a cache miss plays while it is still being rendered. Discord's player is a thread that asks for exactly one 20 ms frame at a time and treats anything short of one as the end of the clip, so `bot/speaker.py` buffers between the two: filled from the event loop, drained a frame at a time, with the tail padded to a whole frame so the last few milliseconds of a word survive. A synthesizer that stalls mid-clip costs the rest of that clip after `TTS_STALL_SECONDS`, not a thread and a voice connection.
+**Audio streams.** The client yields chunks as the synthesizer produces them, and playback starts on the first one rather than waiting for the last — resampling and encoding both happen as the audio arrives, so a cache miss plays while it is still being rendered. Discord's player is a thread that asks for exactly one 20 ms frame at a time and treats anything short of one as the end of the clip, so `bot/speaker.py` buffers between the two: filled from the event loop, drained a frame at a time, with the tail padded to a whole frame so the last few milliseconds of a word survive. A synthesizer that stalls mid-clip costs the rest of that clip after `settings.tts.stall_seconds`, not a thread and a voice connection.
 
-**A clip waits for a head start** (`TTS_LEAD_MS`, 500 ms by default) before the first byte of it is handed to the player. Streaming is the contract, not a promise: a synthesizer is free to render a phrase whole before sending any of it, which makes the first chunk the slow one and every chunk after it instant. That is invisible for a clip that is only speech, and audible for one that opens with a chime — the flourish plays, and then the channel sits silent until the sentence it introduced arrives. Waiting for this much speech first moves the wait to before the chime, where nobody is listening yet. A phrase that ends inside the head start is not padded out to it, and `0` starts on the first chunk, which is what a synthesizer that streams as it renders wants.
+**A clip waits for a head start** (`settings.tts.lead_ms`, 500 ms by default) before the first byte of it is handed to the player. Streaming is the contract, not a promise: a synthesizer is free to render a phrase whole before sending any of it, which makes the first chunk the slow one and every chunk after it instant. That is invisible for a clip that is only speech, and audible for one that opens with a chime — the flourish plays, and then the channel sits silent until the sentence it introduced arrives. Waiting for this much speech first moves the wait to before the chime, where nobody is listening yet. A phrase that ends inside the head start is not padded out to it, and `0` starts on the first chunk, which is what a synthesizer that streams as it renders wants.
 
 **Loudness is a deployment setting** (`PLAYBACK_VOLUME`, `1.0` by default), because how loud a synthesizer renders a sentence has nothing to do with how loud a channel wants to be interrupted. It scales every sample on its way to the player, so a chime is turned down with the words behind it, and it is applied at playback rather than folded into a rendered clip — changing it does not invalidate a cache full of phrases. Above `1.0` the result is clipped at full scale rather than allowed to wrap, since int16 wraps to the opposite extreme and that is a crack in the middle of a word rather than more of the same.
 
@@ -472,19 +482,78 @@ A hit is a file read — 0.85 ms end to end for a three-second clip, against a 2
 
 **`TTS_CACHE_DIR` is therefore load-bearing, not an optimisation.** Mount a writable volume there. Without one, every phrase is synthesized again every time it is said and `prewarm` does nothing at all — which is a round trip to the TTS server per announcement instead of a file read, and is reported as an error at startup rather than a warning. Writes go through a temporary file and a rename, because a process killed mid-write would otherwise cache a truncated clip forever, and a clip is only stored once the synthesizer says it is whole — a failure partway through plays what arrived and stores nothing. A file that is truncated anyway, by a torn volume rather than by this process, is refused on the way in rather than played as a clip that stops early: the container's end-of-stream marker is what says the last page is the last page.
 
-> **Upgrading.** Clips written by an earlier version are `.wav` and cannot be read any more. They are not deleted on sight — they age out on the usual retention clock, since nothing touches them again — so a cache directory empties itself within `TTS_CACHE_RETENTION_DAYS` of the upgrade. Every phrase is re-synthesized once, which is what `prewarm` is for. Hand-placed clips are untouched.
+> **Upgrading.** Clips written by an earlier version are `.wav` and cannot be read any more. They are not deleted on sight — they age out on the usual retention clock, since nothing touches them again — so a cache directory empties itself within `settings.tts.cache_retention_days` of the upgrade. Every phrase is re-synthesized once, which is what `prewarm` is for. Hand-placed clips are untouched.
 
 **A phrase can be rendered before it is needed.** A tool that can work out at startup what it will have to say later warms the cache with it from `prewarm`, and a phrase already stored costs nothing to warm. A warmed clip is deliberately **not** treated as a played one: a phrase already there is left exactly as found rather than touched, so what nobody ever earns ages out like anything else nobody plays. With no usable directory there is nowhere to put the result, and warming does nothing rather than paying a synthesizer for audio nobody will ever be served.
 
-**The cache is reaped at startup** (`TTS_CACHE_RETENTION_DAYS`, 90 by default). The directory otherwise only grows: a display name goes into the key, so everyone who has ever been announced leaves a file behind, and none of them is ever asked for again once they leave the server. Age is the **mtime**, not the filename, and every hit touches the file, so what is still in use stays however old it is and only what nothing plays ages out. A reaped phrase costs one synthesis the next time it is said.
+**The cache is reaped at startup** (`settings.tts.cache_retention_days`, 90 by default). The directory otherwise only grows: a display name goes into the key, so everyone who has ever been announced leaves a file behind, and none of them is ever asked for again once they leave the server. Age is the **mtime**, not the filename, and every hit touches the file, so what is still in use stays however old it is and only what nothing plays ages out. A reaped phrase costs one synthesis the next time it is said.
 
 Only rendered speech is reaped, identified by name: a clip the cache wrote is a SHA-256 digest, which nothing anybody would type by hand looks like, and the scan does not descend into subdirectories. A chime is safe on both counts. Any value below `1` disables the reaper entirely, so `0` is a no-op rather than "delete everything".
 
 The same directory also holds **clips nobody synthesized** — a chime a tool plays ahead of what it has to say. Drop a 16-bit WAV in and name it from the tool's config; it is read once, converted to playback PCM, and held apart from rendered speech so it is never evicted for a phrase somebody said once. Names are resolved against the directory rather than taken at their word: a setting cannot be pointed at an arbitrary file on the host.
 
+## Settings
+
+The `settings:` block of `config.yaml`, described under **Configuration** above. Every one of these has a default, so none of them has to be written down; a name or a value that will not parse is reported at startup and falls back to the default.
+
+### `tts`
+
+Only used by tools that answer out loud. Where the synthesizer *is* is `TTS_HOST` and `TTS_PORT`, and which voice it uses is `TTS_VOICE`.
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `timeout_seconds` | `30.0` | Budget for a **single** wait on the synthesizer, not for a whole clip — a long phrase arriving steadily is not cut off for taking a long time |
+| `stall_seconds` | `10.0` | How long the player waits mid-clip for audio that never comes before ending it |
+| `lead_ms` | `500.0` | How much speech to have in hand before a clip starts playing, so a synthesizer that renders a phrase whole leaves no gap behind a chime. `0` starts on the first chunk |
+| `cache_retention_days` | `90` | Days a rendered clip survives in `TTS_CACHE_DIR` without being played, counted from the last time it was. Also what clears out clips an earlier version wrote as WAVs. Any value below `1` keeps them forever; clips left there by hand are never reaped |
+
+### `credits`
+
+Only used by `scoreboard`. Where the tally is written down is `CREDITS_FILE`.
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `currency` | `credit` | What a balance is denominated in, in the singular. The plural is grown from it by the spelling, so `penny` announces as `2 pennies`. Wording only — it changes nothing about what is counted |
+| `save_seconds` | `5.0` | How often a changed tally is written to disk. `0`, or any value below it, stops the loop: the tally is kept in memory and written only on shutdown |
+| `topic_seconds` | `10.0` | How often a changed tally is published to the voice channel topic — set as the channel **status**, a voice channel having no topic. `0`, or any value below it, keeps the tally off the channel entirely |
+
+### `fines`
+
+Only used by `verbal-morality`. What a fine is *worth* is the scoreboard's; these are how it is said.
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `repeat_seconds` | `5.0` | How soon after being fined the same speaker is told they are "also fined" rather than hearing the whole sentence again. `0`, or any value below it, turns the second wording off |
+| `backoff_seconds` | `300.0` | The sliding window a violation counts for against how loudly the next one is announced |
+| `backoff_percent` | `5` | How much each violation inside that window takes off the next announcement. `0` takes nothing off, turning the backoff off; anything above `100` reaches the floor on the first repeat, and anything negative is treated as `0` rather than made louder |
+| `volume_floor` | `0.25` | The quietest a fine is announced, as a fraction of `PLAYBACK_VOLUME`, once a speaker has earned the full backoff. `0` silences a repeat offender entirely; `1` turns the backoff off |
+
+### `quotes`
+
+Only used by `quotes`. The triggers and the lines themselves are a CSV at `QUOTES_FILE`.
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `backoff_seconds` | `300.0` | How long a trigger stays spent after it fires, so a channel that keeps saying the same word hears the line once. `0`, or any value below it, answers every trigger every time |
+
+### `transcripts`
+
+Where transcripts are written is `TRANSCRIPT_DIR`, and what clock they are stamped with is `TZ`.
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `retention_days` | `-1` | Days to keep. `-1`, or any value below `1`, keeps forever |
+| `resume_seconds` | `5.0` | How long a transcript is held open for a reconnect to the same channel. `0` seals it on disconnect |
+
+---
+
 ## Environment
 
-Every setting is read from the environment; `.env` is loaded if present. Nothing about a particular deployment is baked into the image, so the same image runs anywhere the variables below point it at.
+What a deployment points at, rather than how it behaves — that is **Settings** above. `.env` is loaded if present. Nothing about a particular deployment is baked into the image, so the same image runs anywhere the variables below point it at.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `CONFIG_FILE` | `/config/config.yaml` | The mounted file holding `settings` and `servers` |
 
 ### Discord
 
@@ -512,12 +581,8 @@ Only used by tools that answer out loud. A deployment with no such tool enabled 
 | `TTS_HOST` | `localhost` | Hostname or service name of the Wyoming TTS server |
 | `TTS_PORT` | `10200` | Wyoming's conventional TTS port |
 | `TTS_VOICE` | — | Voice to ask for. Empty takes whatever the synthesizer considers its default, so a server with one voice loaded needs no setting |
-| `TTS_TIMEOUT_SECONDS` | `30.0` | Budget for a **single** wait on the synthesizer, not for a whole clip — a long phrase arriving steadily is not cut off for taking a long time |
-| `TTS_STALL_SECONDS` | `10.0` | How long the player waits mid-clip for audio that never comes before ending it |
-| `TTS_LEAD_MS` | `500.0` | How much speech to have in hand before a clip starts playing, so a synthesizer that renders a phrase whole leaves no gap behind a chime. `0` starts on the first chunk |
 | `PLAYBACK_VOLUME` | `1.0` | Scales everything played into a channel, chime included. `1.0` is however loud the synthesizer rendered it, `0.8` is 20% quieter, `1.2` is 20% louder and clipped rather than wrapped. Any value below `0` is treated as silence |
 | `TTS_CACHE_DIR` | `/cache/tts` | Rendered speech, as Ogg Opus, and the only place it is kept. Mount a writable volume here; without one every phrase is synthesized again every time it is said |
-| `TTS_CACHE_RETENTION_DAYS` | `90` | Days a rendered clip survives on disk without being played, counted from the last time it was. Also what clears out clips an earlier version wrote as WAVs. Any value below `1` keeps them forever; clips left there by hand are never reaped |
 
 ### Quotes
 
@@ -526,7 +591,6 @@ Only used by `quotes`. A deployment with it disabled never opens the file.
 | Variable | Default | Purpose |
 |---|---|---|
 | `QUOTES_FILE` | `/app/src/miss_quote/resources/quotes.csv` | The triggers and the lines they answer with, as a CSV of `movie,trigger,quote`. One list per deployment; the image ships the one in `resources/`, and mounting a file over that path replaces it |
-| `QUOTE_BACKOFF_SECONDS` | `300.0` | How long a trigger stays spent after it fires, so a channel that keeps saying the same word hears the line once. `0`, or any value below it, answers every trigger every time |
 
 ### Credits
 
@@ -535,20 +599,6 @@ Only used by `scoreboard`. A deployment with it enabled nowhere never reads or w
 | Variable | Default | Purpose |
 |---|---|---|
 | `CREDITS_FILE` | `/credits/credits.json` | The running tally, as JSON. One file behind every server's board. Mount a volume at its directory to keep what everybody owes across restarts |
-| `CREDIT_CURRENCY` | `credit` | What a balance is denominated in, in the singular. The plural is grown from it by the spelling, so `penny` announces as `2 pennies`. Wording only — it changes nothing about what is counted |
-| `CREDITS_SAVE_SECONDS` | `5.0` | How often a changed tally is written to disk. `0`, or any value below it, stops the loop: the tally is kept in memory and written only on shutdown |
-| `CREDITS_TOPIC_SECONDS` | `10.0` | How often a changed tally is published to the voice channel topic — set as the channel **status**, a voice channel having no topic. `0`, or any value below it, keeps the tally off the channel entirely |
-
-### Fines
-
-Only used by `verbal-morality`. What a fine is *worth* is the scoreboard's, above; these are how it is said.
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `REPEAT_FINE_SECONDS` | `5.0` | How soon after being fined the same speaker is told they are "also fined" rather than hearing the whole sentence again. `0`, or any value below it, turns the second wording off |
-| `VOLUME_BACKOFF_DURATION` | `300.0` | The sliding window a violation counts for against how loudly the next one is announced |
-| `VOLUME_BACKOFF_PERCENT` | `5` | How much each violation inside that window takes off the next announcement. `0` takes nothing off, turning the backoff off; anything above `100` reaches the floor on the first repeat, and anything negative is treated as `0` rather than made louder |
-| `VIOLATION_VOLUME_FLOOR` | `0.25` | The quietest a fine is announced, as a fraction of `PLAYBACK_VOLUME`, once a speaker has earned the full backoff. `0` silences a repeat offender entirely; `1` turns the backoff off |
 
 ### Transcripts
 
@@ -556,8 +606,6 @@ Only used by `verbal-morality`. What a fine is *worth* is the scoreboard's, abov
 |---|---|---|
 | `TRANSCRIPT_DIR` | `/transcripts` | Directory the session files are written to |
 | `TZ` | `America/Los_Angeles` | Timezone for session filenames and the offset stamped on each line |
-| `RETENTION_DAYS` | `-1` | Days to keep. `-1`, or any value below `1`, keeps forever |
-| `SESSION_RESUME_SECONDS` | `5.0` | How long a transcript is held open for a reconnect to the same channel. `0` seals it on disconnect |
 
 ### Speech segmentation
 
@@ -567,11 +615,11 @@ Only used by `verbal-morality`. What a fine is *worth* is the scoreboard's, abov
 | `USER_TIMEOUT_SECONDS` | `60` | Discard per-user VAD state after this much silence |
 | `LOG_LEVEL` | `INFO` | Standard Python log levels |
 
-VAD thresholds, the pre-roll depth, and the Wyoming chunk size are deliberately **not** environment variables — they are tied to Silero's fixed 512-sample frame and live in `config.py`.
+VAD thresholds, the pre-roll depth, and the Wyoming chunk size are deliberately **not** configurable at all, from either place — they are tied to Silero's fixed 512-sample frame and live in `config.py`.
 
 ### Retention
 
-Pruning is **off by default**. Any value below `1` disables it entirely, so `0` is a no-op rather than "delete everything" and a mis-set variable cannot destroy the archive. When set to a positive `N`, files older than `N` days are deleted, aged by the **date at the front of the filename** rather than mtime — the filename is the authoritative record of when a transcript was taken, while mtime misjudges a file appended to late or restored from backup. Pruning runs at startup and whenever a session opens.
+Pruning is **off by default**. Any value below `1` disables it entirely, so `0` is a no-op rather than "delete everything" and a mis-set setting cannot destroy the archive. When set to a positive `N`, files older than `N` days are deleted, aged by the **date at the front of the filename** rather than mtime — the filename is the authoritative record of when a transcript was taken, while mtime misjudges a file appended to late or restored from backup. Pruning runs at startup and whenever a session opens.
 
 ### Auto-join
 
@@ -599,7 +647,7 @@ Removed outright: the multiprocessing layer and its queues, the STT health-check
 
 Kept intact because they are the non-obvious part: `stt/user_state.py`'s per-user VAD state machine with stale-speech flushing, and `audio/ring_buffer.py`'s pre-roll buffer, which is what stops the first syllable being clipped.
 
-Added: `AUTOJOIN`, `RETENTION_DAYS`, `TRANSCRIPT_DIR`, `TZ`, `SESSION_RESUME_SECONDS`, `WYOMING_HOST`, `WYOMING_PORT`, `MAX_CONCURRENT_TRANSCRIPTIONS`, `PLAYBACK_VOLUME`, `CREDITS_FILE`, `CREDIT_CURRENCY`, `CREDITS_SAVE_SECONDS`, `CREDITS_TOPIC_SECONDS`, `REPEAT_FINE_SECONDS`, `VOLUME_BACKOFF_DURATION`, `VOLUME_BACKOFF_PERCENT`, `VIOLATION_VOLUME_FLOOR`, `QUOTES_FILE`, `QUOTE_BACKOFF_SECONDS`, and every `TTS_*`.
+Added: `AUTOJOIN`, `TRANSCRIPT_DIR`, `TZ`, `WYOMING_HOST`, `WYOMING_PORT`, `MAX_CONCURRENT_TRANSCRIPTIONS`, `PLAYBACK_VOLUME`, `CREDITS_FILE`, `QUOTES_FILE`, `TTS_HOST`, `TTS_PORT`, `TTS_VOICE`, and `TTS_CACHE_DIR`, along with the whole of `config.yaml` — the servers the bot may join, the tools each of them elects into, and the `settings:` block everything above is tuned from.
 
 > **Note on the vendored VAD model.** Silero v5's ONNX graph scores the current frame *together with* the trailing 64 samples of the previous one. Fed a bare 512-sample frame it does not error — it silently returns near-zero probability on unmistakable speech, and the bot transcribes nothing. `stt/vad.py` carries that context between calls, and `tests/test_vad.py` guards it with real speech; silence-based tests pass either way and will not catch a regression.
 

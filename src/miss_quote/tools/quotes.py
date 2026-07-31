@@ -842,12 +842,12 @@ def _denominated(credits: int) -> str:
     """
     A number of credits as it will be said out loud, won or lost.
 
-    What a credit is called is `CREDIT_CURRENCY`, and the plural is grown from
-    it rather than configured beside it, so a deployment counting in something
-    other than credits cannot end up awarding people "2 credit". The count stays
-    a numeral, which every synthesizer worth pointing this at reads as a number;
-    the noun does not get the same treatment — "1 credits" is wrong in a way a
-    listener hears.
+    What a credit is called is `settings.credits.currency`, and the plural is
+    grown from it rather than configured beside it, so a deployment counting in
+    something other than credits cannot end up awarding people "2 credit". The
+    count stays a numeral, which every synthesizer worth pointing this at reads
+    as a number; the noun does not get the same treatment — "1 credits" is wrong
+    in a way a listener hears.
     """
     currency = scoreboard_cfg.currency
     noun = currency if credits == SINGLE_CREDIT else plural(currency)
