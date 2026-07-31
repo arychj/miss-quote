@@ -46,7 +46,7 @@ graph TD
     J -->|"handle_utterance"| L["Tools for this server"]
     K -.->|"handle_finished, on disconnect"| L
 
-    L -.->|"speaker.play"| M["Speech cache<br/><i>Ogg Opus in TTS_CACHE_DIR</i>"]
+    L -.->|"speaker.play"| M["Speech cache<br/><i>Ogg Opus in SPEECH_DIR/cache</i>"]
     M -.->|"on a miss"| N["Wyoming TTS<br/><i>TTS_HOST:TTS_PORT</i>"]
     M -.->|"Opus packets, sent unencoded"| A
 ```
@@ -420,7 +420,7 @@ verbal-morality:
 | `words` | yes | Stems of what the server objects to. A lone one may be written unquoted rather than as a list |
 | `announcement` | no | What gets said. `{user}`, `{credits}`, and `{violations}` are the placeholders |
 | `repeat_announcement` | no | Said instead when the same speaker is fined again inside `settings.fines.repeat_seconds`. Same placeholders |
-| `chime` | no | A WAV in the speech cache directory, played ahead of the announcement |
+| `chime` | no | A WAV in `SPEECH_DIR/chimes`, played ahead of the announcement |
 
 Both templates default to the lines above, which the tool carries, so a server that wants the defaults can leave them out. A template with a placeholder nothing fills is rejected at startup rather than at the moment someone swears, and the error names which of the two it was.
 
@@ -446,7 +446,7 @@ What does not scale is the number of announcements. Three violations in one utte
 
 Three violations because that is what a sentence usually holds; a fourth is remarkable enough to wait for the synthesizer. Anything already cached, from an earlier run or a real fine, is left alone rather than rendered again — including the second wording where a server has set both templates to the same string. What cannot be warmed is anyone **not** on the roster: they are announced under whatever Discord reports, which is not knowable at startup and not a closed set, so they pay for their first fine and nobody pays for it again. Warming also does not count as playing, so a pre-rendered announcement nobody ever earns ages out of the cache on the usual terms and is warmed again at the next startup.
 
-`chime` is resolved **inside** `TTS_CACHE_DIR` — a bare name, or a path below it; anything that climbs out is refused at startup. It must be a **16-bit WAV**, at any sample rate and in mono or stereo, both of which are converted on the way in. WAV rather than MP3 because playing audio without ffmpeg is the point of this path, and nothing in the image can decode anything else. The clip is read once, kept for the life of the process, and never evicted to make room for a phrase. A chime that is missing or will not parse is reported and costs the chime, not the announcement.
+`chime` is resolved **inside** `SPEECH_DIR/chimes` — a bare name, or a path below it; anything that climbs out is refused at startup. It must be a **16-bit WAV**, at any sample rate and in mono or stereo, both of which are converted on the way in. WAV rather than MP3 because playing audio without ffmpeg is the point of this path, and nothing in the image can decode anything else. The clip is read once, kept for the life of the process, and never evicted to make room for a phrase. A chime that is missing or will not parse is reported and costs the chime, not the announcement.
 
 A server electing in with no `words` is enabled and listening for nothing, which is reported at startup rather than left to be discovered by swearing at it.
 
@@ -466,7 +466,7 @@ It is also the one thing that decides how a clip goes out. At `1.0` there is not
 
 **No ffmpeg.** It is the usual way to play audio through discord.py, but only because it is the usual way to decode a file first. Synthesized speech is already raw PCM, so `soxr` converts it to the 48 kHz stereo Discord wants and the libopus already present for receiving handles the rest.
 
-**Clips are cached as what Discord is sent**, so a phrase is only ever synthesized once — and, at full volume, never processed again either. One layer: Opus packets, one per 20 ms, in an Ogg container under `TTS_CACHE_DIR`. About a tenth the size of the samples they came from, and playable, so you can hear what the bot actually said.
+**Clips are cached as what Discord is sent**, so a phrase is only ever synthesized once — and, at full volume, never processed again either. One layer: Opus packets, one per 20 ms, in an Ogg container under `SPEECH_DIR/cache`. About a tenth the size of the samples they came from, and playable, so you can hear what the bot actually said.
 
 Storing what Discord wants rather than what the synthesizer produced is what makes a cached phrase free to play. `AudioSource.is_opus` tells discord.py the frames are ready to send, so it builds no encoder at all: **no resample, no encode, no decode, nothing per play**. Previously every play of every cached phrase re-encoded the whole clip — about 37 ms of CPU for three seconds of audio, on the player thread, every single time.
 
@@ -480,17 +480,23 @@ The batch size is doing real work. Decoding each packet where it arrived put the
 
 A hit is a file read — 0.85 ms end to end for a three-second clip, against a 20 ms frame. There is deliberately no memory layer in front of it: there was one, holding the same packets, and it was measured at 0.27 ms off the way to playback while not even saving a filesystem round trip (the reaper ages clips by mtime, so every hit calls `os.utime` whether or not it read the file). An eviction policy and a tuning knob for a quarter of a millisecond is a bad trade.
 
-**`TTS_CACHE_DIR` is therefore load-bearing, not an optimisation.** Mount a writable volume there. Without one, every phrase is synthesized again every time it is said and `prewarm` does nothing at all — which is a round trip to the TTS server per announcement instead of a file read, and is reported as an error at startup rather than a warning. Writes go through a temporary file and a rename, because a process killed mid-write would otherwise cache a truncated clip forever, and a clip is only stored once the synthesizer says it is whole — a failure partway through plays what arrived and stores nothing. A file that is truncated anyway, by a torn volume rather than by this process, is refused on the way in rather than played as a clip that stops early: the container's end-of-stream marker is what says the last page is the last page.
+**`SPEECH_DIR/cache` is therefore load-bearing, not an optimisation.** Mount a writable volume at `SPEECH_DIR`. Without one, every phrase is synthesized again every time it is said and `prewarm` does nothing at all — which is a round trip to the TTS server per announcement instead of a file read, and is reported as an error at startup rather than a warning. Writes go through a temporary file and a rename, because a process killed mid-write would otherwise cache a truncated clip forever, and a clip is only stored once the synthesizer says it is whole — a failure partway through plays what arrived and stores nothing. A file that is truncated anyway, by a torn volume rather than by this process, is refused on the way in rather than played as a clip that stops early: the container's end-of-stream marker is what says the last page is the last page.
 
-> **Upgrading.** Clips written by an earlier version are `.wav` and cannot be read any more. They are not deleted on sight — they age out on the usual retention clock, since nothing touches them again — so a cache directory empties itself within `settings.tts.cache_retention_days` of the upgrade. Every phrase is re-synthesized once, which is what `prewarm` is for. Hand-placed clips are untouched.
+> **Upgrading from `TTS_CACHE_DIR`.** One directory used to hold both rendered speech and the clips an operator put there by hand; it is now `SPEECH_DIR` with a subdirectory for each. Point the volume at `/speech` and the cache rebuilds itself on the usual terms — nothing is lost but the first synthesis of each phrase, and `prewarm` pays most of that before anyone is waiting. **A chime has to be moved by hand** into `SPEECH_DIR/chimes`, because nothing reads the old path any more; one left behind is reported at startup as missing rather than guessed at. The old directory is not read, not migrated, and not deleted — it is yours to remove once you are satisfied.
+>
+> Clips written by a version older still are `.wav` and cannot be read at all. Anything left in the new cache directory ages out on the retention clock whatever it is named, so nothing has to be cleaned up by hand.
 
 **A phrase can be rendered before it is needed.** A tool that can work out at startup what it will have to say later warms the cache with it from `prewarm`, and a phrase already stored costs nothing to warm. A warmed clip is deliberately **not** treated as a played one: a phrase already there is left exactly as found rather than touched, so what nobody ever earns ages out like anything else nobody plays. With no usable directory there is nowhere to put the result, and warming does nothing rather than paying a synthesizer for audio nobody will ever be served.
 
 **The cache is reaped at startup** (`settings.tts.cache_retention_days`, 90 by default). The directory otherwise only grows: a display name goes into the key, so everyone who has ever been announced leaves a file behind, and none of them is ever asked for again once they leave the server. Age is the **mtime**, not the filename, and every hit touches the file, so what is still in use stays however old it is and only what nothing plays ages out. A reaped phrase costs one synthesis the next time it is said.
 
-Only rendered speech is reaped, identified by name: a clip the cache wrote is a SHA-256 digest, which nothing anybody would type by hand looks like, and the scan does not descend into subdirectories. A chime is safe on both counts. Any value below `1` disables the reaper entirely, so `0` is a no-op rather than "delete everything".
+**Everything in the cache directory is reaped**, because everything in it is the cache's — a clip this version wrote, one an earlier version wrote in a format nothing can read now, or a `.partial` orphaned by a process killed mid-write. All three want the same thing. The scan does not descend into subdirectories and does not remove them, so a directory somebody makes in there is a directory they still have. Any value below `1` disables the reaper entirely, so `0` is a no-op rather than "delete everything".
 
-The same directory also holds **clips nobody synthesized** — a chime a tool plays ahead of what it has to say. Drop a 16-bit WAV in and name it from the tool's config; it is read once, converted to playback PCM, and held apart from rendered speech so it is never evicted for a phrase somebody said once. Names are resolved against the directory rather than taken at their word: a setting cannot be pointed at an arbitrary file on the host.
+### Chimes
+
+`SPEECH_DIR/chimes` holds **clips nobody synthesized** — a flourish a tool plays ahead of what it has to say. Drop a 16-bit WAV in and name it from the tool's config; it is read once, converted to playback PCM, and held for the life of the process.
+
+It is a separate directory from the cache and that is the whole point: nothing writes here and nothing reaps here, so a clip somebody put there deliberately is never on a retention clock meant for a phrase said once. Names are resolved against the directory rather than taken at their word — a bare name or a path below it, and anything that climbs out is refused — so a setting cannot be pointed at an arbitrary file on the host. The directory does not have to exist; an absent one is a missing chime, reported by whichever tool asked for it, rather than a failure to start.
 
 ## Settings
 
@@ -505,7 +511,7 @@ Only used by tools that answer out loud. Where the synthesizer *is* is `TTS_HOST
 | `timeout_seconds` | `30.0` | Budget for a **single** wait on the synthesizer, not for a whole clip — a long phrase arriving steadily is not cut off for taking a long time |
 | `stall_seconds` | `10.0` | How long the player waits mid-clip for audio that never comes before ending it |
 | `lead_ms` | `500.0` | How much speech to have in hand before a clip starts playing, so a synthesizer that renders a phrase whole leaves no gap behind a chime. `0` starts on the first chunk |
-| `cache_retention_days` | `90` | Days a rendered clip survives in `TTS_CACHE_DIR` without being played, counted from the last time it was. Also what clears out clips an earlier version wrote as WAVs. Any value below `1` keeps them forever; clips left there by hand are never reaped |
+| `cache_retention_days` | `90` | Days anything in `SPEECH_DIR/cache` survives without being played, counted from the last time it was. Also what clears out clips an earlier version wrote as WAVs, and `.partial` files orphaned by a process killed mid-write. Any value below `1` keeps them forever. Chimes live elsewhere and are never reaped |
 
 ### `credits`
 
@@ -582,7 +588,7 @@ Only used by tools that answer out loud. A deployment with no such tool enabled 
 | `TTS_PORT` | `10200` | Wyoming's conventional TTS port |
 | `TTS_VOICE` | — | Voice to ask for. Empty takes whatever the synthesizer considers its default, so a server with one voice loaded needs no setting |
 | `PLAYBACK_VOLUME` | `1.0` | Scales everything played into a channel, chime included. `1.0` is however loud the synthesizer rendered it, `0.8` is 20% quieter, `1.2` is 20% louder and clipped rather than wrapped. Any value below `0` is treated as silence |
-| `TTS_CACHE_DIR` | `/cache/tts` | Rendered speech, as Ogg Opus, and the only place it is kept. Mount a writable volume here; without one every phrase is synthesized again every time it is said |
+| `SPEECH_DIR` | `/speech` | Audio on disk, as one root with a directory per kind. `cache/` is rendered speech as Ogg Opus, written and reaped by the bot, and the only place it is kept — mount a writable volume here, since without one every phrase is synthesized again every time it is said. `chimes/` is where you put a WAV by hand |
 
 ### Quotes
 
@@ -647,7 +653,7 @@ Removed outright: the multiprocessing layer and its queues, the STT health-check
 
 Kept intact because they are the non-obvious part: `stt/user_state.py`'s per-user VAD state machine with stale-speech flushing, and `audio/ring_buffer.py`'s pre-roll buffer, which is what stops the first syllable being clipped.
 
-Added: `AUTOJOIN`, `TRANSCRIPT_DIR`, `TZ`, `WYOMING_HOST`, `WYOMING_PORT`, `MAX_CONCURRENT_TRANSCRIPTIONS`, `PLAYBACK_VOLUME`, `CREDITS_FILE`, `QUOTES_FILE`, `TTS_HOST`, `TTS_PORT`, `TTS_VOICE`, and `TTS_CACHE_DIR`, along with the whole of `config.yaml` — the servers the bot may join, the tools each of them elects into, and the `settings:` block everything above is tuned from.
+Added: `AUTOJOIN`, `TRANSCRIPT_DIR`, `TZ`, `WYOMING_HOST`, `WYOMING_PORT`, `MAX_CONCURRENT_TRANSCRIPTIONS`, `PLAYBACK_VOLUME`, `CREDITS_FILE`, `QUOTES_FILE`, `TTS_HOST`, `TTS_PORT`, `TTS_VOICE`, and `SPEECH_DIR`, along with the whole of `config.yaml` — the servers the bot may join, the tools each of them elects into, and the `settings:` block everything above is tuned from.
 
 > **Note on the vendored VAD model.** Silero v5's ONNX graph scores the current frame *together with* the trailing 64 samples of the previous one. Fed a bare 512-sample frame it does not error — it silently returns near-zero probability on unmistakable speech, and the bot transcribes nothing. `stt/vad.py` carries that context between calls, and `tests/test_vad.py` guards it with real speech; silence-based tests pass either way and will not catch a regression.
 
@@ -681,6 +687,7 @@ miss-quote/
 │       │   ├── resampler.py   # soxr, both directions
 │       │   ├── opus.py        # Encode to what Discord sends, and the Ogg it is kept in
 │       │   ├── gain.py        # Playback loudness
+│       │   ├── chimes.py      # Clips kept by hand, read out of SPEECH_DIR/chimes
 │       │   └── ring_buffer.py # Pre-speech context buffer
 │       ├── stt/
 │       │   ├── vad.py         # Silero VAD via onnxruntime
@@ -704,7 +711,7 @@ miss-quote/
 │       │   └── writer.py      # Per-session JSONL appender + retention
 │       ├── tts/
 │       │   ├── client.py      # Streaming Wyoming synthesis
-│       │   └── cache.py       # Render a phrase once, keep it encoded on disk
+│       │   └── cache.py       # Render a phrase once, keep it encoded in SPEECH_DIR/cache
 │       └── utils/
 │           ├── logging.py
 │           └── stems.py       # A stem and the endings it is said with

@@ -78,17 +78,21 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/app/src \
     TRANSCRIPT_DIR=/transcripts \
-    TTS_CACHE_DIR=/cache/tts \
+    SPEECH_DIR=/speech \
     CREDITS_FILE=/credits/credits.json \
     QUOTES_FILE=/app/src/miss_quote/resources/quotes.csv
 
-# The cache and the credits directory are created either way. Mounting a volume
-# over each is what makes rendered speech and the tally outlive the pod; without
-# one the bot re-synthesizes each phrase once per restart, which costs a delay
-# rather than a failure, and forgives every fine anybody has earned.
+# The speech directories and the credits directory are created either way.
+# Mounting a volume over each is what makes rendered speech and the tally
+# outlive the pod; without one the bot re-synthesizes each phrase once per
+# restart, which costs a delay rather than a failure, and forgives every fine
+# anybody has earned.
+#
+# Both subdirectories are made rather than just the root, so that a deployment
+# mounting one volume at /speech still has somewhere to put a chime by hand.
 RUN useradd --create-home --uid 1000 bot \
-    && mkdir -p /transcripts /cache/tts /credits \
-    && chown -R bot:bot /transcripts /cache /credits
+    && mkdir -p /transcripts /speech/cache /speech/chimes /credits \
+    && chown -R bot:bot /transcripts /speech /credits
 
 USER bot
 

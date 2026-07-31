@@ -1,7 +1,7 @@
 """
 Rendered speech, kept so a phrase is only ever synthesized once.
 
-One layer: Opus packets in an Ogg container under `TTS_CACHE_DIR`, one packet
+One layer: Opus packets in an Ogg container under `SPEECH_DIR/cache`, one packet
 per 20 ms, exactly as Discord takes them. About a tenth the size of the samples
 they came from, and playable, so you can hear what the bot actually said.
 
@@ -26,13 +26,12 @@ every phrase is synthesized again every time it is said, and `warm` declines to
 render anything at all rather than paying a synthesizer for audio that would be
 thrown away.
 
-The same directory also holds clips nobody synthesized — a chime a tool plays
-ahead of what it has to say — which `clip` serves by name, as samples. WAV only,
-and deliberately: those are hand-placed, they are chained into a clip that is
-being scaled anyway, and nothing in the image can decode anything else.
+Only rendered speech lives here. Clips nobody synthesized — a chime a tool plays
+ahead of what it has to say — are the operator's rather than this process's, and
+live in their own directory; see `audio.chimes`.
 
-Rendered speech is reaped at startup once it has gone unplayed for long enough;
-a clip somebody put there by hand never is. See `_reap`.
+Rendered speech is reaped at startup once it has gone unplayed for long enough.
+See `_reap`.
 
 A caller that can work out in advance what it will have to say can render it
 before it is needed with `warm`, which costs nothing for a phrase already held.
@@ -43,9 +42,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
-import re
 import struct
-import wave
 from collections.abc import AsyncIterator, Sequence
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -53,14 +50,18 @@ from pathlib import Path
 from discord.oggparse import OggError
 
 from miss_quote.audio import opus
-from miss_quote.audio.resampler import PlaybackResampler, to_mono
-from miss_quote.config import audio_cfg, tts_cfg
+from miss_quote.audio.resampler import PlaybackResampler
+from miss_quote.config import speech_cfg, tts_cfg
 from miss_quote.tts.client import SynthesisError, synthesize
 from miss_quote.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 CACHE_SUFFIX = ".opus"
+
+# What a clip is written as before it is whole. An orphan means a process killed
+# mid-write; the reaper collects it on the usual clock along with everything
+# else, since nothing will ever read it.
 PARTIAL_SUFFIX = ".partial"
 
 # How much audio is decoded per hop into a thread, for a clip being played
@@ -71,23 +72,8 @@ PARTIAL_SUFFIX = ".partial"
 DECODE_BATCH_MS = 100
 DECODE_BATCH_PACKETS = DECODE_BATCH_MS // opus.FRAME_MILLISECONDS
 
-# What rendered speech has been written as. Only the first is produced; the rest
-# are swept by the reaper so that upgrading does not leave a directory of files
-# nothing can read and nothing will delete.
-SUPERSEDED_SUFFIXES = (".wav",)
-REAPED_SUFFIXES = (CACHE_SUFFIX, *SUPERSEDED_SUFFIXES)
 KEY_SEPARATOR = "\n"
-BITS_PER_BYTE = 8
 BYTES_PER_KIB = 1024
-NOTHING = b""
-
-# Only for the hand-placed clips, which are the one thing here still read as
-# samples.
-WAVE_READ = "rb"
-
-# What a rendered clip is named, and so what the reaper is allowed to delete.
-KEY_LENGTH = len(hashlib.sha256().hexdigest())
-KEY_PATTERN = re.compile(rf"[0-9a-f]{{{KEY_LENGTH}}}")
 
 # Below this the reaper does nothing, so a mis-set variable cannot empty the
 # cache and 0 is a no-op rather than "delete everything".
@@ -139,9 +125,8 @@ class SpeechCache:
         self._retention_days = (
             tts_cfg.cache_retention_days if retention_days is None else retention_days
         )
-        self._clips: dict[str, bytes] = {}
         self._directory = self._prepare(
-            Path(tts_cfg.cache_directory if directory is None else directory)
+            Path(speech_cfg.cache_directory if directory is None else directory)
         )
 
         self._reap()
@@ -243,95 +228,6 @@ class SpeechCache:
             pass
 
         return True
-
-    # ── clips kept by hand ────────────────────────
-
-    def clip_path(self, name: str) -> Path | None:
-        """
-        Where a named clip lives, if it lives inside the cache directory.
-
-        Names arrive from configuration and are resolved against the directory
-        rather than taken at their word, so a setting cannot be pointed at an
-        arbitrary file on the host and have the bot read it out.
-        """
-        if self._directory is None:
-            return None
-
-        root = self._directory.resolve()
-        path = (root / name).resolve()
-
-        if not path.is_relative_to(root):
-            logger.error("Clip '%s' resolves outside %s; ignoring it.", name, root)
-            return None
-
-        return path
-
-    async def clip(self, name: str) -> bytes:
-        """
-        Playback-ready PCM for a WAV file kept in the cache directory.
-
-        For audio the synthesizer had no part in. Held apart from rendered
-        speech and never evicted: there are a handful of these, each was put
-        there deliberately, and one should not be dropped to make room for a
-        phrase somebody said once.
-
-        A clip that is missing or will not parse returns nothing playable
-        rather than raising. It is the opening flourish; whatever it was going
-        to introduce is the part that matters.
-        """
-        remembered = self._clips.get(name)
-        if remembered is not None:
-            return remembered
-
-        path = self.clip_path(name)
-        if path is None or not path.is_file():
-            logger.error("No clip at '%s'; carrying on without it.", path or name)
-            return NOTHING
-
-        try:
-            rate, pcm = await asyncio.to_thread(self._read_clip, path)
-        except (OSError, wave.Error) as exc:
-            logger.error("Ignoring unplayable clip %s: %s", path, exc)
-            return NOTHING
-
-        playback = self._to_playback(rate, pcm)
-        self._clips[name] = playback
-        return playback
-
-    @staticmethod
-    def _to_playback(rate: int, pcm: bytes) -> bytes:
-        """
-        One hand-placed clip at the rate and width the player takes.
-
-        Only clips come through here. Rendered speech is stored as Discord takes
-        it and never needs converting, but a WAV somebody dropped in the
-        directory is whatever they authored it as.
-        """
-        resampler = PlaybackResampler(rate)
-
-        return resampler.feed(pcm) + resampler.flush()
-
-    @staticmethod
-    def _read_clip(path: Path) -> tuple[int, bytes]:
-        """
-        One WAV off disk as mono, whatever layout it was authored in.
-
-        Sample rate and channel count are the file's own business — soxr covers
-        the first and a downmix the second — but sample width is not. Anything
-        other than int16 is a different format rather than a different
-        arrangement of this one, and is refused with a line saying so instead
-        of played as noise.
-        """
-        with wave.open(str(path), WAVE_READ) as handle:
-            width = handle.getsampwidth()
-            if width != audio_cfg.sample_width:
-                raise wave.Error(
-                    f"{width * BITS_PER_BYTE}-bit audio, but only "
-                    f"{audio_cfg.sample_width * BITS_PER_BYTE}-bit can be played"
-                )
-
-            frames = handle.readframes(handle.getnframes())
-            return handle.getframerate(), to_mono(frames, handle.getnchannels())
 
     # ── synthesis ─────────────────────────────────
 
@@ -435,21 +331,22 @@ class SpeechCache:
 
     def _reap(self) -> list[Path]:
         """
-        Delete rendered speech nothing has played in a long while.
+        Delete anything in the cache nothing has played in a long while.
 
         The cache is a directory that only grows: a display name goes into the
         key, so every person who has ever been announced leaves a file behind
         and none of them are ever asked for again once they leave the server.
 
-        Only rendered speech is reaped, and it is identified by name — a clip
-        this cache wrote is a hex digest, which nothing an operator would type
-        looks like. A chime is safe because it is called `chime.wav`, and safe
-        again because the scan does not descend into subdirectories.
+        Everything in the directory is fair game, because everything in it is
+        this cache's. There is no hand-placed clip to spare any more — those
+        live in `audio.chimes` — so a file here is either a clip this process
+        wrote, one an earlier version wrote in a format nothing can read now, or
+        a `.partial` orphaned by a process killed mid-write. All three want the
+        same thing, which is to be gone.
 
-        The suffix a clip was written with is swept too, so that a directory
-        filled by a version that stored WAVs empties on the usual clock instead
-        of holding files nothing will ever read again. A hand-placed clip is
-        still safe: `chime.wav` is not a digest whatever it is named.
+        Subdirectories are left alone. The scan does not descend into them and
+        does not remove them, so a directory an operator makes here is a
+        directory they still have.
 
         Age is the mtime, where a transcript is aged by its filename: what
         matters here is when a clip was last wanted rather than when it was
@@ -460,14 +357,9 @@ class SpeechCache:
 
         cutoff = datetime.now() - timedelta(days=self._retention_days)
         reaped: list[Path] = []
-        rendered = (
-            path
-            for suffix in REAPED_SUFFIXES
-            for path in self._directory.glob(f"*{suffix}")
-        )
 
-        for path in rendered:
-            if not KEY_PATTERN.fullmatch(path.stem):
+        for path in self._directory.iterdir():
+            if not path.is_file():
                 continue
 
             try:

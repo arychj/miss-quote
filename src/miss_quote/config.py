@@ -356,6 +356,41 @@ class STTConfig:
 
 
 # ──────────────────────────────────────────────
+# Speech on disk
+# ──────────────────────────────────────────────
+SPEECH_CACHE_SUBDIR = "cache"
+SPEECH_CHIMES_SUBDIR = "chimes"
+
+
+@dataclass(frozen=True)
+class SpeechConfig:
+    """
+    Where audio lives, under one root with a directory per kind.
+
+    Two directories that mean two different things. `cache` is written by this
+    process and reaped by it — every file in it is a rendered phrase named for
+    its own digest. `chimes` is written by hand and never touched: a handful of
+    clips somebody put there deliberately, which no retention clock should ever
+    have an opinion about.
+
+    Derived rather than configured separately so that a deployment mounts one
+    volume and gets both, and so the layout inside it is the same everywhere.
+    """
+
+    directory: Path = field(
+        default_factory=lambda: Path(_env_str("SPEECH_DIR", "/speech"))
+    )
+
+    @property
+    def cache_directory(self) -> Path:
+        return self.directory / SPEECH_CACHE_SUBDIR
+
+    @property
+    def chime_directory(self) -> Path:
+        return self.directory / SPEECH_CHIMES_SUBDIR
+
+
+# ──────────────────────────────────────────────
 # TTS  (Wyoming)
 # ──────────────────────────────────────────────
 @dataclass(frozen=True)
@@ -398,17 +433,9 @@ class TTSConfig:
         default_factory=lambda: file_cfg.setting(TTS_SECTION, LEAD_MS_KEY, 500.0)
     )
 
-    # Rendered speech, kept so a phrase is only ever synthesized once. The only
-    # place it is kept: an unwritable or unset directory means every phrase is
-    # synthesized again every time it is said.
-    cache_directory: Path = field(
-        default_factory=lambda: Path(_env_str("TTS_CACHE_DIR", "/cache/tts"))
-    )
-
     # How long a rendered clip survives on disk without being played. Aged by
     # mtime, which the cache refreshes on every hit, so a phrase still in use
-    # stays whatever its age. Any value below 1 disables the reaper. Clips left
-    # in the directory by hand are never reaped, whatever this says.
+    # stays whatever its age. Any value below 1 disables the reaper.
     cache_retention_days: int = field(
         default_factory=lambda: file_cfg.setting(
             TTS_SECTION, CACHE_RETENTION_DAYS_KEY, 90
@@ -910,6 +937,7 @@ file_cfg = FileConfig.load()
 
 discord_cfg = DiscordConfig()
 audio_cfg = AudioConfig()
+speech_cfg = SpeechConfig()
 vad_cfg = VADConfig()
 stt_cfg = STTConfig()
 tts_cfg = TTSConfig()
