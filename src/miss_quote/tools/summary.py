@@ -105,14 +105,13 @@ NEVER = 0.0
 DEFAULT_PREAMBLE = "Sure! Let me go look at my notes."
 DEFAULT_EMPTY = "I don't have any notes from this channel yet."
 
-# What is said once the story is told. A retelling runs to a minute or more and
-# ends wherever the model decided to end it, so a channel that has been listening
-# has no way to tell "finished" from "stopped". A fixed line does, and being
-# fixed it is rendered at startup and plays the instant the words run out.
-#
-# It is not a summary of anything, so it is the same sentence every time on
-# purpose: what carries the meaning is that the channel has heard it before.
-DEFAULT_CLOSING = "I wonder what'll happen tonight?"
+# What is said once the story is told, for a channel that asks for one. A
+# retelling runs to a minute or more and ends wherever the model decided to end
+# it, so a channel that has been listening needs something that tells "finished"
+# from "stopped" — but the retelling prompt already ends the story itself, and a
+# fixed sentence after one that has just said goodbye is one goodbye too many.
+# Unset, so a channel that wants the second one writes it.
+NO_CLOSING = ""
 
 # What the bot answers to. Several spellings because none of them is what an ASR
 # will necessarily have written down: a name it has never been told is guessed
@@ -262,10 +261,13 @@ class Summary(Tool):
             )
             return
 
+        # A channel that asked for no closing has nothing to render for it, and
+        # an empty phrase is a synthesizer round trip for silence.
         wordings = [
             wording
             for monitored in self._monitored.values()
             for wording in (monitored.preamble, monitored.empty, monitored.closing)
+            if wording
         ]
 
         logger.info(
@@ -464,10 +466,11 @@ class Summary(Tool):
         # nobody will ever ask for those exact words again. See `SpeechCache.stream`.
         await speech.play(source, retelling, keep=False)
 
-        # And a fixed line to say it is over. A retelling runs to a minute and
-        # ends wherever the model chose to; without this the channel cannot tell
-        # a finished story from one that stopped.
-        await speech.play(source, monitored.closing)
+        # And a fixed line after it, for a channel that asked for one. The prompt
+        # is what ordinarily says the story is over; this is for a server that
+        # would rather hear the same sentence every time.
+        if monitored.closing:
+            await speech.play(source, monitored.closing)
 
     async def _retell(self, summary: str, monitored: Monitored) -> str:
         """One stored summary, as something to say rather than something to read."""
@@ -571,7 +574,7 @@ def _channel(
         ),
         preamble=str(raw.get(PREAMBLE_KEY) or DEFAULT_PREAMBLE),
         empty=str(raw.get(EMPTY_KEY) or DEFAULT_EMPTY),
-        closing=str(raw.get(CLOSING_KEY) or DEFAULT_CLOSING),
+        closing=str(raw.get(CLOSING_KEY) or NO_CLOSING),
         address=pattern(_spoken(NAME_KEY, raw.get(NAME_KEY), DEFAULT_NAME)),
         triggers=pattern(_spoken(TRIGGERS_KEY, raw.get(TRIGGERS_KEY), DEFAULT_TRIGGERS)),
     )
