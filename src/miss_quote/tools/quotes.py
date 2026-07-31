@@ -43,6 +43,10 @@ itself, and a round that pays somebody without saying so reads as having missed
 them. Announcements wait their turn on the speaker and come out in the order they
 were earned.
 
+The saying is the server's `tts` tool, which owns the words and the voice
+connection; this one decides what they are. A server with no `tts` still runs its
+rounds and still pays them, silently, and is told so at startup.
+
 Because both the triggers and the lines are a closed set known before anybody
 speaks, the whole list can be rendered at startup rather than while the channel
 waits for it, and so can both wordings for everybody on the roster. See `prewarm`.
@@ -62,8 +66,8 @@ from typing import Any, TypeVar
 from miss_quote.config import quotes_cfg, scoreboard_cfg
 from miss_quote.tools.base import Tool, ToolContext
 from miss_quote.tools.scoreboard import Scoreboard
+from miss_quote.tools.tts import Tts
 from miss_quote.transcript.writer import TranscriptSession, Utterance
-from miss_quote.tts.cache import shared_cache
 from miss_quote.utils.logging import get_logger
 from miss_quote.utils.stems import plural
 
@@ -425,6 +429,7 @@ class Quotes(Tool):
     """Answers a trigger phrase with the film line it belongs to."""
 
     name = "quotes"
+    requires = (Scoreboard, Tts)
 
     def __init__(self, context: ToolContext) -> None:
         super().__init__(context)
@@ -432,7 +437,6 @@ class Quotes(Tool):
         config = self.config
         self._quotes = _load(quotes_cfg.file)
         self._triggers = _pattern(self._quotes)
-        self._speech = shared_cache()
         self._recent = RecentQuotes()
         self._window = _seconds(
             ANSWER_SECONDS_KEY, config.get(ANSWER_SECONDS_KEY), DEFAULT_ANSWER_SECONDS
@@ -488,10 +492,12 @@ class Quotes(Tool):
         somebody says it, so warming any less than all of them would leave the
         channel waiting on a coin toss.
 
-        Serial, and unhurried. Nothing is waiting on this, and a synthesizer
-        asked for fifty phrases at once is one not answering whoever is speaking
-        right now.
+        Handed over as a list rather than rendered here. What it costs to say
+        something is the speaking tool's business, and it is the one that knows
+        what has already been said.
         """
+        speech = self._tts()
+
         if self._asking() and self._scoreboard() is None:
             # The first moment at which every tool on the server exists, so the
             # first at which the absence of one means anything.
@@ -502,6 +508,15 @@ class Quotes(Tool):
                 self.server,
                 ANSWER_SECONDS_KEY,
             )
+
+        if speech is None:
+            logger.warning(
+                "[%s] No '%s' tool is enabled, so quotes will be recognised and not "
+                "said. Enable it to answer out loud.",
+                self.server,
+                Tts.name,
+            )
+            return
 
         names = sorted(set(self.users.values()))
         wordings = [
@@ -514,20 +529,13 @@ class Quotes(Tool):
         if self._asking():
             wordings += [saying for name in names for saying in self._sayings(name)]
 
-        rendered = 0
-        for wording in wordings:
-            if await self._speech.warm(wording):
-                rendered += 1
-
         logger.info(
-            "[%s] Pre-warmed %d phrase(s) for %d quote(s) and %d speaker(s): "
-            "%d rendered, %d already cached.",
+            "[%s] Queued %d phrase(s) for %d quote(s) and %d speaker(s) to be "
+            "rendered in advance.",
             self.server,
-            len(wordings),
+            speech.enqueue(wordings),
             _counted(self._quotes),
             len(names),
-            rendered,
-            len(wordings) - rendered,
         )
 
     @staticmethod
@@ -583,7 +591,7 @@ class Quotes(Tool):
             wording,
         )
 
-        await self.speaker.play(session.source, self._speech.stream(wording))
+        await self._say(session, wording)
         self._ask(quote, utterance.user_id)
 
     # ── the round ─────────────────────────────────
@@ -620,11 +628,6 @@ class Quotes(Tool):
         """
         Settle up with whoever named a title, saying whether that is what this was.
 
-        Announced with no chime in front of it. A fine opens with one because it
-        interrupts a conversation that was about something else; this answers a
-        question the channel is already sitting in, and a flourish ahead of it
-        would be announcing what everybody is waiting for.
-
         Nothing here is dropped for arriving while something else is playing,
         which is what a fine does. A fine interrupts a conversation that was
         about something else, so a backlog of them is a channel being read
@@ -652,12 +655,38 @@ class Quotes(Tool):
             standing,
         )
 
-        await self.speaker.play(
-            session.source,
-            self._speech.stream(self._wording(utterance.user, answer.wording)),
-        )
+        await self._say(session, self._wording(utterance.user, answer.wording))
 
         return True
+
+    def _tts(self) -> Tts | None:
+        """
+        The tool that says things out loud, if the server has one.
+
+        Looked for on the way past rather than held, on the same terms as the
+        scoreboard: a tool's neighbours are only all built once every one of
+        them is; see `Toolbox`.
+        """
+        return self.tools.find(Tts)
+
+    async def _say(self, session: TranscriptSession, wording: str) -> None:
+        """
+        Put one line where it was earned, if the server has anything to say it
+        with.
+
+        No chime in front of it, ever. A fine opens with one because it
+        interrupts a conversation that was about something else; everything here
+        answers a question the channel is already sitting in, and a flourish
+        ahead of it would be announcing what everybody is waiting for.
+
+        A server with no speaking tool has already been told so at startup, so
+        this is silent rather than a line per quote.
+        """
+        speech = self._tts()
+        if speech is None:
+            return
+
+        await speech.play(session.source, wording)
 
     def _wording(
         self, user: str, key: str = ANNOUNCEMENT_KEY, remark: str | None = None

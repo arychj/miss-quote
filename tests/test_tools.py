@@ -124,6 +124,7 @@ class Neighbourly(Recorder):
     """A tool that reaches for another one when something is said."""
 
     name = "neighbourly"
+    requires = (Serving, Inert)
 
     def __init__(self, context):
         super().__init__(context)
@@ -132,6 +133,31 @@ class Neighbourly(Recorder):
     async def handle_utterance(self, utterance, session) -> None:
         await super().handle_utterance(utterance, session)
         self.found.append(self.tools.find(Serving))
+
+
+class Presumptuous(Recorder):
+    """A tool that reaches for one it never said it wanted."""
+
+    name = "presumptuous"
+
+    async def handle_utterance(self, utterance, session) -> None:
+        await super().handle_utterance(utterance, session)
+        self.found = self.tools.find(Serving)
+
+
+class Chicken(Recorder):
+    name = "chicken"
+
+
+class Egg(Recorder):
+    name = "egg"
+
+
+# Settled after both exist, because each names the other and no single pass
+# through a module can do that. A real pair would be two imports pointing at
+# each other, which is the thing worth catching.
+Chicken.requires = (Egg,)
+Egg.requires = (Chicken,)
 
 
 class Exploding(Tool):
@@ -664,6 +690,79 @@ async def test_a_tool_that_can_never_run_is_not_reachable():
     tool = _only_tool(runner, FIRST_SERVER, "_on_utterance")
 
     assert tool.tools.find(Inert) is None
+
+
+async def test_a_tool_reaching_for_what_it_never_declared_is_refused(caplog):
+    """A declaration nothing enforces is one the cycle check reads and gets wrong."""
+    registry = {Presumptuous.name: Presumptuous, Serving.name: Serving}
+    runner = ToolRunner(
+        _servers(first={Presumptuous.name: _enabled(), Serving.name: _enabled()}),
+        registry,
+    )
+    tool = _only_tool(runner, FIRST_SERVER, "_on_utterance")
+
+    await runner.dispatch_utterance(FakeSession(FIRST_SOURCE), _utterance())
+
+    assert tool.found is None
+    assert "without declaring it" in caplog.text
+
+
+# ── tools that require each other ─────────────────
+
+
+def _circular() -> ToolRunner:
+    return ToolRunner(
+        _servers(first={Chicken.name: _enabled(), Egg.name: _enabled()}),
+        {Chicken.name: Chicken, Egg.name: Egg},
+    )
+
+
+async def test_a_circle_of_tools_is_reported():
+    problems = _circular().problems
+
+    assert len(problems) == 1
+    assert "circle" in problems[0]
+
+
+async def test_a_circle_names_every_tool_in_it():
+    (problem,) = _circular().problems
+
+    assert Chicken.name in problem
+    assert Egg.name in problem
+
+
+async def test_nothing_in_a_circle_is_built():
+    """A server that starts and then wedges is a worse way to find out."""
+    runner = _circular()
+
+    assert runner.describe() == {}
+
+
+async def test_a_tool_outside_a_circle_is_still_built():
+    """One bad pair should not take the rest of the server down with it."""
+    registry = {Chicken.name: Chicken, Egg.name: Egg, Serving.name: Serving}
+    runner = ToolRunner(
+        _servers(
+            first={
+                Chicken.name: _enabled(),
+                Egg.name: _enabled(),
+                Serving.name: _enabled(),
+            }
+        ),
+        registry,
+    )
+
+    assert runner.describe() == {FIRST_ALIAS: (Serving.name,)}
+
+
+async def test_a_circle_nobody_enabled_is_not_a_circle():
+    """An edge pointing at a tool the server left off reaches nothing to call."""
+    runner = ToolRunner(
+        _servers(first={Chicken.name: _enabled()}), {Chicken.name: Chicken}
+    )
+
+    assert runner.problems == []
+    assert runner.describe() == {FIRST_ALIAS: (Chicken.name,)}
 
 
 async def test_closing_stops_a_running_tool_first():

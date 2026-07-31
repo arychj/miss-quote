@@ -37,14 +37,16 @@ services have been cancelled, for whatever has to outlive the process. Neither i
 a moment: a tool defining only these handles nothing, and is still reported as
 inert.
 
-A tool is handed a `Speaker`, which is how it answers out loud, and a `Topic`,
-which is how it puts one line where the channel can read it. Nothing in this
-package imports discord: a speaker is somewhere to play audio and a topic is
-somewhere to put a line, and the bot supplies both against a voice channel.
+A tool is handed a `Topic`, which is how it puts one line where the channel can
+read it. Nothing in this package imports discord: a topic is somewhere to put a
+line, and the bot supplies one against a voice channel. A `Speaker` — somewhere
+to play audio — is handed over on the same terms, but only the tool that owns
+playback reads it; everything else answers out loud by asking that tool.
 
 It is also handed a `Toolbox` — the other tools its server has enabled — so that
-the tool which counts something and the tool which hears it can be two tools. See
-`Toolbox` for when to look in it.
+the tool which counts something and the tool which hears it can be two tools. A
+tool says which of its neighbours it uses in `requires`, and the box it is given
+serves those and nothing else. See `Toolbox` for when to look in it.
 """
 
 from __future__ import annotations
@@ -85,9 +87,10 @@ class SilentSpeaker:
     """
     A speaker with nowhere to play.
 
-    The runner's default, so a tool always has one and never has to check. The
-    audio is left unconsumed rather than drained: on a cache miss, draining it
-    would pay a synthesizer to render something nobody can hear.
+    The runner's default, so the tool that plays audio always has one and never
+    has to check. The audio is left unconsumed rather than drained: on a cache
+    miss, draining it would pay a synthesizer to render something nobody can
+    hear.
     """
 
     async def play(
@@ -145,21 +148,105 @@ class Toolbox:
     Lookup is by class rather than by name, so what a tool depends on is an
     import a reader can follow and a checker can see, rather than a string that
     has to go on matching a registry entry.
+
+    What each tool is given is a `view` of the box bound to its own class, which
+    serves only what that class declared in `requires`. The declaration is what
+    the cycle check reads, and a declaration nothing enforces is one that drifts
+    away from the call sites it is supposed to describe — at which point the
+    check is reading a graph the process does not have.
     """
 
-    def __init__(self, tools: Iterable[Tool] = ()) -> None:
+    def __init__(
+        self, tools: Iterable[Tool] = (), owner: type[Tool] | None = None
+    ) -> None:
         self._tools: list[Tool] = list(tools)
+        self._owner = owner
+
+    def view(self, owner: type[Tool]) -> Toolbox:
+        """
+        The same box, answering only what one tool said it uses.
+
+        The list is shared rather than copied. A box is filled as its server's
+        tools are built, and a view taken at construction would otherwise hold
+        whatever had been built by then — which for the first tool is nothing.
+        """
+        bound = Toolbox(owner=owner)
+        bound._tools = self._tools
+
+        return bound
 
     def add(self, tool: Tool) -> None:
         self._tools.append(tool)
 
     def find(self, kind: type[Found]) -> Found | None:
-        """The server's instance of one kind of tool, or None if it has none."""
+        """
+        The server's instance of one kind of tool, or None if it has none.
+
+        None is also what an undeclared kind gets, with a line saying so: a tool
+        reaching for a neighbour it never said it wanted is a `requires` that has
+        gone stale, and serving it would leave the startup cycle check walking a
+        graph that is missing an edge.
+        """
+        if self._owner is not None and kind not in self._owner.requires:
+            logger.error(
+                "Tool '%s' asked for %s without declaring it in 'requires'; "
+                "refusing to serve it.",
+                self._owner.name,
+                kind.__name__,
+            )
+            return None
+
         for tool in self._tools:
             if isinstance(tool, kind):
                 return tool
 
         return None
+
+
+def cycles(classes: Iterable[type[Tool]]) -> list[tuple[type[Tool], ...]]:
+    """
+    Every circle of tools that require each other, among the ones given.
+
+    A tool resolves its neighbours through the box and calls them, so a circle is
+    a stack that does not end. It is worth finding at startup, where it is a line
+    in the report, rather than at the moment somebody speaks, where it is the
+    process.
+
+    Only the classes handed over are walked. An edge pointing at a tool the
+    server did not enable is not a cycle: nothing is in the box to be called, and
+    the tool that reaches for it gets the same None it would get anyway.
+
+    Each circle comes back once, starting from whichever of its members was
+    reached first, so a report names a cycle rather than one per tool in it.
+    Walked in the order the classes were given, so two runs of the same
+    configuration report the same thing.
+    """
+    ordered = list(dict.fromkeys(classes))
+    enabled = set(ordered)
+    found: list[tuple[type[Tool], ...]] = []
+    walked: set[type[Tool]] = set()
+
+    def walk(tool: type[Tool], path: list[type[Tool]]) -> None:
+        if tool in path:
+            found.append(tuple(path[path.index(tool) :]))
+            return
+
+        if tool in walked:
+            return
+
+        for required in tool.requires:
+            if required in enabled:
+                walk(required, [*path, tool])
+
+        # Marked once the whole of it has been walked, so a tool reached again
+        # by another route is skipped rather than re-reporting a circle behind
+        # it, and a tool still on the path is not mistaken for a finished one.
+        walked.add(tool)
+
+    for tool in ordered:
+        walk(tool, [])
+
+    return found
 
 
 @dataclass(frozen=True)
@@ -172,6 +259,10 @@ class ToolContext:
     should not have to name them all to reach the one it does. Everything except
     the server has a default that does nothing, so a test can build a tool from
     the part it is about.
+
+    `speaker` is carried for every tool and read by one. It is somewhere to play
+    audio, which is the business of whichever tool owns playback; the rest reach
+    that tool through `tools` and never touch this.
     """
 
     server: str
@@ -196,14 +287,24 @@ class Tool:
     speak before anybody does; it is empty for a server that has not written one,
     and it never covers everybody, since a speaker who is not on it is known by
     whatever Discord reports.
+
+    `requires` is the other tools this one calls, as classes. It is what the box
+    a tool is given will serve and the only thing the startup cycle check has to
+    read, so a neighbour that is used and not declared is refused rather than
+    quietly handed over. Declaring one does not make it present: a server is free
+    to enable this tool and not that one, and the lookup still comes back None.
+
+    There is no `speaker` here. Playing audio is one tool's job and everything
+    else asks it, so a tool that has nothing to say never holds the thing that
+    would let it.
     """
 
     name: str = ""
+    requires: tuple[type[Tool], ...] = ()
 
     def __init__(self, context: ToolContext) -> None:
         self.server = context.server
         self.config = context.config
-        self.speaker = context.speaker
         self.users = context.users
         self.tools = context.tools
         self.topic = context.topic

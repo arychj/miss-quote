@@ -10,7 +10,12 @@ Every tool a server has elected into shares one `Toolbox`, which is what lets on
 of them call another. The box is handed over at construction and filled as each
 tool is built, so it is complete by the time anything is dispatched and only
 partly filled while the building is going on — which is why a tool looks in it
-when it needs something rather than when it is made.
+when it needs something rather than when it is made. What each tool is given is
+its own view of that box, serving what its class declared in `requires`.
+
+Those declarations are walked before anything is built, because a tool that
+requires another which requires it back is a stack that does not end. Found here
+it is a line in the startup report; found later it is the process.
 """
 
 from __future__ import annotations
@@ -32,6 +37,7 @@ from miss_quote.tools.base import (
     Topic,
     UtteranceHandler,
     Warmer,
+    cycles,
 )
 from miss_quote.tools.registry import TOOLS
 from miss_quote.transcript.writer import Transcript, TranscriptSession, Utterance
@@ -44,6 +50,8 @@ FINISHED_MOMENT = "a finished transcript"
 PREWARM_MOMENT = "a pre-warm"
 SERVICE_MOMENT = "a run of its own"
 CLOSE_MOMENT = "a shutdown"
+
+CYCLE_ARROW = " → "
 
 
 class ToolRunner:
@@ -86,9 +94,56 @@ class ToolRunner:
 
         The box is what a tool reaches its neighbours through, so it is made
         before any of them and handed to every one of them — including the ones
-        built before whatever they will eventually go looking for.
+        built before whatever they will eventually go looking for. Each gets its
+        own view of it, which serves only what that tool's class declared.
+
+        Tools caught in a circle are left unbuilt. The alternative is a server
+        that starts and then hangs the first time one of them calls the other,
+        which is a worse way to find out and a harder one to read.
         """
         toolbox = Toolbox()
+        wanted = self._enabled_classes(server, registry)
+        circular = self._circular(server.alias, wanted)
+
+        for name, tool_class in wanted.items():
+            if name in circular:
+                continue
+
+            settings = server.tools[name]
+
+            try:
+                tool = tool_class(
+                    ToolContext(
+                        server=server.alias,
+                        config=settings.config,
+                        speaker=self._speaker,
+                        users=server.users,
+                        tools=toolbox.view(tool_class),
+                        topic=self._topic,
+                    )
+                )
+            except Exception as exc:
+                self.problems.append(
+                    f"Server '{server.alias}': tool '{name}' would not start: {exc}"
+                )
+                continue
+
+            if self._place(server_id, server.alias, name, tool):
+                toolbox.add(tool)
+
+    def _enabled_classes(
+        self, server: ServerConfig, registry: Mapping[str, type[Tool]]
+    ) -> dict[str, type[Tool]]:
+        """
+        The classes behind the names one server switched on, in the order it
+        listed them.
+
+        Resolved before any of them is built, because the cycle check reads
+        classes and it has to read all of them at once. A name nothing answers to
+        is reported here rather than where the building happens, so it is
+        reported once.
+        """
+        wanted: dict[str, type[Tool]] = {}
 
         for name, settings in server.tools.items():
             if not settings.enabled:
@@ -101,25 +156,30 @@ class ToolRunner:
                 )
                 continue
 
-            try:
-                tool = tool_class(
-                    ToolContext(
-                        server=server.alias,
-                        config=settings.config,
-                        speaker=self._speaker,
-                        users=server.users,
-                        tools=toolbox,
-                        topic=self._topic,
-                    )
-                )
-            except Exception as exc:
-                self.problems.append(
-                    f"Server '{server.alias}': tool '{name}' would not start: {exc}"
-                )
-                continue
+            wanted[name] = tool_class
 
-            if self._place(server_id, server.alias, name, tool):
-                toolbox.add(tool)
+        return wanted
+
+    def _circular(self, alias: str, wanted: Mapping[str, type[Tool]]) -> set[str]:
+        """
+        The names of the tools caught in a circle, reporting each circle once.
+
+        A circle is named in the order it was walked and closed back to where it
+        started, so the line reads as the call that would not have returned.
+        """
+        circular: set[str] = set()
+
+        for circle in cycles(wanted.values()):
+            named = [tool.name for tool in circle]
+            circular.update(named)
+
+            self.problems.append(
+                f"Server '{alias}': tools "
+                f"{CYCLE_ARROW.join([*named, named[0]])} require each other in a "
+                "circle; none of them will be built."
+            )
+
+        return circular
 
     def _place(self, server_id: int, alias: str, name: str, tool: Tool) -> bool:
         """

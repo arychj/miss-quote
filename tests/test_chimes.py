@@ -5,11 +5,13 @@ import wave
 import numpy as np
 import pytest
 
-from miss_quote.audio.chimes import ChimeLibrary
+from miss_quote.audio.chimes import CHIME_SUFFIX, ChimeLibrary
 from miss_quote.config import audio_cfg
 from miss_quote.tts.cache import SpeechCache
 
-CLIP_NAME = "chime.wav"
+# The name a config file holds, and the file it resolves to.
+CLIP_NAME = "chime"
+CLIP_FILE = f"{CLIP_NAME}{CHIME_SUFFIX}"
 STEREO_CHANNELS = 2
 EIGHT_BIT_WIDTH = 1
 PLAYBACK_BYTES_PER_FRAME = audio_cfg.playback_channels * audio_cfg.sample_width
@@ -68,7 +70,7 @@ def _largest_difference(first: bytes, second: bytes) -> int:
 
 
 async def test_a_clip_is_read_and_made_playable(tmp_path):
-    _write_clip(tmp_path / CLIP_NAME)
+    _write_clip(tmp_path / CLIP_FILE)
 
     playback = await ChimeLibrary(directory=tmp_path).clip(CLIP_NAME)
 
@@ -77,7 +79,7 @@ async def test_a_clip_is_read_and_made_playable(tmp_path):
 
 
 async def test_a_clip_is_read_off_disk_only_once(tmp_path):
-    path = tmp_path / CLIP_NAME
+    path = tmp_path / CLIP_FILE
     _write_clip(path)
     chimes = ChimeLibrary(directory=tmp_path)
 
@@ -90,25 +92,42 @@ async def test_a_clip_is_read_off_disk_only_once(tmp_path):
 
 async def test_a_stereo_clip_is_folded_down(tmp_path):
     """Discord wants stereo, but the playback path widens mono to get there."""
-    _write_clip(tmp_path / CLIP_NAME)
+    _write_clip(tmp_path / CLIP_FILE)
     mono = await ChimeLibrary(directory=tmp_path).clip(CLIP_NAME)
 
-    _write_clip(tmp_path / CLIP_NAME, channels=STEREO_CHANNELS)
+    _write_clip(tmp_path / CLIP_FILE, channels=STEREO_CHANNELS)
     stereo = await ChimeLibrary(directory=tmp_path).clip(CLIP_NAME)
 
     assert _largest_difference(mono, stereo) <= FILTER_TOLERANCE
 
 
 async def test_a_clip_already_at_the_playback_rate_is_not_resampled(tmp_path):
-    source = _write_clip(tmp_path / CLIP_NAME, rate=audio_cfg.playback_sample_rate)
+    source = _write_clip(tmp_path / CLIP_FILE, rate=audio_cfg.playback_sample_rate)
 
     playback = await ChimeLibrary(directory=tmp_path).clip(CLIP_NAME)
 
     assert len(playback) == len(source) * audio_cfg.playback_channels
 
 
+async def test_a_name_does_not_carry_its_extension(tmp_path):
+    """One format, so the suffix is the library's business and not a config file's."""
+    _write_clip(tmp_path / CLIP_FILE)
+
+    assert ChimeLibrary(directory=tmp_path).path(CLIP_NAME) == tmp_path / CLIP_FILE
+
+
+async def test_a_name_that_carries_its_extension_is_called_out(tmp_path, caplog):
+    """The old spelling; 'chime.wav.wav' reported as missing tells nobody anything."""
+    _write_clip(tmp_path / CLIP_FILE)
+
+    playback = await ChimeLibrary(directory=tmp_path).clip(CLIP_FILE)
+
+    assert playback == b""
+    assert "names its own extension" in caplog.text
+
+
 async def test_a_clip_may_live_in_a_subdirectory(tmp_path):
-    _write_clip(tmp_path / "fines" / CLIP_NAME)
+    _write_clip(tmp_path / "fines" / CLIP_FILE)
 
     playback = await ChimeLibrary(directory=tmp_path).clip(f"fines/{CLIP_NAME}")
 
@@ -134,7 +153,7 @@ async def test_a_missing_directory_is_a_missing_clip(tmp_path, caplog):
 
 
 async def test_a_clip_that_is_not_a_wav_plays_nothing(tmp_path, caplog):
-    (tmp_path / CLIP_NAME).write_bytes(b"ID3\x04\x00not actually a wav")
+    (tmp_path / CLIP_FILE).write_bytes(b"ID3\x04\x00not actually a wav")
 
     playback = await ChimeLibrary(directory=tmp_path).clip(CLIP_NAME)
 
@@ -143,7 +162,7 @@ async def test_a_clip_that_is_not_a_wav_plays_nothing(tmp_path, caplog):
 
 
 async def test_a_clip_that_is_not_16_bit_plays_nothing(tmp_path, caplog):
-    _write_clip(tmp_path / CLIP_NAME, width=EIGHT_BIT_WIDTH)
+    _write_clip(tmp_path / CLIP_FILE, width=EIGHT_BIT_WIDTH)
 
     playback = await ChimeLibrary(directory=tmp_path).clip(CLIP_NAME)
 
@@ -154,7 +173,7 @@ async def test_a_clip_that_is_not_16_bit_plays_nothing(tmp_path, caplog):
 async def test_a_clip_above_the_chime_directory_is_refused(tmp_path, caplog):
     """A name from configuration is not a licence to read the host."""
     elsewhere = tmp_path / "elsewhere"
-    _write_clip(elsewhere / CLIP_NAME)
+    _write_clip(elsewhere / CLIP_FILE)
     chimes = ChimeLibrary(directory=tmp_path / "chimes")
 
     playback = await chimes.clip(f"../elsewhere/{CLIP_NAME}")
@@ -165,7 +184,7 @@ async def test_a_clip_above_the_chime_directory_is_refused(tmp_path, caplog):
 
 async def test_an_absolute_clip_path_is_refused(tmp_path, caplog):
     elsewhere = tmp_path / "elsewhere"
-    _write_clip(elsewhere / CLIP_NAME)
+    _write_clip(elsewhere / CLIP_FILE)
     chimes = ChimeLibrary(directory=tmp_path / "chimes")
 
     playback = await chimes.clip(str(elsewhere / CLIP_NAME))
@@ -185,7 +204,7 @@ async def test_a_chime_outlives_the_speech_cache_reaper(tmp_path):
     because it is not in it, not because it is named something safe.
     """
     speech = tmp_path / "speech"
-    chime = speech / "chimes" / CLIP_NAME
+    chime = speech / "chimes" / CLIP_FILE
     _write_clip(chime)
 
     SpeechCache(directory=speech / "cache", retention_days=1)
