@@ -331,12 +331,12 @@ def test_the_completion_budget_and_the_summary_retention_are_settings(
         monkeypatch,
         tmp_path,
         "settings:\n"
-        "  llm:\n    timeout_seconds: 45\n    max_tokens: 256\n"
+        "  llm:\n    timeout_seconds: 45\n    max_output_tokens: 256\n"
         "  summaries:\n    retention_days: 365\n",
     )
 
     assert reloaded.llm_cfg.timeout_seconds == 45.0
-    assert reloaded.llm_cfg.max_tokens == 256
+    assert reloaded.llm_cfg.max_output_tokens == 256
     assert reloaded.llm_cfg.temperature == 0.7
     assert reloaded.summary_cfg.retention_days == 365
     assert reloaded.summary_cfg.retention_enabled
@@ -348,3 +348,32 @@ def test_summaries_are_kept_forever_unless_a_window_is_set(monkeypatch, tmp_path
 
     assert reloaded.summary_cfg.retention_days == -1
     assert not reloaded.summary_cfg.retention_enabled
+
+
+def test_thinking_is_left_on_unless_a_file_says_otherwise(monkeypatch, tmp_path) -> None:
+    """The only safe default: an ordinary model is not sent a field it never reads."""
+    assert _reload_without_settings(monkeypatch, tmp_path).llm_cfg.thinking
+
+
+def test_thinking_can_be_turned_off(monkeypatch, tmp_path) -> None:
+    reloaded = _reload_with_setting(monkeypatch, tmp_path, "llm", "thinking", "false")
+
+    assert reloaded.llm_cfg.thinking is False
+    assert reloaded.file_cfg.problems == ()
+
+
+def test_a_quoted_switch_is_read_as_what_it_says(monkeypatch, tmp_path) -> None:
+    """`bool("false")` is True, which is the opposite of what the file asked for."""
+    reloaded = _reload_with_setting(monkeypatch, tmp_path, "llm", "thinking", "'no'")
+
+    assert reloaded.llm_cfg.thinking is False
+    assert reloaded.file_cfg.problems == ()
+
+
+def test_a_switch_that_is_not_a_switch_falls_back_and_is_reported(
+    monkeypatch, tmp_path
+) -> None:
+    reloaded = _reload_with_setting(monkeypatch, tmp_path, "llm", "thinking", "maybe")
+
+    assert reloaded.llm_cfg.thinking is True
+    assert any("thinking" in problem for problem in reloaded.file_cfg.problems)

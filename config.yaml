@@ -126,10 +126,24 @@ settings:
     #
     # timeout_seconds: 120
 
-    # A ceiling on what comes back, so a model that will not stop cannot
-    # produce a summary longer than the conversation it came from.
+    # A ceiling on what is generated. Not the context window and not the whole
+    # request: the input is not counted against it.
     #
-    # max_tokens: 1024
+    # On a model that reasons before it answers, the reasoning is generated too
+    # and comes out of this. Run out mid-thought and the answer is never begun,
+    # which arrives as a 200 carrying nothing.
+    #
+    # max_output_tokens: 1024
+
+    # Whether a model that reasons before answering is allowed to. Sent only to
+    # turn reasoning off, so an endpoint that has never heard of the field is
+    # never shown it.
+    #
+    # Reasoning is most of the wall clock. That costs nothing on a summary
+    # written after everyone has left, and is dead air on a retelling somebody
+    # just asked for out loud.
+    #
+    # thinking: true
 
     # How much licence the model has. Higher than a mechanical transform would
     # want, because the output is prose somebody reads for pleasure.
