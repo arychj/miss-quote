@@ -24,6 +24,7 @@ MINUTES = "minutes"
 BARD = "bard"
 
 TRANSCRIPT_FRAGMENT = "transcript_instructions"
+RETELLING_FRAGMENT = "retelling_instructions"
 CLOSING_FRAGMENT = "retelling_closing"
 
 
@@ -133,7 +134,9 @@ def test_the_retelling_carries_the_length_it_was_given():
 # ── fragments ─────────────────────────────────
 
 
-@pytest.mark.parametrize("fragment", (TRANSCRIPT_FRAGMENT, CLOSING_FRAGMENT))
+@pytest.mark.parametrize(
+    "fragment", (TRANSCRIPT_FRAGMENT, RETELLING_FRAGMENT, CLOSING_FRAGMENT)
+)
 def test_no_shipped_prompt_still_asks_for_a_fragment(fragment):
     for name in prompts.BUILTIN:
         assert "{" + fragment + "}" not in _resolved(name), name
@@ -148,6 +151,25 @@ def test_a_custom_prompt_is_given_the_fragments_too():
 
     assert CLOSING_FRAGMENT not in available["mine"]
     assert "the tale is over" in available["mine"]
+
+
+def test_the_reteller_is_told_an_evening_can_arrive_in_pieces():
+    """
+    Each part was written as a standalone account, so three in a row open three
+    times and a model told nothing narrates three episodes.
+    """
+    assert "single continuous story" in _resolved(BARD)
+
+
+def test_a_custom_retelling_prompt_is_told_the_same():
+    """
+    A deployment with its own retelling prompt is handed the same stitched text
+    and would otherwise never have been told to expect it.
+    """
+    available = prompts.library({"mine": f"Retell it. {{{RETELLING_FRAGMENT}}}"})
+
+    assert RETELLING_FRAGMENT not in available["mine"]
+    assert "single continuous story" in available["mine"]
 
 
 # ── the library ───────────────────────────────

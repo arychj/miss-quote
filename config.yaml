@@ -372,18 +372,41 @@ servers:
               #
               # minimum_utterances: 5
 
-              # How soon the channel can be told its notes again. 0, or below,
-              # tells it every time it is asked.
+              # How soon the channel can be told the same evening again. 0, or
+              # below, tells it every time it is asked. Per evening rather than
+              # per channel, so asking about a different night is a different
+              # question and gets an answer.
               #
               # backoff_seconds: 120
 
+              # How long the room can sit quiet before the rest of the night
+              # counts as a different one. A transcript is one connection, and
+              # settings.transcripts.resume_seconds is a handful of seconds —
+              # enough for a client dropping, not for a pod restart or for a
+              # room that empties while everybody refills a glass. Past that the
+              # evening is filed in pieces, and this is what puts it back
+              # together to be retold as one story.
+              #
+              # Not the resume window and not to be set to match it: that one
+              # holds a session open and delays the summary behind it, while
+              # this is read long afterwards off files already on disk.
+              #
+              # session_gap_minutes: 10
+
               # What plays while the model is still thinking, and what plays
-              # when there is nothing to think about. Both are rendered at
+              # when there is nothing to think about. All three are rendered at
               # startup, so the announcement starts straight away and covers
               # the wait rather than following it.
               #
+              # `empty` and `missing` are different answers on purpose: one says
+              # nothing has ever been written down in this room, and the other
+              # says there is nothing from the night that was named. A channel
+              # told the first when the second is true goes looking for a
+              # misconfiguration that is not there.
+              #
               # preamble: "Sure! Let me go look at my notes."
               # empty: "I don't have any notes from this channel yet."
+              # missing: "I don't have any notes from then."
 
               # A fixed line said once the story is told, for a server that
               # would rather hear the same words every time. Off unless you set
@@ -394,10 +417,10 @@ servers:
               #
               # closing: "I wonder what'll happen tonight?"
 
-              # What the bot answers to, and what asking looks like. Both
-              # replace their defaults rather than adding to them: they are a
-              # matching vocabulary, and renaming the bot should make the old
-              # name stop working.
+              # What the bot answers to, and how asking starts. Both replace
+              # their defaults rather than adding to them: they are a matching
+              # vocabulary, and renaming the bot should make the old name stop
+              # working.
               #
               # Punctuation is ignored on both sides, so several spellings are
               # listed because an ASR guesses at a name it has never been told.
@@ -405,13 +428,33 @@ servers:
               # breath — an unaddressed "what happened last session" is somebody
               # talking to the room.
               #
+              # Triggers are the start of a question rather than the whole of
+              # one. Which evening is being asked about is a clause on the end,
+              # so "what happened" covers "what happened last session", "what
+              # happened two weeks ago" and "what happened on the twelfth"
+              # without a line each. What is understood after a trigger:
+              #
+              #   nothing, or "last time" / "last session" / "last night"
+              #   "last week", "a week ago", "two weeks ago" … "eight weeks ago"
+              #   "on the twelfth", "the twenty fifth", "the 12th"
+              #
+              # A day names one of the last two months: earlier this month if it
+              # has already been, and the month before if it has not. Counting
+              # back weeks lands on the nearest evening within a few days of the
+              # date, because a channel that meets on a night of the week does
+              # not meet on a date.
+              #
+              # A trigger has to be followed by one of those or by nothing at
+              # all, which is what stops "Miss Quote, what happened to my beer"
+              # from being a question about last Thursday.
+              #
               # name: [miss quote, misquote, missquote, mis quote, ms quote, mizquote]
               # triggers:
-              #   - what happened last session
-              #   - what happened last time
-              #   - what did we do last session
-              #   - recap the last session
+              #   - what happened
+              #   - what did we do
+              #   - recap
               #   - read me your notes
+              #   - tell me about
 
       # Says things out loud. Every other tool that answers a channel goes
       # through this one, so a server without it hears nothing: fines are still

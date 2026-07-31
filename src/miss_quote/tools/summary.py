@@ -19,6 +19,13 @@ rendered at startup — and, crucially, **starts the inference before it starts
 saying it**, so the announcement covers the wait rather than being followed by
 one. See `_recall`.
 
+Two things sit under that sentence and are not in it. One evening is not always
+one session, so what is retold is the whole run of them rather than the newest;
+`summary.store` is where that is put back together. And "last session" is not
+always what is meant — sessions get skipped, and other things happen in the
+channel in between — so a trigger is the start of a question rather than the
+whole of one, and `summary.when` reads which evening out of what follows it.
+
 **Everything is per voice channel, under `monitored_channels`.** A server's rooms
 are not interchangeable: one is where a game night happens and one is where two
 people are debugging something, and a bot that summarizes every room it was ever
@@ -38,11 +45,15 @@ import re
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
+from miss_quote.config import transcript_cfg
 from miss_quote.llm import client as llm
-from miss_quote.summary import dialogue, prompts
-from miss_quote.summary.store import SummaryStore
+from miss_quote.summary import dialogue, prompts, when as clauses
+from miss_quote.summary.store import Chain, SummaryStore
+from miss_quote.summary.when import When
 from miss_quote.tools.base import Finder, Tool, ToolContext
 from miss_quote.tools.tts import Tts
 from miss_quote.transcript.writer import Source, Transcript, TranscriptSession, Utterance, slugify
@@ -60,8 +71,10 @@ RETELLING_PROMPT_KEY = "retelling_prompt"
 RETELLING_WORDS_KEY = "retelling_words"
 MINIMUM_UTTERANCES_KEY = "minimum_utterances"
 BACKOFF_SECONDS_KEY = "backoff_seconds"
+SESSION_GAP_MINUTES_KEY = "session_gap_minutes"
 PREAMBLE_KEY = "preamble"
 EMPTY_KEY = "empty"
+MISSING_KEY = "missing"
 CLOSING_KEY = "closing"
 NAME_KEY = "name"
 TRIGGERS_KEY = "triggers"
@@ -77,8 +90,10 @@ CHANNEL_KEYS = (
     RETELLING_WORDS_KEY,
     MINIMUM_UTTERANCES_KEY,
     BACKOFF_SECONDS_KEY,
+    SESSION_GAP_MINUTES_KEY,
     PREAMBLE_KEY,
     EMPTY_KEY,
+    MISSING_KEY,
     CLOSING_KEY,
     NAME_KEY,
     TRIGGERS_KEY,
@@ -99,11 +114,31 @@ DEFAULT_BACKOFF_SECONDS = 120.0
 # own business to want.
 NEVER = 0.0
 
+# How long a channel can sit quiet before the rest of the night counts as a
+# different one. A transcript is one connection, and `resume_window_seconds` is
+# a handful of seconds — enough for a client dropping, not for a pod restart or
+# for a room that empties while everybody refills a glass. Past that the evening
+# is filed in pieces, and this is what puts it back together to be retold.
+#
+# Ten minutes, because that is a break rather than an ending. It is not the
+# resume window and should not be set to match it: the resume window holds a
+# session open and delays everything behind it, while this is read long after,
+# from names and files that are already on disk.
+DEFAULT_SESSION_GAP_MINUTES = 10.0
+
 # What plays while the model is still thinking, and what plays when there is
-# nothing to think about. Both are rendered at startup, so both are a file read
-# rather than a synthesizer round trip at the moment somebody is waiting.
+# nothing to think about. Both are rendered at startup, along with the line
+# below, so each is a file read rather than a synthesizer round trip at the
+# moment somebody is waiting.
 DEFAULT_PREAMBLE = "Sure! Let me go look at my notes."
 DEFAULT_EMPTY = "I don't have any notes from this channel yet."
+
+# And what plays when there are notes, just not from the evening somebody named.
+# Separate from `empty` because they are different answers: one says the bot has
+# never written anything down here, and the other says it was not listening that
+# night. A channel told the first when the second is true goes looking for a
+# misconfiguration that is not there.
+DEFAULT_MISSING = "I don't have any notes from then."
 
 # What is said once the story is told, for a channel that asks for one. A
 # retelling runs to a minute or more and ends wherever the model decided to end
@@ -131,15 +166,25 @@ DEFAULT_NAME = (
     "mizquote",
 )
 
-# What asking looks like. Matched after the name and in the same breath, so an
+# How asking starts. Matched after the name and in the same breath, so an
 # unaddressed "what happened last session" in the middle of a conversation is
 # somebody talking to the room rather than to the bot.
+#
+# Stems rather than whole phrases, because which evening is being asked about is
+# a clause on the end rather than a different question: "what happened last
+# session" is this list's first entry plus a clause `summary.when` reads, and so
+# is "what happened on the twelfth". Writing the whole phrase out would mean one
+# entry per date anybody might name.
+#
+# A stem on its own is still a question — somebody who says "Miss Quote, what
+# happened" means the last one — but only when nothing follows it. See
+# `Monitored.request` for why that restriction is what keeps the list honest.
 DEFAULT_TRIGGERS = (
-    "what happened last session",
-    "what happened last time",
-    "what did we do last session",
-    "recap the last session",
+    "what happened",
+    "what did we do",
+    "recap",
     "read me your notes",
+    "tell me about",
 )
 
 # What the post says above the summary, so a channel scrolling back knows which
@@ -149,6 +194,21 @@ HEADER_TIMESTAMP_FORMAT = "%a %d %b %Y, %H:%M %Z"
 HEADER_SEPARATOR = "\n\n"
 
 LIST_SEPARATOR = ", "
+
+# What a window is measured in, for the complaint when one will not parse.
+SECONDS = "seconds"
+MINUTES = "minutes"
+
+
+def _today() -> date:
+    """
+    The day a question is being asked on.
+
+    The clock the transcripts were named by, not the process's. A date somebody
+    says out loud is a date in the room they are sitting in, and resolving it
+    anywhere else puts "the twelfth" a day out for half of every day.
+    """
+    return datetime.now(ZoneInfo(transcript_cfg.timezone)).date()
 
 
 @dataclass(frozen=True)
@@ -167,8 +227,10 @@ class Monitored:
     retelling_prompt: str
     minimum_utterances: int
     backoff_seconds: float
+    session_gap: timedelta
     preamble: str
     empty: str
+    missing: str
     closing: str
     address: re.Pattern[str]
     triggers: re.Pattern[str]
@@ -177,22 +239,34 @@ class Monitored:
     def posting(self) -> bool:
         return bool(self.channel)
 
-    def asked(self, text: str) -> bool:
+    def request(self, text: str, today: date) -> When | None:
         """
-        Whether one utterance is somebody asking this channel's question.
+        Which evening one utterance asked about, if it asked about one.
 
-        The name has to come first and the trigger after it, in the same
-        sentence. Addressing the bot is what separates a question from a
-        remark, and the order is what stops "what happened last session, and
-        where is Miss Quote" from being read as one.
+        The name has to come first and a trigger stem after it, in the same
+        sentence. Addressing the bot is what separates a question from a remark,
+        and the order is what stops "what happened last session, and where is
+        Miss Quote" from being read as one.
+
+        What follows the stem decides which evening, and `summary.when` will
+        only accept a clause it understands or nothing at all. That second half
+        is doing more work than it looks like: the stems are short now that they
+        no longer carry a date, and "what happened" is a thing people say about
+        the beer as often as about last Thursday. Requiring the rest of the
+        sentence to be either a date or absent is what keeps a shorter list from
+        being a louder one.
         """
         said = normalized(text)
 
         addressed = self.address.search(said)
         if addressed is None:
-            return False
+            return None
 
-        return self.triggers.search(said, addressed.end()) is not None
+        stem = self.triggers.search(said, addressed.end())
+        if stem is None:
+            return None
+
+        return clauses.parse(said, stem.end(), today)
 
 
 class Summary(Tool):
@@ -213,7 +287,7 @@ class Summary(Tool):
         # still being told is dropped rather than queued: what is queued behind
         # a minute of narration is a minute of the same narration.
         self._telling = asyncio.Lock()
-        self._told: dict[str, float] = {}
+        self._told: dict[tuple[str, str], float] = {}
 
         logger.debug(
             "[%s] Summarizing %d channel(s): %s",
@@ -266,7 +340,12 @@ class Summary(Tool):
         wordings = [
             wording
             for monitored in self._monitored.values()
-            for wording in (monitored.preamble, monitored.empty, monitored.closing)
+            for wording in (
+                monitored.preamble,
+                monitored.empty,
+                monitored.missing,
+                monitored.closing,
+            )
             if wording
         ]
 
@@ -377,14 +456,22 @@ class Summary(Tool):
         self, utterance: Utterance, session: TranscriptSession
     ) -> None:
         """
-        Answer somebody asking what happened last time, if they asked here.
+        Answer somebody asking what happened, if they asked here.
 
         Gated on the same mapping as the summarizing: a channel nobody is
         writing about cannot be asked about either, which is one rule rather
         than two and means a room left off the list is left off it entirely.
+
+        The backoff is checked inside `_recall` rather than here, because what
+        it holds off is one story rather than one channel, and which story was
+        asked for is not known until the notes have been looked in.
         """
         monitored = self._for(session.source)
-        if monitored is None or not monitored.asked(utterance.text):
+        if monitored is None:
+            return
+
+        when = monitored.request(utterance.text, _today())
+        if when is None:
             return
 
         if self._telling.locked():
@@ -396,17 +483,11 @@ class Summary(Tool):
             return
 
         async with self._telling:
-            if not self._ready(monitored):
-                logger.debug(
-                    "[%s] %s asked again inside the backoff; not telling it twice.",
-                    self.server,
-                    utterance.user,
-                )
-                return
+            await self._recall(session.source, monitored, utterance.user, when)
 
-            await self._recall(session.source, monitored, utterance.user)
-
-    async def _recall(self, source: Source, monitored: Monitored, asker: str) -> None:
+    async def _recall(
+        self, source: Source, monitored: Monitored, asker: str, when: When
+    ) -> None:
         """
         Go and look at the notes, out loud.
 
@@ -429,24 +510,43 @@ class Summary(Tool):
         And the **retelling is awaited last**, by which point the model has had
         the length of the announcement to work in. If it needed longer, the wait
         is what is left of it rather than all of it.
+
+        The **backoff is checked between the lookup and the announcement**, once
+        it is known which evening was asked for. Somebody asking twice for the
+        same story is what it is there to stop; somebody asking for a different
+        one is asking a different question and gets an answer.
         """
         speech = self._tts()
         if speech is None:
             return
 
-        stored = self._store.latest(source)
-        if stored is None:
-            logger.info("[%s] %s asked, and there are no notes yet.", self.server, asker)
-            await speech.play(source, monitored.empty)
+        chain = self._store.find(source, when, monitored.session_gap)
+        if chain is None:
+            logger.info(
+                "[%s] %s asked about %s, and there are no notes from it.",
+                self.server,
+                asker,
+                "the last session" if when.latest else when.target,
+            )
+            await speech.play(source, monitored.empty if when.latest else monitored.missing)
             return
 
-        telling = asyncio.create_task(self._retell(stored.text, monitored))
+        if not self._ready(monitored, chain):
+            logger.debug(
+                "[%s] %s asked for %s again inside the backoff; not telling it twice.",
+                self.server,
+                asker,
+                chain.name,
+            )
+            return
+
+        telling = asyncio.create_task(self._retell(chain.read(), monitored))
 
         try:
             await speech.play(source, monitored.preamble)
             retelling = await telling
         except llm.CompletionError as exc:
-            logger.error("[%s] Could not retell %s: %s", self.server, stored.session, exc)
+            logger.error("[%s] Could not retell %s: %s", self.server, chain.name, exc)
             return
         finally:
             # A preamble that failed would otherwise leave the completion running
@@ -454,13 +554,14 @@ class Summary(Tool):
             telling.cancel()
 
         logger.info(
-            "📖 [%s] %s asked what happened; retelling %s.",
+            "📖 [%s] %s asked what happened; retelling %s (%d part(s)).",
             self.server,
             asker,
-            stored.session,
+            chain.name,
+            chain.parts,
         )
 
-        self._told[monitored.name] = time.monotonic()
+        self._told[(monitored.name, chain.name)] = time.monotonic()
 
         # Not kept: this is one evening's account, composed for this moment, and
         # nobody will ever ask for those exact words again. See `SpeechCache.stream`.
@@ -472,16 +573,24 @@ class Summary(Tool):
         if monitored.closing:
             await speech.play(source, monitored.closing)
 
-    async def _retell(self, summary: str, monitored: Monitored) -> str:
-        """One stored summary, as something to say rather than something to read."""
-        return await llm.complete(monitored.retelling_prompt, summary)
+    async def _retell(self, evening: str, monitored: Monitored) -> str:
+        """One stored evening, as something to say rather than something to read."""
+        return await llm.complete(monitored.retelling_prompt, evening)
 
-    def _ready(self, monitored: Monitored) -> bool:
-        """Whether enough has passed since this channel last heard its notes."""
+    def _ready(self, monitored: Monitored, chain: Chain) -> bool:
+        """
+        Whether enough has passed since this channel last heard this evening.
+
+        Per evening rather than per channel. What the window is for is a room
+        amusing itself by asking the same thing repeatedly, and what it costs
+        when it is per channel is somebody who asked about last Thursday being
+        ignored for two minutes because somebody else just asked about last
+        week — which is a second question, and has a different answer.
+        """
         if monitored.backoff_seconds <= NEVER:
             return True
 
-        last = self._told.get(monitored.name)
+        last = self._told.get((monitored.name, chain.name))
 
         return last is None or time.monotonic() - last >= monitored.backoff_seconds
 
@@ -569,11 +678,23 @@ def _channel(
             raw.get(MINIMUM_UTTERANCES_KEY),
             DEFAULT_MINIMUM_UTTERANCES,
         ),
-        backoff_seconds=_seconds(
-            BACKOFF_SECONDS_KEY, raw.get(BACKOFF_SECONDS_KEY), DEFAULT_BACKOFF_SECONDS
+        backoff_seconds=_span(
+            BACKOFF_SECONDS_KEY,
+            raw.get(BACKOFF_SECONDS_KEY),
+            DEFAULT_BACKOFF_SECONDS,
+            SECONDS,
+        ),
+        session_gap=timedelta(
+            minutes=_span(
+                SESSION_GAP_MINUTES_KEY,
+                raw.get(SESSION_GAP_MINUTES_KEY),
+                DEFAULT_SESSION_GAP_MINUTES,
+                MINUTES,
+            )
         ),
         preamble=str(raw.get(PREAMBLE_KEY) or DEFAULT_PREAMBLE),
         empty=str(raw.get(EMPTY_KEY) or DEFAULT_EMPTY),
+        missing=str(raw.get(MISSING_KEY) or DEFAULT_MISSING),
         closing=str(raw.get(CLOSING_KEY) or NO_CLOSING),
         address=pattern(_spoken(NAME_KEY, raw.get(NAME_KEY), DEFAULT_NAME)),
         triggers=pattern(_spoken(TRIGGERS_KEY, raw.get(TRIGGERS_KEY), DEFAULT_TRIGGERS)),
@@ -658,7 +779,7 @@ def _whole(key: str, value: Any, default: int) -> int:
         raise ValueError(f"'{key}' must be a whole number, not {value!r}: {exc}") from exc
 
 
-def _seconds(key: str, value: Any, default: float) -> float:
+def _span(key: str, value: Any, default: float, unit: str) -> float:
     """A window from the channel's settings, or the default it did not set."""
     if value is None:
         return default
@@ -667,5 +788,5 @@ def _seconds(key: str, value: Any, default: float) -> float:
         return float(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(
-            f"'{key}' must be a number of seconds, not {value!r}: {exc}"
+            f"'{key}' must be a number of {unit}, not {value!r}: {exc}"
         ) from exc

@@ -35,6 +35,23 @@ fragments:
     and the occasional word that makes no sense — read through them rather than
     quoting them as though they were said.
 
+  # The shape of what a retelling prompt is handed. One evening is not always
+  # one session — a room that empties and refills, or a pod that restarts, files
+  # the rest of the night separately and it is summarized separately — so what
+  # arrives can be several accounts set end to end. They are joined before the
+  # model sees them, with blank lines and nothing else, because a rule or a
+  # heading between them is a seam a synthesizer would read out loud.
+  #
+  # Saying so is still necessary. Each part was written as a standalone account
+  # of an evening, so three of them in a row open three times and a model told
+  # nothing narrates three episodes.
+  retelling_instructions: >
+    The text may be more than one account of the same evening, written
+    separately and set end to end in the order they happened. It is one evening:
+    tell it as a single continuous story rather than as a series of episodes,
+    and do not start over at each seam. The text opens with a line saying which
+    day it was — use it to place the story, and do not read it out as a heading.
+
   # How a spoken prompt ends. A retelling runs to a minute and finishes wherever
   # the model chose to, so a channel that has been listening cannot tell a story
   # that ended from one that stopped. A channel's `closing` is the fixed-sentence
@@ -81,6 +98,8 @@ prompts:
     You are given a written summary of a conversation that happened earlier.
     You are a bard, and you are retelling it the way one opens the next session
     at the table: "When last we left our adventurers..."
+
+    {retelling_instructions}
 
     You are the storyteller and you were not there. Write about the people in the
     summary in the **third person** — they are "they", and each of them is

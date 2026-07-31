@@ -38,6 +38,49 @@ USER_FIELD = "user"
 TEXT_FIELD = "text"
 
 
+def date_from_filename(path: Path) -> date | None:
+    """
+    The day a session was taken, from the front of its name.
+
+    Only the date prefix is read, so an ordinal on the end of a name does not
+    exempt that session from retention. Both trees are named the same way and
+    both age on this, which is why it is one function rather than a copy each.
+    """
+    taken = _prefix(
+        path, transcript_cfg.filename_date_length, transcript_cfg.filename_date_format
+    )
+
+    return None if taken is None else taken.date()
+
+
+def opened_from_filename(path: Path) -> datetime | None:
+    """
+    The moment a session opened, from the front of its name.
+
+    Aware, in the timezone the name was written in, because the only other time
+    a session has on disk is the offset-carrying `ts` of its last line and the
+    two are subtracted from each other to decide whether they are one evening.
+    """
+    opened = _prefix(
+        path,
+        transcript_cfg.filename_timestamp_length,
+        transcript_cfg.filename_timestamp_format,
+    )
+
+    if opened is None:
+        return None
+
+    return opened.replace(tzinfo=ZoneInfo(transcript_cfg.timezone))
+
+
+def _prefix(path: Path, length: int, layout: str) -> datetime | None:
+    """One fixed-width prefix of a filename, parsed, or nothing if it will not."""
+    try:
+        return datetime.strptime(path.stem[:length], layout)
+    except ValueError:
+        return None
+
+
 def slugify(name: str) -> str:
     """
     Reduce a Discord display name to something safe to use as a path segment.
@@ -105,6 +148,36 @@ class Utterance:
             user=str(parsed[USER_FIELD]),
             text=str(parsed[TEXT_FIELD]),
         )
+
+
+def last_spoken(path: Path) -> datetime | None:
+    """
+    When the last thing in a transcript was said, or nothing if none of it was.
+
+    This is the closest a sealed session comes to recording when it ended: the
+    filename is the moment it opened, and nothing on disk is the moment it
+    closed. A file that is missing, empty, or unreadable answers nothing rather
+    than raising, and the caller decides what an unknown ending means.
+
+    A line that will not parse is skipped, on `Transcript.read`'s rule: one bad
+    line should cost one utterance, not the answer.
+    """
+    spoken: datetime | None = None
+
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    spoken = Utterance.from_line(line).timestamp
+                except (ValueError, KeyError, TypeError):
+                    continue
+    except OSError as exc:
+        logger.error("Could not read %s to find when it ended: %s", path, exc)
+        return None
+
+    return spoken
 
 
 @dataclass(frozen=True)
@@ -291,7 +364,7 @@ class TranscriptWriter:
         removed: list[Path] = []
 
         for path in self._directory.rglob(f"*{transcript_cfg.filename_suffix}"):
-            file_date = self._date_from_filename(path)
+            file_date = date_from_filename(path)
             if file_date is None or file_date >= cutoff:
                 continue
 
@@ -336,19 +409,3 @@ class TranscriptWriter:
             ordinal += 1
 
         return path
-
-    @staticmethod
-    def _date_from_filename(path: Path) -> date | None:
-        """
-        The day a transcript was taken, from the front of its name.
-
-        Only the date prefix is parsed, so an ordinal on the end of a name does
-        not exempt that session from retention.
-        """
-        try:
-            return datetime.strptime(
-                path.stem[: transcript_cfg.filename_date_length],
-                transcript_cfg.filename_date_format,
-            ).date()
-        except ValueError:
-            return None
