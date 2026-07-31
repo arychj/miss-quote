@@ -321,7 +321,9 @@ async def test_the_loop_does_not_run_with_saving_switched_off(
         await board.run()  # Returning at all is the test.
 
     assert not path.exists()
-    assert any("CREDITS_SAVE_SECONDS" in record.message for record in caplog.records)
+    assert any(
+        "settings.credits.save_seconds" in record.message for record in caplog.records
+    )
 
 
 async def test_a_failing_tick_does_not_stop_the_loop(ledger, topic, caplog):

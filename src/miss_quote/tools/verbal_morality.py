@@ -12,17 +12,17 @@ rather than left to be noticed.
 
 A repeat offender is announced more and more quietly. Being fined is the joke,
 and a joke told fifteen times in five minutes is a denial of service on the
-conversation, so the announcement backs off toward `VIOLATION_VOLUME_FLOOR` as
-somebody keeps earning them. See `RecentViolations`.
+conversation, so the announcement backs off toward `settings.fines.volume_floor`
+as somebody keeps earning them. See `RecentViolations`.
 
 For the same reason a violation earned while an announcement is already playing
 is counted and not announced. The speaker plays one clip at a time and returns
 when it is finished, so waiting for a turn would leave the channel working
 through a backlog of fines for things said a minute ago.
 
-A speaker fined again within `REPEAT_FINE_SECONDS` gets the second wording —
-"you are also fined" — because reading the whole sentence out again sounds like
-a bot that has lost track of what it just said.
+A speaker fined again within `settings.fines.repeat_seconds` gets the second
+wording — "you are also fined" — because reading the whole sentence out again
+sounds like a bot that has lost track of what it just said.
 
 What the server writes down are stems. Each is expanded at startup into the
 endings it is said with, so a list stays a list of words rather than a list of
@@ -127,7 +127,7 @@ class RecentViolations:
 
     In memory only, and per tool instance, which is per server: one server's
     patience is not another's, and a tally that survives a restart is the
-    credits, not this. A `VOLUME_BACKOFF_DURATION` after their last one, a
+    credits, not this. A `settings.fines.backoff_seconds` after their last one, a
     speaker is back to being announced at whatever loudness the channel asked
     for.
 
@@ -548,11 +548,11 @@ def _fine(offences: int) -> str:
     """
     The fine as it will be said out loud: one credit per forbidden word.
 
-    What a credit is called is `CREDIT_CURRENCY`, and the plural is grown from
-    it rather than configured beside it, so a deployment cannot end up fining
-    people "2 credit". The count stays a numeral, which every synthesizer worth
-    pointing this at reads as a number; the noun does not get the same treatment
-    — "1 credits" is wrong in a way a listener hears.
+    What a credit is called is `settings.credits.currency`, and the plural is
+    grown from it rather than configured beside it, so a deployment cannot end
+    up fining people "2 credit". The count stays a numeral, which every
+    synthesizer worth pointing this at reads as a number; the noun does not get
+    the same treatment — "1 credits" is wrong in a way a listener hears.
     """
     currency = scoreboard_cfg.currency
     noun = currency if offences == SINGLE_CREDIT else plural(currency)

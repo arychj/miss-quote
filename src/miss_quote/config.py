@@ -1,14 +1,16 @@
 """
 Configuration for the Discord voice transcription bot.
 
-Groups settings into logical dataclasses with environment variable loading and validation.
+Groups settings into logical dataclasses, loaded and validated from two places:
+the environment, which says what a deployment points at, and the mounted file,
+which says how it behaves.
 """
 
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 import yaml
 from dotenv import load_dotenv
@@ -59,11 +61,6 @@ def _env_float(name: str, default: float) -> float:
         raise ValueError(f"{name} must be a number, got {value!r}") from exc
 
 
-def _env_percent(name: str, default: float) -> float:
-    """A percentage from the environment, as the fraction everything else uses."""
-    return _env_float(name, default) / PERCENT
-
-
 def _env_bool(name: str, default: bool) -> bool:
     value = os.getenv(name)
     if value is None or value.strip() == "":
@@ -75,6 +72,167 @@ def _env_bool(name: str, default: bool) -> bool:
     if normalized in FALSE_VALUES:
         return False
     raise ValueError(f"{name} must be a boolean, got {value!r}")
+
+
+def _fraction(percent: float) -> float:
+    """A percentage, as the fraction everything else scales audio by."""
+    return percent / PERCENT
+
+
+# ──────────────────────────────────────────────
+# Settings, from the mounted file
+# ──────────────────────────────────────────────
+
+# Everything a deployment tunes rather than points at: how long a trigger stays
+# spent, what a balance is called, how quiet a repeat offender gets. The
+# environment keeps what a deployment *points at* — hosts, ports, directories,
+# and the token — because those are what a manifest already carries and what a
+# secret has to stay in.
+#
+# Sections group settings the way the tools that read them are grouped, and are
+# written under `settings:` beside `servers:`. Every one of them has a default,
+# so a file that says none of this is a working file.
+SETTINGS_KEY = "settings"
+
+TTS_SECTION = "tts"
+CREDITS_SECTION = "credits"
+FINES_SECTION = "fines"
+QUOTES_SECTION = "quotes"
+TRANSCRIPTS_SECTION = "transcripts"
+
+TIMEOUT_SECONDS_KEY = "timeout_seconds"
+STALL_SECONDS_KEY = "stall_seconds"
+LEAD_MS_KEY = "lead_ms"
+CACHE_RETENTION_DAYS_KEY = "cache_retention_days"
+CURRENCY_KEY = "currency"
+SAVE_SECONDS_KEY = "save_seconds"
+TOPIC_SECONDS_KEY = "topic_seconds"
+REPEAT_SECONDS_KEY = "repeat_seconds"
+BACKOFF_SECONDS_KEY = "backoff_seconds"
+BACKOFF_PERCENT_KEY = "backoff_percent"
+VOLUME_FLOOR_KEY = "volume_floor"
+RETENTION_DAYS_KEY = "retention_days"
+RESUME_SECONDS_KEY = "resume_seconds"
+
+# Every setting there is, and what each one has to be. A name absent from here
+# is read by nothing, which is the quiet failure worth catching: the alternative
+# to reporting a typo is a deployment running on a default against a file that
+# plainly asks for something else.
+SETTINGS_SCHEMA: Mapping[str, Mapping[str, type]] = {
+    TTS_SECTION: {
+        TIMEOUT_SECONDS_KEY: float,
+        STALL_SECONDS_KEY: float,
+        LEAD_MS_KEY: float,
+        CACHE_RETENTION_DAYS_KEY: int,
+    },
+    CREDITS_SECTION: {
+        CURRENCY_KEY: str,
+        SAVE_SECONDS_KEY: float,
+        TOPIC_SECONDS_KEY: float,
+    },
+    FINES_SECTION: {
+        REPEAT_SECONDS_KEY: float,
+        BACKOFF_SECONDS_KEY: float,
+        BACKOFF_PERCENT_KEY: float,
+        VOLUME_FLOOR_KEY: float,
+    },
+    QUOTES_SECTION: {
+        BACKOFF_SECONDS_KEY: float,
+    },
+    TRANSCRIPTS_SECTION: {
+        RETENTION_DAYS_KEY: int,
+        RESUME_SECONDS_KEY: float,
+    },
+}
+
+# What a value has to be, worded the way the complaint about it reads.
+SETTING_KINDS: Mapping[type, str] = {
+    str: "text",
+    int: "a whole number",
+    float: "a number",
+}
+
+# How a complaint lists the names it was expecting instead.
+NAME_SEPARATOR = ", "
+
+SettingT = TypeVar("SettingT", str, int, float)
+
+
+def _parse_setting(
+    section: str, key: str, value: Any, kind: type, problems: list[str]
+) -> Any | None:
+    """One setting as the thing that reads it wants it, or nothing at all."""
+    try:
+        return kind(value)
+    except (TypeError, ValueError):
+        problems.append(
+            f"'{SETTINGS_KEY}.{section}.{key}' must be {SETTING_KINDS[kind]}, not "
+            f"{value!r}; using the default instead."
+        )
+        return None
+
+
+def _parse_section(
+    section: str, raw: Any, expected: Mapping[str, type], problems: list[str]
+) -> Mapping[str, Any]:
+    if not raw:
+        return {}
+
+    if not isinstance(raw, Mapping):
+        problems.append(
+            f"'{SETTINGS_KEY}.{section}' is not a mapping; ignoring the whole section."
+        )
+        return {}
+
+    values: dict[str, Any] = {}
+    for name, value in raw.items():
+        key = str(name)
+        kind = expected.get(key)
+        if kind is None:
+            problems.append(
+                f"'{SETTINGS_KEY}.{section}' has a '{key}', which nothing reads. "
+                f"That section holds "
+                f"{NAME_SEPARATOR.join(repr(known) for known in expected)}."
+            )
+            continue
+
+        parsed = _parse_setting(section, key, value, kind, problems)
+        if parsed is not None:
+            values[key] = parsed
+
+    return values
+
+
+def _parse_settings(raw: Any, problems: list[str]) -> Mapping[str, Mapping[str, Any]]:
+    """
+    The `settings:` block, with anything unreadable dropped and reported.
+
+    Unlike the environment, which fails fast on a value it cannot parse, a
+    setting here falls back to its default: the file also decides which servers
+    the bot joins, and a typo in a backoff should not be what stops it starting.
+    """
+    if not raw:
+        return {}
+
+    if not isinstance(raw, Mapping):
+        problems.append(f"'{SETTINGS_KEY}' is not a mapping; ignoring it.")
+        return {}
+
+    settings: dict[str, Mapping[str, Any]] = {}
+    for name, block in raw.items():
+        section = str(name)
+        expected = SETTINGS_SCHEMA.get(section)
+        if expected is None:
+            problems.append(
+                f"'{SETTINGS_KEY}' has a '{section}' section, which nothing reads. "
+                f"The sections are "
+                f"{NAME_SEPARATOR.join(repr(known) for known in SETTINGS_SCHEMA)}."
+            )
+            continue
+
+        settings[section] = _parse_section(section, block, expected, problems)
+
+    return settings
 
 
 # ──────────────────────────────────────────────
@@ -220,14 +378,14 @@ class TTSConfig:
     # server that streams slowly but steadily is healthy, one that goes quiet
     # for this long is not.
     timeout_seconds: float = field(
-        default_factory=lambda: _env_float("TTS_TIMEOUT_SECONDS", 30.0)
+        default_factory=lambda: file_cfg.setting(TTS_SECTION, TIMEOUT_SECONDS_KEY, 30.0)
     )
 
     # How long the player waits for the next piece of a clip before ending it.
     # Playback begins on the first chunk, so a synthesizer that stalls mid-word
     # leaves a thread holding the channel open until this expires.
     stall_seconds: float = field(
-        default_factory=lambda: _env_float("TTS_STALL_SECONDS", 10.0)
+        default_factory=lambda: file_cfg.setting(TTS_SECTION, STALL_SECONDS_KEY, 10.0)
     )
 
     # How much of a phrase to have in hand before a clip starts playing. A
@@ -236,7 +394,9 @@ class TTSConfig:
     # in the middle of a clip that opens with a chime. Waiting for this much
     # moves that wait to before the chime, where nobody hears it. Zero plays on
     # the first chunk, as a synthesizer that streams as it renders wants.
-    lead_ms: float = field(default_factory=lambda: _env_float("TTS_LEAD_MS", 500.0))
+    lead_ms: float = field(
+        default_factory=lambda: file_cfg.setting(TTS_SECTION, LEAD_MS_KEY, 500.0)
+    )
 
     # Rendered speech, kept so a phrase is only ever synthesized once. The only
     # place it is kept: an unwritable or unset directory means every phrase is
@@ -250,7 +410,9 @@ class TTSConfig:
     # stays whatever its age. Any value below 1 disables the reaper. Clips left
     # in the directory by hand are never reaped, whatever this says.
     cache_retention_days: int = field(
-        default_factory=lambda: _env_int("TTS_CACHE_RETENTION_DAYS", 90)
+        default_factory=lambda: file_cfg.setting(
+            TTS_SECTION, CACHE_RETENTION_DAYS_KEY, 90
+        )
     )
 
     @property
@@ -269,14 +431,20 @@ class TranscriptConfig:
     timezone: str = field(default_factory=lambda: _env_str("TZ", "America/Los_Angeles"))
 
     # Days of transcripts to keep. Any value below 1 disables pruning entirely,
-    # so a mis-set variable cannot destroy the archive.
-    retention_days: int = field(default_factory=lambda: _env_int("RETENTION_DAYS", -1))
+    # so a mis-set setting cannot destroy the archive.
+    retention_days: int = field(
+        default_factory=lambda: file_cfg.setting(
+            TRANSCRIPTS_SECTION, RETENTION_DAYS_KEY, -1
+        )
+    )
 
     # How long a channel may sit empty before its transcript is sealed. A
     # channel that refills inside the window is one conversation with a gap in
     # it, not two. Zero seals on disconnect.
     resume_window_seconds: float = field(
-        default_factory=lambda: _env_float("SESSION_RESUME_SECONDS", 5.0)
+        default_factory=lambda: file_cfg.setting(
+            TRANSCRIPTS_SECTION, RESUME_SECONDS_KEY, 5.0
+        )
     )
 
     # One file per connection, named for the moment the bot joined. Colons are
@@ -335,15 +503,21 @@ class ScoreboardConfig:
 
     # What a balance is denominated in, in the singular. The plural is grown from
     # it by the same spelling rules the word list uses, so a deployment that
-    # counts in something other than credits sets one variable rather than
-    # rewriting every server's announcement.
-    currency: str = field(default_factory=lambda: _env_str("CREDIT_CURRENCY", "credit"))
+    # counts in something other than credits sets one line rather than rewriting
+    # every server's announcement.
+    currency: str = field(
+        default_factory=lambda: file_cfg.setting(
+            CREDITS_SECTION, CURRENCY_KEY, "credit"
+        )
+    )
 
     # How often a changed tally is written to disk, and how often the loop that
     # does it wakes at all. Any value at or below zero stops the loop, leaving
     # the tally in memory until shutdown, which still saves it.
     save_interval_seconds: float = field(
-        default_factory=lambda: _env_float("CREDITS_SAVE_SECONDS", 5.0)
+        default_factory=lambda: file_cfg.setting(
+            CREDITS_SECTION, SAVE_SECONDS_KEY, 5.0
+        )
     )
 
     # How often a changed tally is published to the voice channel topic — the
@@ -353,7 +527,9 @@ class ScoreboardConfig:
     # is worth reading rather than of what the API will tolerate. Any value at or
     # below zero keeps the tally off the channel, and still saves it.
     topic_interval_seconds: float = field(
-        default_factory=lambda: _env_float("CREDITS_TOPIC_SECONDS", 10.0)
+        default_factory=lambda: file_cfg.setting(
+            CREDITS_SECTION, TOPIC_SECONDS_KEY, 10.0
+        )
     )
 
 
@@ -376,14 +552,16 @@ class MoralityConfig:
     # where somebody is still mid-sentence, not for the argument they had five
     # minutes ago. 0 means nothing is ever a repeat.
     repeat_seconds: float = field(
-        default_factory=lambda: _env_float("REPEAT_FINE_SECONDS", 5.0)
+        default_factory=lambda: file_cfg.setting(FINES_SECTION, REPEAT_SECONDS_KEY, 5.0)
     )
 
     # How long a violation counts against how loudly the next one is announced.
     # A sliding window, so a speaker is back to full volume this long after
     # their last one rather than at the top of some fixed period.
     backoff_seconds: float = field(
-        default_factory=lambda: _env_float("VOLUME_BACKOFF_DURATION", 300.0)
+        default_factory=lambda: file_cfg.setting(
+            FINES_SECTION, BACKOFF_SECONDS_KEY, 300.0
+        )
     )
 
     # How much of an announcement each violation inside that window takes off.
@@ -394,7 +572,10 @@ class MoralityConfig:
     backoff_step: float = field(
         default_factory=lambda: min(
             UNITY_VOLUME,
-            max(SILENT_VOLUME, _env_percent("VOLUME_BACKOFF_PERCENT", 5.0)),
+            max(
+                SILENT_VOLUME,
+                _fraction(file_cfg.setting(FINES_SECTION, BACKOFF_PERCENT_KEY, 5.0)),
+            ),
         )
     )
 
@@ -404,7 +585,10 @@ class MoralityConfig:
     volume_floor: float = field(
         default_factory=lambda: min(
             UNITY_VOLUME,
-            max(SILENT_VOLUME, _env_float("VIOLATION_VOLUME_FLOOR", 0.25)),
+            max(
+                SILENT_VOLUME,
+                file_cfg.setting(FINES_SECTION, VOLUME_FLOOR_KEY, 0.25),
+            ),
         )
     )
 
@@ -439,7 +623,9 @@ class QuotesConfig:
     # the same line back each time. Any value at or below zero answers every
     # trigger every time, which is a deployment's own business to want.
     backoff_seconds: float = field(
-        default_factory=lambda: _env_float("QUOTE_BACKOFF_SECONDS", 300.0)
+        default_factory=lambda: file_cfg.setting(
+            QUOTES_SECTION, BACKOFF_SECONDS_KEY, 300.0
+        )
     )
 
 
@@ -471,7 +657,6 @@ TOOL_CONFIG_KEY = "config"
 # reported rather than ignored: the symptom otherwise is a tool running on its
 # defaults with nothing anywhere saying why.
 TOOL_KEYS = (TOOL_ENABLED_KEY, TOOL_CONFIG_KEY)
-TOOL_KEY_SEPARATOR = ", "
 
 # A tool listed without saying so is off. Enabling one is a decision, and it
 # should have to be written down.
@@ -553,9 +738,9 @@ def _parse_tools(
         if stray:
             problems.append(
                 f"Server {server_id}: tool '{name}' has "
-                f"{TOOL_KEY_SEPARATOR.join(repr(str(key)) for key in stray)} "
+                f"{NAME_SEPARATOR.join(repr(str(key)) for key in stray)} "
                 f"outside '{TOOL_CONFIG_KEY}', where nothing reads it. A tool block "
-                f"holds only {TOOL_KEY_SEPARATOR.join(repr(key) for key in TOOL_KEYS)}; "
+                f"holds only {NAME_SEPARATOR.join(repr(key) for key in TOOL_KEYS)}; "
                 f"move the rest under '{TOOL_CONFIG_KEY}:'."
             )
 
@@ -604,11 +789,13 @@ def _parse_server(
 @dataclass(frozen=True)
 class FileConfig:
     """
-    Settings that come from a mounted file rather than the environment.
+    Everything that comes from a mounted file rather than the environment.
 
-    These are mappings, which do not survive being flattened into environment
-    variables. Read once at startup, so changing the file means restarting the
-    pod.
+    Two things live here: the servers the bot may join, which are mappings and
+    do not survive being flattened into environment variables, and the settings
+    a deployment tunes, which are a file's worth of numbers nobody wants spread
+    across twenty variables in a manifest. Read once at startup, so changing the
+    file means restarting the pod.
 
     Servers are identified by ID once, as the key in `servers`, and by a stable
     alias everywhere else. The alias is what transcript paths are named for, so
@@ -624,12 +811,16 @@ class FileConfig:
     problems: tuple[str, ...]
     found: bool
 
+    # Last and defaulted, because a deployment that says none of this is the
+    # ordinary case: every setting has a default and nothing is required.
+    settings: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+
     @classmethod
     def load(cls) -> "FileConfig":
         path = Path(_env_str(CONFIG_FILE_ENV, DEFAULT_CONFIG_FILE))
 
         if not path.is_file():
-            return cls(path=path, servers={}, problems=(), found=False)
+            return cls(path=path, servers={}, settings={}, problems=(), found=False)
 
         raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
 
@@ -645,9 +836,21 @@ class FileConfig:
         return cls(
             path=path,
             servers=servers,
+            settings=_parse_settings(raw.get(SETTINGS_KEY), problems),
             problems=tuple(problems),
             found=True,
         )
+
+    def setting(self, section: str, key: str, default: SettingT) -> SettingT:
+        """
+        One deployment-wide setting, or the default nobody had to write down.
+
+        Anything the file did not say, and anything it said that would not
+        parse, is missing here rather than wrong: the complaint is already in
+        `problems`, and what the caller gets is what it would have got from an
+        empty file.
+        """
+        return self.settings.get(section, {}).get(key, default)
 
     def knows(self, server_id: int) -> bool:
         """
@@ -701,6 +904,10 @@ class FileConfig:
 # ──────────────────────────────────────────────
 # Singleton instances (import these directly)
 # ──────────────────────────────────────────────
+
+# The file comes first: everything below reads its settings out of it.
+file_cfg = FileConfig.load()
+
 discord_cfg = DiscordConfig()
 audio_cfg = AudioConfig()
 vad_cfg = VADConfig()
@@ -712,4 +919,3 @@ scoreboard_cfg = ScoreboardConfig()
 morality_cfg = MoralityConfig()
 quotes_cfg = QuotesConfig()
 log_cfg = LogConfig()
-file_cfg = FileConfig.load()

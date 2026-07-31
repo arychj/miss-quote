@@ -321,6 +321,88 @@ def test_a_malformed_tool_does_not_cost_the_server(monkeypatch, tmp_path):
     assert cfg.problems
 
 
+# ── settings ──────────────────────────────────────
+
+
+def test_settings_are_read_as_what_reads_them_wants(monkeypatch, tmp_path):
+    cfg = _load(
+        monkeypatch,
+        tmp_path,
+        "settings:\n"
+        "  credits:\n    currency: penny\n    save_seconds: 2\n"
+        "  transcripts:\n    retention_days: '30'\n",
+    )
+
+    assert cfg.setting("credits", "currency", "credit") == "penny"
+    assert cfg.setting("credits", "save_seconds", 5.0) == 2.0
+    assert cfg.setting("transcripts", "retention_days", -1) == 30
+    assert cfg.problems == ()
+
+
+def test_an_unsaid_setting_is_the_default(monkeypatch, tmp_path):
+    """Every one of them has one, so a file that says none of this is a file."""
+    cfg = _load(monkeypatch, tmp_path, FULL_CONFIG)
+
+    assert cfg.setting("credits", "currency", "credit") == "credit"
+    assert cfg.problems == ()
+
+
+def test_an_empty_section_is_not_an_error(monkeypatch, tmp_path):
+    cfg = _load(monkeypatch, tmp_path, "settings:\n  quotes:\n")
+
+    assert cfg.setting("quotes", "backoff_seconds", 300.0) == 300.0
+    assert cfg.problems == ()
+
+
+def test_a_value_that_will_not_parse_is_dropped_and_reported(monkeypatch, tmp_path):
+    """A typo in a backoff must not be what stops the bot joining anything."""
+    cfg = _load(monkeypatch, tmp_path, "settings:\n  tts:\n    lead_ms: soon\n")
+
+    assert cfg.setting("tts", "lead_ms", 500.0) == 500.0
+    assert any("lead_ms" in problem for problem in cfg.problems)
+
+
+def test_a_setting_nothing_reads_is_reported(monkeypatch, tmp_path):
+    """The quiet failure: a default running against a file that asks otherwise."""
+    cfg = _load(monkeypatch, tmp_path, "settings:\n  fines:\n    repeat_second: 9\n")
+
+    assert any("repeat_second" in problem for problem in cfg.problems)
+
+
+def test_a_section_nothing_reads_is_reported(monkeypatch, tmp_path):
+    cfg = _load(monkeypatch, tmp_path, "settings:\n  fine:\n    repeat_seconds: 9\n")
+
+    assert any("'fine'" in problem for problem in cfg.problems)
+
+
+def test_a_setting_written_under_the_wrong_section_is_reported(monkeypatch, tmp_path):
+    cfg = _load(monkeypatch, tmp_path, "settings:\n  tts:\n    currency: penny\n")
+
+    assert cfg.setting("credits", "currency", "credit") == "credit"
+    assert any("currency" in problem for problem in cfg.problems)
+
+
+def test_settings_that_are_not_a_mapping_are_reported(monkeypatch, tmp_path):
+    cfg = _load(monkeypatch, tmp_path, "settings: nonsense\n")
+
+    assert cfg.settings == {}
+    assert cfg.problems
+
+
+def test_a_section_that_is_not_a_mapping_is_reported(monkeypatch, tmp_path):
+    cfg = _load(monkeypatch, tmp_path, "settings:\n  credits: nonsense\n")
+
+    assert cfg.setting("credits", "currency", "credit") == "credit"
+    assert cfg.problems
+
+
+def test_a_missing_file_leaves_every_setting_at_its_default(monkeypatch, tmp_path):
+    cfg = _load(monkeypatch, tmp_path, body=None)
+
+    assert cfg.setting("credits", "currency", "credit") == "credit"
+    assert cfg.problems == ()
+
+
 # ── the shipped file ──────────────────────────────
 
 
