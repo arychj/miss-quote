@@ -1,6 +1,6 @@
 import json
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -292,7 +292,7 @@ def test_the_gap_is_measured_from_when_the_talking_stopped(tmp_path):
     assert found.name == first
 
 
-def test_a_session_nobody_spoke_in_bridges_the_two_around_it(tmp_path):
+def test_a_session_too_short_to_summarize_bridges_the_two_around_it(tmp_path):
     """
     A session under the summarizing threshold has no summary and is still what
     holds an evening together. Looking only at summaries breaks the chain at
@@ -306,7 +306,12 @@ def test_a_session_nobody_spoke_in_bridges_the_two_around_it(tmp_path):
         spoken=_at(2026, 7, 26, 21, 0, 0),
         summary="before the reconnect",
     )
-    _session(tmp_path, _at(2026, 7, 26, 21, 5, 0), summary=None)
+    _session(
+        tmp_path,
+        _at(2026, 7, 26, 21, 5, 0),
+        spoken=_at(2026, 7, 26, 21, 6, 0),
+        summary=None,
+    )
     _session(
         tmp_path,
         _at(2026, 7, 26, 21, 8, 0),
@@ -322,6 +327,62 @@ def test_a_session_nobody_spoke_in_bridges_the_two_around_it(tmp_path):
     assert found.name == first
     assert "before the reconnect" in found.read()
     assert "after the reconnect" in found.read()
+
+
+def test_a_short_session_at_the_end_of_a_day_does_not_hide_it(tmp_path):
+    """
+    The last session on a day is the first anchor tried and need not be one
+    anybody wrote about. An hour after the evening ended, somebody rejoining
+    for two minutes must not answer for the whole of it.
+    """
+    store = _store(tmp_path)
+
+    evening = _session(
+        tmp_path,
+        _at(2026, 7, 29, 20, 27, 26),
+        spoken=_at(2026, 7, 29, 20, 47, 45),
+        summary="they argued about the rules",
+    )
+    _session(
+        tmp_path,
+        _at(2026, 7, 29, 21, 47, 44),
+        spoken=_at(2026, 7, 29, 21, 48, 30),
+        summary=None,
+    )
+
+    found = store.find(SOURCE, When(target=date(2026, 7, 29), tolerance_days=EXACT_DAY), GAP)
+
+    assert found is not None
+    assert found.name == evening
+    assert "they argued about the rules" in found.read()
+
+
+def test_asking_in_the_middle_of_a_session_finds_the_one_before_it(tmp_path):
+    """
+    A session still in progress is the newest thing in the channel and has no
+    summary, since that is written when the transcript seals. "Last time" asked
+    from inside one means the conversation before it.
+    """
+    store = _store(tmp_path)
+
+    previous = _session(
+        tmp_path,
+        _at(2026, 7, 29, 20, 27, 26),
+        spoken=_at(2026, 7, 29, 22, 40, 0),
+        summary="the evening before",
+    )
+    _session(
+        tmp_path,
+        _at(2026, 8, 1, 9, 39, 38),
+        spoken=_at(2026, 8, 1, 9, 39, 53),
+        summary=None,
+    )
+
+    found = store.latest(SOURCE, GAP)
+
+    assert found is not None
+    assert found.name == previous
+    assert "the evening before" in found.read()
 
 
 def test_a_transcript_that_is_gone_stops_the_chain(tmp_path):
