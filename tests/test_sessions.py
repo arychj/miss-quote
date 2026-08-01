@@ -10,6 +10,7 @@ import miss_quote.bot.client as client_module
 from miss_quote.config import FileConfig, ServerConfig, ToolSettings, transcript_cfg
 from miss_quote.tools.base import Tool
 from miss_quote.tools.runner import ToolRunner
+from miss_quote.transcript.schedule import ALWAYS
 from miss_quote.transcript.writer import TranscriptWriter
 
 SERVER = 123456789012345678
@@ -129,7 +130,12 @@ def bot(monkeypatch, tmp_path):
         client_module,
         "TranscriptWriter",
         lambda: TranscriptWriter(
-            directory=tmp_path, timezone=TIMEZONE, retention_days=KEEP_FOREVER
+            directory=tmp_path,
+            timezone=TIMEZONE,
+            retention_days=KEEP_FOREVER,
+            # Every room on the record: these tests are about when a session
+            # seals, not about which rooms a deployment listed.
+            schedules=lambda guild_id, channel: ALWAYS,
         ),
     )
     monkeypatch.setattr(

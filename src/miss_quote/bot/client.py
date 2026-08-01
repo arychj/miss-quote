@@ -18,11 +18,18 @@ from miss_quote.bot.audio_sink import STTAudioSink
 from miss_quote.bot.presence import DiscordPresence
 from miss_quote.bot.speaker import DiscordSpeaker
 from miss_quote.bot.topic import DiscordTopic
-from miss_quote.config import discord_cfg, file_cfg, presence_cfg, transcript_cfg
+from miss_quote.config import (
+    MONITORED_CHANNELS_KEY,
+    discord_cfg,
+    file_cfg,
+    presence_cfg,
+    transcript_cfg,
+)
 from miss_quote.stt.processor import STTProcessor
 from miss_quote.tools.runner import ToolRunner
-from miss_quote.transcript.writer import Source, TranscriptSession, TranscriptWriter, slugify
+from miss_quote.transcript.writer import Source, TranscriptSession, TranscriptWriter
 from miss_quote.utils.logging import get_logger
+from miss_quote.utils.slugs import slugify
 
 logger = get_logger(__name__)
 
@@ -300,34 +307,54 @@ class STTBot:
     @staticmethod
     def _report_schedule() -> None:
         """
-        Say which hours are written down, and complain about the ones that were not.
+        Say which rooms are on the record and when, room by room.
 
-        A schedule nothing survived reading captures nothing, which is the safe
-        way to be wrong and a poor thing to discover a week later by finding an
-        empty directory. It is reported as an error for that reason, while a
-        deployment that asked for no schedule at all is the ordinary case and is
-        not worth a line.
+        Every one of them, not only the ones that named a window: being listed
+        in `monitored_channels` is what puts a room on the record at all, and a
+        deployment reading this wants to see the whole list rather than work out
+        the absences. A room that is listed and covers nothing is an error, that
+        being a schedule somebody wrote and nothing could be read out of.
+
+        Nothing is said about the rooms that are not listed, there being no end
+        to them; what they get is said once, here, in the line about the rest.
         """
-        schedule = transcript_cfg.schedule
+        schedules = file_cfg.channel_schedules
 
-        for problem in schedule.problems:
-            logger.error("%s: %s", file_cfg.path, problem)
-
-        if not schedule.configured:
-            return
-
-        if schedule.empty:
-            logger.error(
-                "Nothing in the transcript schedule could be read, so nothing will "
-                "be written down. Correct it, or remove it to capture everything."
+        if not schedules:
+            logger.warning(
+                "No voice channel is listed in any server's '%s', so nothing "
+                "will be written down. List the rooms that should be.",
+                MONITORED_CHANNELS_KEY,
             )
             return
 
+        # Sorted by what the line will say rather than by server ID, so the
+        # report reads in the order somebody scanning it expects.
+        listed = sorted(
+            (
+                (f"{file_cfg.alias_for(server_id) or server_id}/{channel}", schedule)
+                for (server_id, channel), schedule in schedules.items()
+            ),
+            key=lambda entry: entry[0],
+        )
+
+        for where, schedule in listed:
+            if schedule.empty:
+                logger.error(
+                    "Nothing in the schedule for %s could be read, so it will not "
+                    "be written down. Correct it, or remove it to keep every "
+                    "session in that room.",
+                    where,
+                )
+            elif schedule.configured:
+                logger.info("Keeping %s for sessions opening during: %s.", where, schedule.describe())
+            else:
+                logger.info("Keeping %s for every session.", where)
+
         logger.info(
-            "Transcripts are kept for sessions opening during: %s. One that opens "
-            "then runs until the channel empties, however late; one that opens "
-            "outside them is still transcribed and answered, and is not written down.",
-            schedule.describe(),
+            "Every other voice channel is transcribed and answered while the bot "
+            "is in it, and nothing is written down. A session that opens on the "
+            "record runs until the channel empties, however late."
         )
 
     def _report_tools(self) -> None:

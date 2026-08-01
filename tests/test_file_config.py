@@ -485,3 +485,120 @@ def test_a_list_setting_that_is_not_a_list_is_dropped_and_reported(monkeypatch, 
 
     assert cfg.setting("transcripts", "schedule", ()) == ()
     assert any("schedule" in problem for problem in cfg.problems)
+
+
+# ── which rooms are on the record ─────────────────
+
+MONITORED = f"""
+servers:
+  {FIRST_SERVER}:
+    alias: first-server
+    tools:
+      summary:
+        enabled: true
+        config:
+          monitored_channels:
+            general:
+              channel: general
+              schedule:
+                - Wed 17:00-00:00
+            side-room:
+              channel: general
+"""
+
+
+def test_a_listed_channel_is_kept_on_its_own_schedule(monkeypatch, tmp_path):
+    cfg = _load(monkeypatch, tmp_path, MONITORED)
+    schedule = cfg.schedule_for(FIRST_SERVER, "general")
+
+    assert schedule.describe() == "Wed 17:00-00:00"
+    assert cfg.problems == ()
+
+
+def test_a_channel_not_listed_is_never_kept(monkeypatch, tmp_path):
+    """`monitored_channels` is the list of rooms on the record, not a filter on one."""
+    cfg = _load(monkeypatch, tmp_path, MONITORED)
+
+    assert cfg.schedule_for(FIRST_SERVER, "somewhere-else").empty
+    assert cfg.schedule_for(UNKNOWN_SERVER, "general").empty
+
+
+def test_a_listed_channel_without_a_schedule_falls_back_to_the_default(
+    monkeypatch, tmp_path
+):
+    cfg = _load(
+        monkeypatch,
+        tmp_path,
+        "settings:\n  transcripts:\n    schedule:\n      - Sun 12:00-14:00\n" + MONITORED,
+    )
+
+    assert cfg.schedule_for(FIRST_SERVER, "side-room").describe() == "Sun 12:00-14:00"
+    assert cfg.schedule_for(FIRST_SERVER, "general").describe() == "Wed 17:00-00:00"
+
+
+def test_a_listed_channel_with_no_default_anywhere_is_always_kept(monkeypatch, tmp_path):
+    cfg = _load(monkeypatch, tmp_path, MONITORED)
+    schedule = cfg.schedule_for(FIRST_SERVER, "side-room")
+
+    assert not schedule.configured
+    assert not schedule.empty
+
+
+def test_a_channel_is_matched_through_slugify(monkeypatch, tmp_path):
+    """A file written the way transcripts are named matches whatever Discord says."""
+    cfg = _load(
+        monkeypatch,
+        tmp_path,
+        MONITORED.replace("            general:", "            General Voice:"),
+    )
+
+    assert cfg.schedule_for(FIRST_SERVER, "General Voice").describe() == "Wed 17:00-00:00"
+    assert cfg.schedule_for(FIRST_SERVER, "general-voice").describe() == "Wed 17:00-00:00"
+
+
+def test_a_server_with_the_summary_tool_off_keeps_nothing(monkeypatch, tmp_path):
+    """The cost of listing the rooms under the tool: turning it off stops the lot."""
+    cfg = _load(monkeypatch, tmp_path, MONITORED.replace("enabled: true", "enabled: false"))
+
+    assert cfg.channel_schedules == {}
+    assert cfg.schedule_for(FIRST_SERVER, "general").empty
+
+
+def test_an_unreadable_channel_schedule_keeps_nothing_and_is_reported(
+    monkeypatch, tmp_path
+):
+    """A typo must not widen what is recorded, here as anywhere else."""
+    cfg = _load(
+        monkeypatch, tmp_path, MONITORED.replace("- Wed 17:00-00:00", "- every other tuesday")
+    )
+
+    assert cfg.schedule_for(FIRST_SERVER, "general").empty
+    assert any("general" in problem for problem in cfg.problems)
+
+
+def test_a_channel_schedule_complaint_names_the_channel_not_the_setting(
+    monkeypatch, tmp_path
+):
+    """A complaint pointing at the wrong part of the file sends somebody hunting."""
+    cfg = _load(
+        monkeypatch, tmp_path, MONITORED.replace("- Wed 17:00-00:00", "- Wen 17:00-19:00")
+    )
+
+    assert cfg.problems
+    assert not any("settings.transcripts.schedule" in problem for problem in cfg.problems)
+    assert any("monitored_channels.general.schedule" in problem for problem in cfg.problems)
+
+
+def test_an_unreadable_default_schedule_keeps_nothing_and_is_reported(
+    monkeypatch, tmp_path
+):
+    """The deployment-wide default fails closed on the same terms a channel's does."""
+    cfg = _load(
+        monkeypatch,
+        tmp_path,
+        "settings:\n  transcripts:\n    schedule:\n      - every other tuesday\n"
+        + MONITORED,
+    )
+
+    assert cfg.schedule_for(FIRST_SERVER, "side-room").empty
+    assert cfg.problems

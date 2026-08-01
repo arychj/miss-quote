@@ -6,7 +6,8 @@ import pytest
 
 import miss_quote.transcript.writer as writer_module
 from miss_quote.transcript.schedule import ALWAYS, Schedule
-from miss_quote.transcript.writer import Source, TranscriptWriter, slugify
+from miss_quote.transcript.writer import Source, TranscriptWriter
+from miss_quote.utils.slugs import slugify
 
 TIMEZONE = "America/Los_Angeles"
 KEEP_FOREVER = -1
@@ -46,11 +47,12 @@ def frozen_clock(monkeypatch):
 def _writer(
     tmp_path, retention_days: int = KEEP_FOREVER, schedule: Schedule = ALWAYS
 ) -> TranscriptWriter:
+    """A writer whose every room is on the same schedule, whichever room it is."""
     return TranscriptWriter(
         directory=tmp_path,
         timezone=TIMEZONE,
         retention_days=retention_days,
-        schedule=schedule,
+        schedules=lambda guild_id, channel: schedule,
     )
 
 
