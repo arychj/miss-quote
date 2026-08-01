@@ -145,6 +145,17 @@ def bot(monkeypatch, tmp_path):
     return client_module.STTBot()
 
 
+def _spoken_in(bot, channel_id: int = CHANNEL_ID) -> None:
+    """
+    Put something in an open session, so sealing it produces a transcript.
+
+    A session nobody spoke in takes its own file away and is never handed to a
+    tool. These tests are about when a session seals rather than what is in one,
+    and the dispatch is how they can tell.
+    """
+    bot._sessions[channel_id].write(1, "someone", "said a thing")
+
+
 async def test_joining_opens_a_session(bot):
     channel = FakeChannel()
 
@@ -193,6 +204,7 @@ async def test_rejoining_starts_a_second_transcript_once_the_window_has_passed(
 
     await bot._connect(channel)
     first = bot._sessions[CHANNEL_ID].path
+    _spoken_in(bot)
     await bot._disconnect(channel.voice_client)
 
     await bot._connect(channel)
@@ -256,6 +268,7 @@ async def test_the_window_expiring_seals_the_transcript(bot, collected, resume_w
     resume_window(A_BRIEF_WINDOW)
     channel = FakeChannel()
     await bot._connect(channel)
+    _spoken_in(bot)
 
     await bot._disconnect(channel.voice_client)
     await asyncio.sleep(A_BRIEF_WINDOW * WINDOWS_TO_WAIT)
@@ -272,6 +285,7 @@ async def test_reconnecting_after_the_window_starts_a_new_transcript(
     channel = FakeChannel()
     await bot._connect(channel)
     first = bot._sessions[CHANNEL_ID].path
+    _spoken_in(bot)
 
     await bot._disconnect(channel.voice_client)
     await asyncio.sleep(A_BRIEF_WINDOW * WINDOWS_TO_WAIT)
@@ -288,6 +302,7 @@ async def test_a_sealed_transcript_ends_when_the_connection_did(
     resume_window(A_BRIEF_WINDOW)
     channel = FakeChannel()
     await bot._connect(channel)
+    _spoken_in(bot)
 
     await bot._disconnect(channel.voice_client)
     await asyncio.sleep(A_BRIEF_WINDOW * WINDOWS_TO_WAIT)
@@ -322,6 +337,8 @@ async def test_shutdown_closes_every_open_session(bot, collected):
 
     await bot._connect(here)
     await bot._connect(elsewhere)
+    _spoken_in(bot)
+    _spoken_in(bot, OTHER_CHANNEL_ID)
 
     await bot._close_all_sessions()
 
@@ -336,6 +353,7 @@ async def test_shutdown_does_not_wait_out_the_resume_window(
     resume_window(A_LONG_WINDOW)
     channel = FakeChannel()
     await bot._connect(channel)
+    _spoken_in(bot)
     await bot._disconnect(channel.voice_client)
 
     await bot._close_all_sessions()
@@ -354,6 +372,7 @@ async def test_moving_channels_ends_one_transcript_and_starts_another(
     channel = FakeChannel()
     await bot._connect(channel)
     first = bot._sessions[CHANNEL_ID]
+    _spoken_in(bot)
 
     elsewhere = FakeChannel(OTHER_CHANNEL_ID, "side-room")
     await bot._move(channel.voice_client, elsewhere)

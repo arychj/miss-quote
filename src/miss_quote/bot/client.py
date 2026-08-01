@@ -540,8 +540,19 @@ class STTBot:
         return True
 
     async def _finalize(self, session: TranscriptSession) -> None:
-        """Seal a transcript and hand it to the tools that want one."""
+        """
+        Seal a transcript and hand it to the tools that want one.
+
+        A session nobody spoke in has taken its own file away by this point and
+        there is nothing to hand anybody. A tool given one could only find that
+        out by reading it, and every tool would have to.
+        """
         transcript = session.close()
+
+        if transcript.empty:
+            logger.info("Transcript discarded: %s (nobody spoke).", transcript.path)
+            return
+
         logger.info(
             "Transcript closed: %s (%d utterance(s)).",
             transcript.path,

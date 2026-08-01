@@ -200,6 +200,11 @@ class Transcript:
     def duration(self) -> timedelta:
         return self.closed - self.opened
 
+    @property
+    def empty(self) -> bool:
+        """Whether nobody spoke. One that nobody did leaves no file behind."""
+        return self.utterances == 0
+
     def read(self) -> list[Utterance]:
         """
         Every utterance in the file, in the order it was spoken.
@@ -228,8 +233,9 @@ class TranscriptSession:
     One connection to one voice channel, and the file it appends to.
 
     The file is created when the session opens rather than on the first
-    utterance, so the tree records that the bot was present even in a channel
-    where nobody spoke, and a tool never has to handle a path that is not there.
+    utterance, so nothing writing to a session that is still going has to handle
+    a path that is not there. A session nobody ever spoke in takes it away again
+    when it seals; see `close`.
     """
 
     def __init__(self, path: Path, source: Source, opened: datetime, zone: ZoneInfo) -> None:
@@ -296,9 +302,20 @@ class TranscriptSession:
         Idempotent, and the end time is fixed by the first call: a session can
         be closed by the channel emptying, by the bot being disconnected, or by
         the pod terminating, and more than one of those can land.
+
+        A session nobody spoke in leaves nothing behind. A file of no lines is
+        not a record that the bot was there, it is a session every reader
+        downstream has to recognize and discount — and one of them will forget.
+        `summary.store` chains an evening together out of both trees, and an
+        empty session an hour after the last real one is a session on that day
+        with nothing in it: near enough to be taken for the evening somebody
+        asked about, and nothing to tell them once it has been.
         """
         if self._closed is None:
             self._closed = self._suspended or datetime.now(self._zone)
+
+        if self._utterances == 0:
+            self._discard()
 
         return Transcript(
             path=self._path,
@@ -307,6 +324,13 @@ class TranscriptSession:
             closed=self._closed,
             utterances=self._utterances,
         )
+
+    def _discard(self) -> None:
+        """Take the file away, reporting a failure rather than raising on it."""
+        try:
+            self._path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.error("Could not remove the empty transcript %s: %s", self._path, exc)
 
 
 class TranscriptWriter:

@@ -89,17 +89,45 @@ def test_reconnecting_starts_a_new_transcript(tmp_path, frozen_clock):
     assert second.path.name == "2026-07-26T14-30-00.jsonl"
 
 
-def test_a_session_with_nobody_speaking_still_leaves_a_file(tmp_path, frozen_clock):
-    """The tree records that the bot was present, and a tool never sees a missing path."""
+def test_a_session_with_nobody_speaking_leaves_no_file(tmp_path, frozen_clock):
+    """
+    A file of no lines is not a record that the bot was there, it is a session
+    every reader downstream has to recognize and discount.
+    """
     frozen_clock(datetime(2026, 7, 26, 10, 0, 0, tzinfo=ZoneInfo(TIMEZONE)))
     session = _writer(tmp_path).open(SOURCE)
 
+    assert session.path.is_file()
+
     transcript = session.close()
 
-    assert transcript.path.is_file()
-    assert transcript.path.read_text() == ""
+    assert transcript.empty
+    assert not transcript.path.exists()
     assert transcript.utterances == 0
     assert transcript.read() == []
+
+
+def test_a_session_somebody_spoke_in_keeps_its_file(tmp_path, frozen_clock):
+    frozen_clock(datetime(2026, 7, 26, 10, 0, 0, tzinfo=ZoneInfo(TIMEZONE)))
+    session = _writer(tmp_path).open(SOURCE)
+    session.write(USER_ID, USER, "something")
+
+    transcript = session.close()
+
+    assert not transcript.empty
+    assert transcript.path.is_file()
+
+
+def test_discarding_an_empty_session_twice_is_not_an_error(tmp_path, frozen_clock):
+    """More than one thing can end a session, and the first took the file away."""
+    frozen_clock(datetime(2026, 7, 26, 10, 0, 0, tzinfo=ZoneInfo(TIMEZONE)))
+    session = _writer(tmp_path).open(SOURCE)
+
+    first = session.close()
+    second = session.close()
+
+    assert first == second
+    assert not second.path.exists()
 
 
 def test_closing_twice_reports_the_same_transcript(tmp_path, frozen_clock):

@@ -25,10 +25,11 @@ transcript is gone — pruned ahead of its summary, which is a thing deployments
 are told they may want — is treated as having closed when it opened, so the
 chain stops there rather than being stitched on a guess.
 
-Sessions are enumerated from **both** trees. One nobody spoke in, or one too
-short to have been worth summarizing, has no summary and is still the bridge
-between two that do; looking only at summaries would break a chain at exactly
-the point something has to hold it together.
+Sessions are enumerated from **both** trees. One too short to have been worth
+summarizing has no summary and is still the bridge between two that do; looking
+only at summaries would break a chain at exactly the point something has to hold
+it together. It can equally be the newest session in the channel, or the last
+one on the day somebody named, which is what `find` takes several anchors for.
 
 Everything is read by **filename** rather than by mtime. The name is the moment
 the session opened; the mtime is the moment a file happened to be written, which
@@ -38,7 +39,7 @@ backup. Retention ages files the same way and for the same reason.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -220,37 +221,45 @@ class SummaryStore:
         """
         The evening somebody asked for in one channel, if it had one.
 
-        An **anchor** is picked first and the chain grown out from it, rather
-        than every chain in the channel's history being built and one of them
-        chosen. Listing names is a directory scan and reading transcripts is
-        not, and a channel that has been kept forever has a great many of them;
-        this way an evening of three sessions costs three reads whether the
-        channel is a week old or two years old.
+        An **anchor** is picked and the chain grown out from it, rather than
+        every chain in the channel's history being built and one of them chosen.
+        Listing names is a directory scan and reading transcripts is not, and a
+        channel that has been kept forever has a great many of them; this way an
+        evening of three sessions costs three reads whether the channel is a
+        week old or two years old.
 
         Growing runs **both ways**. Backwards is the point of it — the anchor is
         the last session of an evening and the rest of the evening is behind it.
         Forwards matters for a date: an evening that began before midnight on
         the twelfth is asked for as the twelfth and does not end there.
 
-        A chain with no summaries anywhere in it is nothing to tell, and answers
-        the same as no chain at all. A session still in progress has no summary
-        yet — it is written when the transcript seals — so this is the previous
-        conversation even when it is asked for in the middle of one, which is
-        exactly what "last time" means.
+        A chain with no summaries anywhere in it is nothing to tell — and not
+        the end of the search. The best anchor is frequently a session nobody
+        wrote about: one still in progress, whose summary is written when the
+        transcript seals, or one at the end of a night that was too short to be
+        worth summarizing. Either can be the newest session in the channel or
+        the last one on the day somebody named, and stopping there answers "no
+        notes" with the notes sitting an hour behind it. So anchors are taken in
+        order until one of them yields an evening with something in it.
+
+        A chain already rejected is never grown again from the inside. Every
+        session in one produces that same chain, so remembering it is what keeps
+        a channel of unsummarized sessions linear instead of quadratic.
         """
         sessions = self._sessions(source)
-        if not sessions:
-            return None
+        rejected: set[Session] = set()
 
-        anchor = _anchor(sessions, when)
-        if anchor is None:
-            return None
+        for anchor in _anchors(sessions, when):
+            if anchor in rejected:
+                continue
 
-        chain = _grown(sessions, anchor, gap)
-        if not any(session.summary for session in chain):
-            return None
+            chain = _grown(sessions, anchor, gap)
+            if any(session.summary for session in chain):
+                return Chain(sessions=tuple(chain))
 
-        return Chain(sessions=tuple(chain))
+            rejected.update(chain)
+
+        return None
 
     def latest(self, source: Source, gap: timedelta) -> Chain | None:
         """The most recent evening in one channel, if it has had any."""
@@ -353,23 +362,29 @@ def _filed(directory: Path, suffix: str) -> dict[str, Path]:
     return {path.stem: path for path in directory.glob(f"*{suffix}")}
 
 
-def _anchor(sessions: Sequence[Session], when: When) -> Session | None:
+def _anchors(sessions: Sequence[Session], when: When) -> Iterator[Session]:
     """
-    The session an evening is grown out from.
+    The sessions an evening might be grown out from, best first.
 
-    For the most recent evening that is simply the newest session. For a date it
-    is the **last** session to start on the nearest qualifying day: a day with an
-    afternoon conversation and an evening one is asked about with one date, and
-    the later of the two is what "what happened on the twelfth" means, on the
-    same reading that makes "last time" the most recent rather than the first.
+    For the most recent evening that is every session, newest first. For a date
+    it is the sessions near enough to the day named, the **last** one on the
+    nearest qualifying day first: a day with an afternoon conversation and an
+    evening one is asked about with one date, and the later of the two is what
+    "what happened on the twelfth" means, on the same reading that makes "last
+    time" the most recent rather than the first.
 
     Ties in distance go to the later day, so a target falling between two
     evenings resolves forwards. Somebody counting back weeks is counting to a
     session, and the more recent of two equally close ones is the one they are
     more likely to have been at.
+
+    Several rather than one, because the best anchor need not be an evening
+    anybody wrote about, and the caller is the only one that can tell. See
+    `SummaryStore.find`.
     """
     if when.latest or when.target is None:
-        return sessions[-1]
+        yield from reversed(sessions)
+        return
 
     named = when.target
     near = [
@@ -378,15 +393,13 @@ def _anchor(sessions: Sequence[Session], when: When) -> Session | None:
         if abs((session.opened.date() - named).days) <= when.tolerance_days
     ]
 
-    if not near:
-        return None
-
-    return max(
+    yield from sorted(
         near,
         key=lambda session: (
             -abs((session.opened.date() - named).days),
             session.opened,
         ),
+        reverse=True,
     )
 
 
