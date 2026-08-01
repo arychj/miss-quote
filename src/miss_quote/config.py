@@ -7,13 +7,15 @@ which says how it behaves.
 """
 
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TypeVar
 
 import yaml
 from dotenv import load_dotenv
+
+from miss_quote.transcript.schedule import Schedule
 
 load_dotenv()
 
@@ -101,6 +103,7 @@ QUOTES_SECTION = "quotes"
 TRANSCRIPTS_SECTION = "transcripts"
 LLM_SECTION = "llm"
 SUMMARIES_SECTION = "summaries"
+PRESENCE_SECTION = "presence"
 
 TIMEOUT_SECONDS_KEY = "timeout_seconds"
 STALL_SECONDS_KEY = "stall_seconds"
@@ -115,9 +118,11 @@ BACKOFF_PERCENT_KEY = "backoff_percent"
 VOLUME_FLOOR_KEY = "volume_floor"
 RETENTION_DAYS_KEY = "retention_days"
 RESUME_SECONDS_KEY = "resume_seconds"
+SCHEDULE_KEY = "schedule"
 MAX_OUTPUT_TOKENS_KEY = "max_output_tokens"
 TEMPERATURE_KEY = "temperature"
 THINKING_KEY = "thinking"
+TRANSCRIBING_KEY = "transcribing"
 
 # Every setting there is, and what each one has to be. A name absent from here
 # is read by nothing, which is the quiet failure worth catching: the alternative
@@ -147,6 +152,7 @@ SETTINGS_SCHEMA: Mapping[str, Mapping[str, type]] = {
     TRANSCRIPTS_SECTION: {
         RETENTION_DAYS_KEY: int,
         RESUME_SECONDS_KEY: float,
+        SCHEDULE_KEY: list,
     },
     LLM_SECTION: {
         TIMEOUT_SECONDS_KEY: float,
@@ -157,6 +163,9 @@ SETTINGS_SCHEMA: Mapping[str, Mapping[str, type]] = {
     SUMMARIES_SECTION: {
         RETENTION_DAYS_KEY: int,
     },
+    PRESENCE_SECTION: {
+        TRANSCRIBING_KEY: str,
+    },
 }
 
 # What a value has to be, worded the way the complaint about it reads.
@@ -165,12 +174,13 @@ SETTING_KINDS: Mapping[type, str] = {
     int: "a whole number",
     float: "a number",
     bool: "true or false",
+    list: "a list of lines",
 }
 
 # How a complaint lists the names it was expecting instead.
 NAME_SEPARATOR = ", "
 
-SettingT = TypeVar("SettingT", str, int, float, bool)
+SettingT = TypeVar("SettingT", str, int, float, bool, tuple)
 
 
 def _parse_bool(value: Any) -> bool:
@@ -195,11 +205,31 @@ def _parse_bool(value: Any) -> bool:
     raise ValueError(f"{value!r} is not a boolean")
 
 
+def _parse_list(value: Any) -> tuple[str, ...]:
+    """
+    A setting written as several lines, however few of them there are.
+
+    A bare string is read as one entry rather than rejected: a schedule with a
+    single window in it is the ordinary case, and YAML makes writing it without
+    the dash easy enough that refusing it would only ever catch somebody being
+    reasonable. Blank entries are dropped, so a trailing dash says nothing.
+    """
+    if isinstance(value, str):
+        value = [value]
+
+    if not isinstance(value, Sequence):
+        raise ValueError(f"{value!r} is not a list")
+
+    return tuple(str(entry).strip() for entry in value if str(entry).strip())
+
+
 def _parse_setting(
     section: str, key: str, value: Any, kind: type, problems: list[str]
 ) -> Any | None:
     """One setting as the thing that reads it wants it, or nothing at all."""
     try:
+        if kind is list:
+            return _parse_list(value)
         return _parse_bool(value) if kind is bool else kind(value)
     except (TypeError, ValueError):
         problems.append(
@@ -587,6 +617,24 @@ class TranscriptConfig:
         )
     )
 
+    # When a session may start being written down, as `Wed 17:00-00:00`. Read
+    # once per session, at the moment the bot joins: a session that opens inside
+    # a window keeps writing until everybody disconnects, however far past the
+    # end of it that is. A deployment that says nothing captures everything; one
+    # that says something unreadable captures nothing, because a schedule is
+    # written to narrow what is recorded and a typo in it must not widen it back
+    # out.
+    #
+    # Only the writing down is scheduled. A session off the record is still
+    # transcribed and still reaches the tools that read one utterance at a time,
+    # so a fine is announced and counted whether or not the evening is being
+    # kept. See `transcript.schedule`.
+    schedule: Schedule = field(
+        default_factory=lambda: Schedule.parse(
+            file_cfg.setting(TRANSCRIPTS_SECTION, SCHEDULE_KEY, ())
+        )
+    )
+
     # One file per connection, named for the moment the bot joined. Colons are
     # legal in the name on POSIX but travel badly, so the time is dash-separated.
     filename_timestamp_format: str = "%Y-%m-%dT%H-%M-%S"
@@ -808,6 +856,32 @@ class QuotesConfig:
     backoff_seconds: float = field(
         default_factory=lambda: file_cfg.setting(
             QUOTES_SECTION, BACKOFF_SECONDS_KEY, 300.0
+        )
+    )
+
+
+# ──────────────────────────────────────────────
+# Presence
+# ──────────────────────────────────────────────
+@dataclass(frozen=True)
+class PresenceConfig:
+    """
+    What the bot says about itself while a conversation is being kept.
+
+    Per deployment, and necessarily so: Discord has one presence per bot rather
+    than one per server, so there is nowhere for a second server to say
+    something different. See `bot.presence`.
+    """
+
+    # Shown under the bot's name while any session is on the record, and cleared
+    # when none is. The emoji is part of the text rather than a field of its
+    # own: a custom status carries an emoji, and Discord does not apply it for a
+    # bot, so the only spelling that reaches anybody is one inside the words.
+    #
+    # Empty turns the signal off, which needs no second setting to say.
+    transcribing: str = field(
+        default_factory=lambda: file_cfg.setting(
+            PRESENCE_SECTION, TRANSCRIBING_KEY, "🎙️ transcribing..."
         )
     )
 
@@ -1104,4 +1178,5 @@ process_cfg = ProcessConfig()
 scoreboard_cfg = ScoreboardConfig()
 morality_cfg = MoralityConfig()
 quotes_cfg = QuotesConfig()
+presence_cfg = PresenceConfig()
 log_cfg = LogConfig()

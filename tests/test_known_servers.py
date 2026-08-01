@@ -61,6 +61,7 @@ class FakeChannel:
 class FakeSession:
     def __init__(self, source) -> None:
         self.source = source
+        self.capturing = True
 
 
 class FakeWriter:

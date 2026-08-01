@@ -447,3 +447,41 @@ def test_shipped_config_parses(monkeypatch, tmp_path):
     assert cfg.problems == (), "the shipped example must not trip its own parser"
     assert all(isinstance(server, int) for server in cfg.servers)
     assert all(server.alias for server in cfg.servers.values())
+
+
+def test_a_list_setting_is_read_as_a_list(monkeypatch, tmp_path):
+    cfg = _load(
+        monkeypatch,
+        tmp_path,
+        "settings:\n  transcripts:\n    schedule:\n"
+        "      - Wed 17:00-00:00\n      - Sat 12:00-14:00\n",
+    )
+
+    assert cfg.setting("transcripts", "schedule", ()) == (
+        "Wed 17:00-00:00",
+        "Sat 12:00-14:00",
+    )
+    assert cfg.problems == ()
+
+
+def test_a_list_setting_written_as_one_line_is_one_entry(monkeypatch, tmp_path):
+    """YAML makes writing a single-entry list without the dash easy enough."""
+    cfg = _load(
+        monkeypatch,
+        tmp_path,
+        "settings:\n  transcripts:\n    schedule: Wed 17:00-00:00\n",
+    )
+
+    assert cfg.setting("transcripts", "schedule", ()) == ("Wed 17:00-00:00",)
+    assert cfg.problems == ()
+
+
+def test_a_list_setting_that_is_not_a_list_is_dropped_and_reported(monkeypatch, tmp_path):
+    cfg = _load(
+        monkeypatch,
+        tmp_path,
+        "settings:\n  transcripts:\n    schedule:\n      wednesday: evening\n",
+    )
+
+    assert cfg.setting("transcripts", "schedule", ()) == ()
+    assert any("schedule" in problem for problem in cfg.problems)

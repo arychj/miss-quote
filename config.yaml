@@ -113,6 +113,69 @@ settings:
     #
     # resume_seconds: 5
 
+    # When a session may start being written down, as a day and a 24-hour range.
+    # Saying nothing writes everything down, which is what a deployment that has
+    # never set this already has.
+    #
+    # A window is when an evening may *start* being recorded, not how long it
+    # may go on for. The schedule is read once, at the moment the bot joins, and
+    # a session that opens inside a window keeps writing until everybody
+    # disconnects — however far past the end of it that is. An evening does not
+    # stop being the evening at midnight, and a transcript cut off
+    # mid-conversation is worse than either the whole of it or none of it. The
+    # same rule the other way: a session opened a minute early is off the record
+    # for its whole length, and leaving and rejoining is what fixes that.
+    #
+    # Only the writing down is scheduled. Off the record the bot still joins,
+    # still transcribes, and still hands each line to the tools — a fine is
+    # announced and counted whether or not the evening is being kept. What the
+    # schedule decides is whether anything is left afterwards for a summary to
+    # be written from, or for somebody to go back and read.
+    #
+    # An end at or before the start runs into the following day, which is how
+    # one line says "Wednesday evening": `Wed 17:00-00:00` is Wednesday 17:00
+    # until midnight, and `Wed 21:00-02:00` runs to two in the morning on
+    # Thursday. `24:00` may be written for the end of a day, and an end equal to
+    # the start is the whole 24 hours. The start is included and the end is not,
+    # so two windows written back to back neither overlap nor leave a gap.
+    #
+    # Days are `Mon` through `Sun`, or written out, in any case. An entry that
+    # cannot be read is dropped and reported at startup — and a schedule that
+    # nothing could be read out of writes nothing down at all, rather than
+    # falling back to writing everything down. A schedule is written by somebody
+    # narrowing what is recorded, and a typo in it should not widen it back out:
+    # an evening not written down can be had again, and one that should not have
+    # been written down cannot be taken back.
+    #
+    # schedule:
+    #   - Wed 17:00-00:00
+    #   - Sat 12:00-14:00
+
+  # What the bot says about itself while a conversation is being kept.
+  #
+  # A transparency signal rather than a status readout. Everybody can see the
+  # bot sitting in a channel, and hearing on its own retains nothing material —
+  # a fine is counted and the words behind it are gone. What is worth announcing
+  # is the part that leaves something afterwards: a transcript on disk, and the
+  # summaries and retellings written off it. So there is a wording for being on
+  # the record and none for listening.
+  #
+  # It follows sessions rather than speech: a session being written down shows
+  # this whether or not anybody is talking.
+  #
+  # There is one presence per bot rather than one per server — Discord has no
+  # per-guild presence for a bot — so a deployment recording in one server says
+  # so in all of them. Which is why this is here rather than under a server.
+  presence:
+    # Shown under the bot's name while any session is on the record, and cleared
+    # when none is. Empty turns the signal off.
+    #
+    # The emoji goes in the words. A custom status has an emoji field of its
+    # own, and Discord does not apply it for a bot, so one written there would
+    # never reach anybody.
+    #
+    # transcribing: "🎙️ transcribing..."
+
   # Only used by `summary`. Where the endpoint is, what key it wants, and which
   # model to ask for are LLM_API_BASE, LLM_API_KEY, and LLM_MODEL — one endpoint
   # for the whole deployment, whatever is serving it.

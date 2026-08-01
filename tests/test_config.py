@@ -1,4 +1,5 @@
 import importlib
+from datetime import UTC, datetime
 
 import pytest
 
@@ -377,3 +378,40 @@ def test_a_switch_that_is_not_a_switch_falls_back_and_is_reported(
 
     assert reloaded.llm_cfg.thinking is True
     assert any("thinking" in problem for problem in reloaded.file_cfg.problems)
+
+
+def test_no_schedule_captures_everything(monkeypatch, tmp_path) -> None:
+    """What every deployment did before there was a schedule to write."""
+    reloaded = _reload_without_settings(monkeypatch, tmp_path)
+
+    assert reloaded.transcript_cfg.schedule.configured is False
+    assert reloaded.transcript_cfg.schedule.covers(datetime.now(UTC))
+
+
+def test_the_capture_schedule_is_read_from_the_file(monkeypatch, tmp_path) -> None:
+    reloaded = _reload_with(
+        monkeypatch,
+        tmp_path,
+        "settings:\n  transcripts:\n    schedule:\n      - Wed 17:00-00:00\n",
+    )
+    schedule = reloaded.transcript_cfg.schedule
+
+    assert schedule.describe() == "Wed 17:00-00:00"
+    assert schedule.problems == ()
+    assert reloaded.file_cfg.problems == ()
+
+
+def test_a_capture_schedule_nothing_could_be_read_from_captures_nothing(
+    monkeypatch, tmp_path
+) -> None:
+    """A typo in a schedule must not widen back out what it was written to narrow."""
+    reloaded = _reload_with(
+        monkeypatch,
+        tmp_path,
+        "settings:\n  transcripts:\n    schedule:\n      - every other tuesday\n",
+    )
+    schedule = reloaded.transcript_cfg.schedule
+
+    assert schedule.empty
+    assert not schedule.covers(datetime.now(UTC))
+    assert schedule.problems
