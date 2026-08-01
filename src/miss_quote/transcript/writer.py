@@ -21,21 +21,18 @@ own file away again.
 from __future__ import annotations
 
 import json
-import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from miss_quote.config import transcript_cfg
+from miss_quote.config import file_cfg, transcript_cfg
 from miss_quote.transcript.schedule import ALWAYS, Schedule
 from miss_quote.utils.logging import get_logger
+from miss_quote.utils.slugs import slugify
 
 logger = get_logger(__name__)
-
-SLUG_DISALLOWED = re.compile(r"[^a-z0-9_-]+")
-SLUG_EDGE_CHARACTERS = "-"
-SLUG_FALLBACK = "unnamed"
 
 # Distinguishes sessions that opened in the same second; the first needs none.
 SESSION_ORDINAL_SEPARATOR = "-"
@@ -88,19 +85,6 @@ def _prefix(path: Path, length: int, layout: str) -> datetime | None:
         return datetime.strptime(path.stem[:length], layout)
     except ValueError:
         return None
-
-
-def slugify(name: str) -> str:
-    """
-    Reduce a Discord display name to something safe to use as a path segment.
-
-    Dots and separators are dropped rather than escaped, so a name like
-    `../../etc` cannot express a traversal no matter where in the string it
-    appears. Runs of disallowed characters collapse to a single dash so a name
-    cannot expand into a long run of separators.
-    """
-    slug = SLUG_DISALLOWED.sub("-", name.casefold()).strip(SLUG_EDGE_CHARACTERS)
-    return slug or SLUG_FALLBACK
 
 
 @dataclass(frozen=True)
@@ -412,14 +396,16 @@ class TranscriptWriter:
         directory: Path | None = None,
         timezone: str | None = None,
         retention_days: int | None = None,
-        schedule: Schedule | None = None,
+        schedules: Callable[[int, str], Schedule] | None = None,
     ) -> None:
         self._directory = Path(directory or transcript_cfg.directory)
         self._zone = ZoneInfo(timezone or transcript_cfg.timezone)
         self._retention_days = (
             transcript_cfg.retention_days if retention_days is None else retention_days
         )
-        self._schedule = transcript_cfg.schedule if schedule is None else schedule
+        # A resolver rather than one schedule: which rooms are on the record is
+        # per server and per channel, and the writer serves every one of them.
+        self._schedules = file_cfg.schedule_for if schedules is None else schedules
 
         self._directory.mkdir(parents=True, exist_ok=True)
         self.prune()
@@ -449,7 +435,7 @@ class TranscriptWriter:
             source=source,
             opened=opened,
             zone=self._zone,
-            schedule=self._schedule,
+            schedule=self._schedules(source.guild_id, source.channel),
         )
 
         if not session.capturing:

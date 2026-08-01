@@ -230,7 +230,7 @@ def make_bot(monkeypatch, tmp_path):
                 directory=tmp_path,
                 timezone=TIMEZONE,
                 retention_days=KEEP_FOREVER,
-                schedule=schedule,
+                schedules=lambda guild_id, channel: schedule,
             ),
         )
         monkeypatch.setattr(

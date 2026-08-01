@@ -119,27 +119,35 @@ Timestamps carry an explicit UTC offset, resolved through `TZ`.
 
 ### The capture schedule
 
-**When a session may start being written down is `settings.transcripts.schedule`**, a list of a day and a 24-hour range:
+**`monitored_channels` is the list of rooms on the record.** A voice channel absent from it is **never transcribed** — the bot still joins it, still hears it, still fines people in it, and nothing said there reaches disk. That list lives under the [`summary`](#summary) tool, because transcribing a room, summarizing it, and telling it back are one thing to whoever is sitting in it.
+
+**When** a listed room is written down is `schedule`, in that room's own block:
 
 ```yaml
-settings:
-  transcripts:
-    schedule:
-      - Wed 17:00-00:00
-      - Sat 12:00-14:00
+tools:
+  summary:
+    enabled: true
+    config:
+      monitored_channels:
+        general-voice:
+          channel: session-summaries
+          schedule:
+            - Wed 17:00-00:00
 ```
 
-Saying nothing writes everything down, which is what a deployment that has never set this already has.
+A listed room that names no windows keeps every session, or whatever `settings.transcripts.schedule` says — that setting is the deployment-wide default for listed rooms, and nothing more.
 
-**A window is when an evening may *start* being recorded, not how long it may run for.** The schedule is read once per session, at the moment the bot joins, and the answer holds until the session seals: **a session that opens inside a window keeps writing until everybody disconnects**, however far past the end of the window that is. An evening does not stop being the evening at midnight, and a transcript cut off mid-conversation is worse than either the whole of it or none of it.
+**A window is when an evening may *start* being recorded, not how long it may run for.** The schedule is read once per session, when the bot joins, and the answer holds until the session seals: **a session that opens inside a window keeps writing until everybody disconnects**, however far past the end of the window. An evening doesn't stop being the evening at midnight, and a transcript cut off mid-conversation is worse than either the whole of it or none of it.
 
-The same rule runs the other way, which is the part worth knowing before setting one. **A session opened a minute early is off the record for its whole length** — it does not start writing when the window arrives — and so is one opened by a rejoin after a pod restart at two in the morning. Leaving the channel and coming back is what fixes both, since that is what opens a new session.
+The rule runs the other way too, which is the part worth knowing before setting one. **A session opened a minute early is off the record for its whole length** — it does not start writing when the window arrives — and so is one opened by a rejoin after a pod restart at two in the morning. Leaving the channel and coming back opens a new session, which is what fixes both; so does `!start-transcribing`.
 
-**Only the writing down is scheduled.** Off the record the bot still joins, still transcribes, and still hands each line to the tools that read one utterance at a time — a fine is announced and counted whether or not the evening is being kept, because [`verbal-morality`](#verbal-morality) is given the utterance rather than the file. What the schedule decides is whether anything is left afterwards for a summary to be written from, or for somebody to go back and read. A session that wrote nothing down seals as an empty one and takes its own file away, so an off-the-record evening leaves no trace in the tree and produces no summary. It is logged when it opens, so that is a fact about the deployment rather than something to work out from an empty directory.
+**Only the writing down is scheduled.** Off the record the bot still transcribes and still hands each line to the tools that read one utterance at a time — a fine is announced and counted whether or not the evening is being kept, because [`verbal-morality`](#verbal-morality) is given the utterance rather than the file. A session that wrote nothing down seals as an empty one and takes its own file away, so an off-the-record evening leaves no trace in the tree and produces no summary. It is logged when it opens, and every room on the record is listed at startup, so what is being kept is a fact about the deployment rather than something to work out from an empty directory.
 
-**An end at or before the start runs into the following day**, which is how one line says "Wednesday evening": `Wed 17:00-00:00` opens sessions from Wednesday 17:00 until midnight, and `Wed 21:00-02:00` until two in the morning on Thursday. `24:00` may be written for the end of a day, and an end equal to the start is the whole 24 hours. The start is included and the end is not, so `Wed 17:00-00:00` and `Thu 00:00-02:00` meet without overlapping and without leaving a minute between them. Days are `Mon` through `Sun`, or written out, in any case. The clock is `TZ`, the one the transcripts are stamped with and the one somebody writing `Wed 17:00` was reading.
+**Writing a window.** An end at or before the start runs into the following day, which is how one line says "Wednesday evening": `Wed 17:00-00:00` opens sessions from Wednesday 17:00 until midnight, and `Wed 21:00-02:00` until two in the morning on Thursday. `24:00` may be written for the end of a day, and an end equal to the start is the whole 24 hours. The start is included and the end is not, so `Wed 17:00-00:00` and `Thu 00:00-02:00` meet without overlapping and without leaving a minute between them. Days are `Mon` through `Sun`, or written out, in any case. The clock is `TZ`.
 
-**A schedule nothing could be read out of writes nothing down**, rather than falling back to writing everything down. An entry that cannot be read is dropped and reported at startup, and if none of them survive, the bot says so as an error and captures nothing. A schedule is written by somebody narrowing what is recorded, and a typo in it must not widen it back out: an evening not written down can be had again, and one that should not have been written down cannot be taken back.
+**A schedule nothing could be read out of writes nothing down**, rather than falling back to something wider. An entry that cannot be read is dropped and reported at startup, and if none of them survive, that room keeps nothing. A schedule is written by somebody narrowing what is recorded, and a typo in it must not widen it back out: an evening not written down can be had again; one that shouldn't have been written down can't be taken back.
+
+> **One coupling to know about.** Because the room list belongs to the `summary` tool, **a server with `summary` disabled writes nothing down at all.** Turning the tool off to stop the recaps also stops the transcripts. That is the price of configuring both in one place, and it is reported at startup rather than left to be noticed.
 
 ---
 
@@ -441,7 +449,7 @@ That is a working block. Everything below has a default.
 
 #### Which channels
 
-**Everything is per voice channel, under `monitored_channels`, and that mapping is also the switch.** A channel that is not in it is not summarized, is not posted, and does not answer the question either — one rule rather than two, so a room left off the list is left off entirely.
+**Everything is per voice channel, under `monitored_channels`, and that mapping is also the switch.** A channel that is not in it is **not transcribed**, not summarized, not posted, and does not answer the question either — one rule rather than four, so a room left off the list is left off entirely. See [The capture schedule](#the-capture-schedule) for what that means for the transcript, and note the consequence: **turning this tool off stops the server writing anything down.**
 
 Per channel rather than per server because a server's rooms are not interchangeable. One is where a game night happens and one is where two people are debugging something, and a bot that summarizes every room it was ever dragged into is writing files nobody asked for and posting them where everybody can read them. Opting a channel in is a line in the config file; that is the whole of the decision.
 
@@ -550,6 +558,7 @@ A prompt of your own can pull in the text the shipped ones share by naming it in
 | `minimum_utterances` | `5` | Below this a session is not a conversation and is not summarized |
 | `backoff_seconds` | `120` | How soon the channel can be told the same evening again. `0`, or below, tells it every time |
 | `session_gap_minutes` | `10` | How long the room can sit quiet before the rest of the night is a different evening. Not `resume_seconds`, and not to be set to match it |
+| `schedule` | *(unset)* | When a session in this room may **start** being written down, as a list of `Wed 17:00-00:00`. Unset keeps every session, or whatever `settings.transcripts.schedule` says. Read by the transcript writer rather than by this tool. See [The capture schedule](#the-capture-schedule) |
 | `preamble` | `Sure! Let me go look at my notes.` | What plays while the model is thinking |
 | `empty` | `I don't have any notes from this channel yet.` | What plays when nothing has ever been written down in this room |
 | `missing` | `I don't have any notes from then.` | What plays when there are notes, just not from the evening that was named |
@@ -780,7 +789,7 @@ Where transcripts are written is `TRANSCRIPT_DIR`, and what clock they are stamp
 |---|---|---|
 | `retention_days` | `-1` | Days to keep. `-1`, or any value below `1`, keeps forever |
 | `resume_seconds` | `5.0` | How long a transcript is held open for a reconnect to the same channel. `0` seals it on disconnect |
-| `schedule` | *(unset)* | When a session may start being written down, as a list of `Wed 17:00-00:00`. Unset writes everything down. Read once, when the bot joins: a session opening inside a window runs until the channel empties, and one opening outside it is still transcribed, fined, and answered. See [The capture schedule](#the-capture-schedule) |
+| `schedule` | *(unset)* | The default windows for a room listed in `monitored_channels` that names none of its own, as a list of `Wed 17:00-00:00`. **Not** what decides which rooms are kept — that is the room list itself. See [The capture schedule](#the-capture-schedule) |
 
 ### `presence`
 
@@ -926,11 +935,11 @@ The `!join` and `!leave` commands remain available either way. They require **Me
 
 ### Starting and stopping by hand
 
-Two commands override [the capture schedule](#the-capture-schedule) for the session the bot is currently in, for an evening it did not cover or one it did that nobody wanted kept:
+Two commands override [the capture schedule](#the-capture-schedule) for the session the bot is currently in, for an evening it did not cover, a room it does not list, or one it does that nobody wanted kept:
 
 | Command | Effect |
 |---|---|
-| `!start-transcribing` | Puts the open session on the record **from here on**. Nothing said before it was buffered anywhere, so there is nothing to backfill — this starts a transcript rather than completing one |
+| `!start-transcribing` | Puts the open session on the record **from here on**. Nothing said before it was buffered anywhere, so there is nothing to backfill — this starts a transcript rather than completing one. Works in a room that is not in `monitored_channels` at all, which is the only way to record one |
 | `!stop-transcribing` | Takes the open session off the record. **What is already written stays written**; stopping is a decision about what happens next, not a retraction. A session that never wrote anything still takes its own file away when it seals |
 
 **Both require Administrator on the server**, since what they decide is whether everybody in the room is on the record. A refusal is said out loud rather than silently ignored — a rule nobody is told about is one everybody keeps testing.

@@ -140,9 +140,13 @@ class Schedule:
     problems: tuple[str, ...] = ()
 
     @classmethod
-    def parse(cls, entries: Iterable[str]) -> "Schedule":
+    def parse(cls, entries: Iterable[str], where: str = SCHEDULE_SETTING) -> "Schedule":
         """
         Read a list of windows, keeping the ones that made sense.
+
+        `where` names the setting the entries came from, since the same list can
+        be written per deployment or per channel and a complaint that names the
+        wrong one sends somebody to the wrong part of the file.
 
         An entry that will not parse is dropped and reported rather than raised
         on, on the config file's rule that a typo should not stop the pod. It is
@@ -159,7 +163,7 @@ class Schedule:
                 continue
 
             configured = True
-            window = _window(written, problems)
+            window = _window(written, where, problems)
             if window is not None:
                 windows.append(window)
 
@@ -192,15 +196,21 @@ class Schedule:
         return WINDOW_SEPARATOR.join(window.describe() for window in self.windows)
 
 
+# No schedule was asked for, so everything is written down.
 ALWAYS = Schedule()
 
+# A schedule was asked for and nothing in it covers anything, so nothing is.
+# What a room absent from `monitored_channels` gets, and what a schedule nothing
+# could be read out of falls back to; see `Schedule.empty`.
+NEVER = Schedule(configured=True)
 
-def _window(entry: str, problems: list[str]) -> Window | None:
+
+def _window(entry: str, where: str, problems: list[str]) -> Window | None:
     """One window, or nothing and a complaint naming the entry it came from."""
     matched = ENTRY.match(entry.casefold())
     if matched is None:
         problems.append(
-            f"'{SCHEDULE_SETTING}' has an entry it cannot read, {entry!r}. "
+            f"'{where}' has an entry it cannot read, {entry!r}. "
             f"An entry is a day and a range, as in 'Wed 17:00-00:00'."
         )
         return None
@@ -208,7 +218,7 @@ def _window(entry: str, problems: list[str]) -> Window | None:
     day = DAYS.get(matched.group(DAY_GROUP))
     if day is None:
         problems.append(
-            f"'{SCHEDULE_SETTING}' entry {entry!r} does not start with a day of "
+            f"'{where}' entry {entry!r} does not start with a day of "
             f"the week. Those are "
             f"{WINDOW_SEPARATOR.join(name.capitalize() for name in DAY_NAMES)}, "
             f"in full or abbreviated to {ABBREVIATION_LENGTH} letters."
@@ -220,7 +230,7 @@ def _window(entry: str, problems: list[str]) -> Window | None:
 
     if start is None or end is None:
         problems.append(
-            f"'{SCHEDULE_SETTING}' entry {entry!r} has a time that is not one. "
+            f"'{where}' entry {entry!r} has a time that is not one. "
             f"Times are 24-hour, as in '17:00', and midnight is '00:00' or "
             f"'{END_OF_DAY}'."
         )

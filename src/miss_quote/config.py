@@ -15,7 +15,8 @@ from typing import Any, TypeVar
 import yaml
 from dotenv import load_dotenv
 
-from miss_quote.transcript.schedule import Schedule
+from miss_quote.transcript.schedule import ALWAYS, NEVER, Schedule
+from miss_quote.utils.slugs import slugify
 
 load_dotenv()
 
@@ -617,24 +618,6 @@ class TranscriptConfig:
         )
     )
 
-    # When a session may start being written down, as `Wed 17:00-00:00`. Read
-    # once per session, at the moment the bot joins: a session that opens inside
-    # a window keeps writing until everybody disconnects, however far past the
-    # end of it that is. A deployment that says nothing captures everything; one
-    # that says something unreadable captures nothing, because a schedule is
-    # written to narrow what is recorded and a typo in it must not widen it back
-    # out.
-    #
-    # Only the writing down is scheduled. A session off the record is still
-    # transcribed and still reaches the tools that read one utterance at a time,
-    # so a fine is announced and counted whether or not the evening is being
-    # kept. See `transcript.schedule`.
-    schedule: Schedule = field(
-        default_factory=lambda: Schedule.parse(
-            file_cfg.setting(TRANSCRIPTS_SECTION, SCHEDULE_KEY, ())
-        )
-    )
-
     # One file per connection, named for the moment the bot joined. Colons are
     # legal in the name on POSIX but travel badly, so the time is dash-separated.
     filename_timestamp_format: str = "%Y-%m-%dT%H-%M-%S"
@@ -909,6 +892,19 @@ TOOLS_KEY = "tools"
 TOOL_ENABLED_KEY = "enabled"
 TOOL_CONFIG_KEY = "config"
 
+# Where the rooms on the record are listed. The names live here rather than in
+# `tools.summary`, which imports this module and so cannot be imported back, and
+# because the shape of a server's block is this module's to describe: everything
+# else about it — the alias, the roster, what a tool block may hold — is already
+# named a few lines up.
+#
+# That the list belongs to a tool is a deliberate choice and a coupling worth
+# saying out loud. Transcribing a room, summarizing it, and telling it back are
+# one feature to whoever is in it, so they are configured in one place; the price
+# is that a server which turns the tool off stops writing anything down.
+SUMMARY_TOOL_NAME = "summary"
+MONITORED_CHANNELS_KEY = "monitored_channels"
+
 # Everything a tool block may say. Anything else in one is a setting written a
 # level too high — every tool's own settings live under 'config' — and is
 # reported rather than ignored: the symptom otherwise is a tool running on its
@@ -1009,6 +1005,76 @@ def _parse_tools(
     return tools
 
 
+def _channel_schedules(
+    servers: Mapping[int, ServerConfig], default: Schedule, problems: list[str]
+) -> Mapping[tuple[int, str], Schedule]:
+    """
+    Every room on the record, and when each may start being written down.
+
+    Keyed the way transcript directories are named, so a channel written one way
+    in the file matches whatever Discord is calling it today. A room absent from
+    here is never transcribed at all, which is why this is built from the whole
+    of `monitored_channels` rather than only the entries that named a schedule:
+    being listed is the permission, and the schedule only narrows it further.
+
+    Read here rather than where a session opens, so a window nobody can parse is
+    a line at startup instead of a discovery made by finding an empty directory
+    a week later.
+    """
+    schedules: dict[tuple[int, str], Schedule] = {}
+
+    for server_id, server in servers.items():
+        tool = server.tools.get(SUMMARY_TOOL_NAME)
+        if tool is None or not tool.enabled:
+            continue
+
+        monitored = tool.config.get(MONITORED_CHANNELS_KEY)
+        if not isinstance(monitored, Mapping):
+            continue
+
+        for name, settings in monitored.items():
+            channel = slugify(str(name))
+            written = settings.get(SCHEDULE_KEY) if isinstance(settings, Mapping) else None
+
+            if written is None:
+                schedules[(server_id, channel)] = default
+                continue
+
+            schedules[(server_id, channel)] = _channel_schedule(
+                written,
+                f"{MONITORED_CHANNELS_KEY}.{channel}.{SCHEDULE_KEY}",
+                f"Server {server_id}",
+                problems,
+            )
+
+    return schedules
+
+
+def _channel_schedule(
+    written: Any, where: str, whose: str, problems: list[str]
+) -> Schedule:
+    """
+    One channel's windows, with anything unreadable reported and dropped.
+
+    Complaints name the channel's own setting rather than the deployment-wide
+    one, since the same list can be written in either place and a complaint
+    pointing at the wrong one sends somebody to the wrong part of the file.
+    """
+    try:
+        entries = _parse_list(written)
+    except (TypeError, ValueError):
+        problems.append(
+            f"{whose}: '{where}' is not a list of windows, so that channel will "
+            f"not be transcribed until it is."
+        )
+        return NEVER
+
+    schedule = Schedule.parse(entries, where)
+    problems.extend(f"{whose}: {problem}" for problem in schedule.problems)
+
+    return schedule
+
+
 def _parse_server(
     key: Any, settings: Any, problems: list[str]
 ) -> tuple[int, ServerConfig] | None:
@@ -1072,6 +1138,11 @@ class FileConfig:
     # ordinary case: every setting has a default and nothing is required.
     settings: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
 
+    # Which rooms are on the record, by server and by the name their transcripts
+    # are filed under. Resolved once here rather than at every join; see
+    # `schedule_for`, which is the only thing that reads it.
+    channel_schedules: Mapping[tuple[int, str], Schedule] = field(default_factory=dict)
+
     @classmethod
     def load(cls) -> "FileConfig":
         path = Path(_env_str(CONFIG_FILE_ENV, DEFAULT_CONFIG_FILE))
@@ -1090,13 +1161,42 @@ class FileConfig:
                 server_id, server = parsed
                 servers[server_id] = server
 
+        parsed_settings = _parse_settings(raw.get(SETTINGS_KEY), problems)
+
+        # What a listed room falls back to when it named no windows of its own.
+        # Its complaints are collected here rather than dropped: a default
+        # nothing could be read out of leaves every room that relies on it
+        # keeping nothing, which is a silent way to stop recording.
+        default = Schedule.parse(
+            parsed_settings.get(TRANSCRIPTS_SECTION, {}).get(SCHEDULE_KEY, ())
+        )
+        problems.extend(default.problems)
+
         return cls(
             path=path,
             servers=servers,
-            settings=_parse_settings(raw.get(SETTINGS_KEY), problems),
+            settings=parsed_settings,
+            channel_schedules=_channel_schedules(servers, default, problems),
             problems=tuple(problems),
             found=True,
         )
+
+    def schedule_for(self, guild_id: int, channel: str) -> Schedule:
+        """
+        When a room may start being written down, or never.
+
+        `monitored_channels` is the list of rooms on the record, so a channel
+        absent from it is never transcribed at all rather than transcribed on
+        some wider default. That makes one list the answer to both "is this room
+        kept" and "when", which is the whole of what somebody sitting in it
+        wants to know.
+
+        A server whose `summary` tool is off or missing lists no rooms and so
+        keeps nothing. That is the cost of configuring this where it is, and it
+        is a real one: turning the tool off to stop the recaps also stops the
+        transcripts.
+        """
+        return self.channel_schedules.get((guild_id, slugify(channel)), NEVER)
 
     def setting(self, section: str, key: str, default: SettingT) -> SettingT:
         """

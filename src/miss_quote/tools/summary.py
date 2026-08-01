@@ -52,17 +52,18 @@ from zoneinfo import ZoneInfo
 from miss_quote.config import transcript_cfg
 from miss_quote.llm import client as llm
 from miss_quote.summary import dialogue, prompts, when as clauses
+from miss_quote.config import MONITORED_CHANNELS_KEY, SCHEDULE_KEY
 from miss_quote.summary.store import Chain, SummaryStore
 from miss_quote.summary.when import When
 from miss_quote.tools.base import Finder, Tool, ToolContext
 from miss_quote.tools.tts import Tts
-from miss_quote.transcript.writer import Source, Transcript, TranscriptSession, Utterance, slugify
+from miss_quote.transcript.writer import Source, Transcript, TranscriptSession, Utterance
 from miss_quote.utils.logging import get_logger
 from miss_quote.utils.phrases import normalized, pattern
+from miss_quote.utils.slugs import slugify
 
 logger = get_logger(__name__)
 
-MONITORED_CHANNELS_KEY = "monitored_channels"
 PROMPTS_KEY = "prompts"
 
 CHANNEL_KEY = "channel"
@@ -85,6 +86,10 @@ TRIGGERS_KEY = "triggers"
 # is the misconfiguration with no symptom.
 CHANNEL_KEYS = (
     CHANNEL_KEY,
+    # Read by the transcript writer rather than by this tool, but written here:
+    # a room is listed once, and being listed is what puts it on the record at
+    # all. See `config.schedule_for`.
+    SCHEDULE_KEY,
     PROMPT_KEY,
     RETELLING_PROMPT_KEY,
     RETELLING_WORDS_KEY,

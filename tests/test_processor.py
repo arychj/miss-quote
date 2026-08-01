@@ -7,6 +7,7 @@ import miss_quote.stt.processor as processor_module
 from miss_quote.config import vad_cfg
 from miss_quote.stt.processor import STTProcessor
 from miss_quote.tools.runner import ToolRunner
+from miss_quote.transcript.schedule import ALWAYS
 from miss_quote.transcript.writer import Source, TranscriptSession, TranscriptWriter
 
 TIMEZONE = "America/Los_Angeles"
@@ -75,7 +76,10 @@ async def build(monkeypatch, tmp_path, transcripts):
 
     def _build(tools: ToolRunner | None = None) -> tuple[STTProcessor, TranscriptSession]:
         writer = TranscriptWriter(
-            directory=tmp_path, timezone=TIMEZONE, retention_days=KEEP_FOREVER
+            directory=tmp_path,
+            timezone=TIMEZONE,
+            retention_days=KEEP_FOREVER,
+            schedules=lambda guild_id, channel: ALWAYS,
         )
         session = writer.open(SOURCE)
         processor = STTProcessor(tools or ToolRunner({}, {}))
