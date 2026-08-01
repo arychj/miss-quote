@@ -15,9 +15,10 @@ from discord.ext import commands
 
 from miss_quote.bot.announcer import DiscordAnnouncer
 from miss_quote.bot.audio_sink import STTAudioSink
+from miss_quote.bot.presence import DiscordPresence
 from miss_quote.bot.speaker import DiscordSpeaker
 from miss_quote.bot.topic import DiscordTopic
-from miss_quote.config import discord_cfg, file_cfg, transcript_cfg
+from miss_quote.config import discord_cfg, file_cfg, presence_cfg, transcript_cfg
 from miss_quote.stt.processor import STTProcessor
 from miss_quote.tools.runner import ToolRunner
 from miss_quote.transcript.writer import Source, TranscriptSession, TranscriptWriter, slugify
@@ -30,6 +31,14 @@ LISTEN_WATCHDOG_INTERVAL_SECONDS = 15.0
 
 UNKNOWN_NAME = "unknown"
 UNKNOWN_ID = 0
+
+# Starting and stopping by hand, for a conversation the schedule did not cover
+# or one it did and nobody wanted kept. Administrator-only: what these decide is
+# whether everybody in the room is on the record.
+START_TRANSCRIBING_COMMAND = "start-transcribing"
+STOP_TRANSCRIBING_COMMAND = "stop-transcribing"
+
+NOT_IN_A_CHANNEL = "❌ I am not in a voice channel here."
 
 
 def source_for(channel: Any) -> Source:
@@ -147,6 +156,11 @@ class STTBot:
             command_prefix=discord_cfg.command_prefix,
             intents=intents,
         )
+        # After the bot, which it sets the presence of. Nothing hands this to a
+        # tool, so unlike the speaker and the topic it has no ordering to work
+        # around and can hold the client directly.
+        self._presence = DiscordPresence(self._bot, presence_cfg.transcribing)
+
         self._watchdog: asyncio.Task | None = None
         self._prewarm: asyncio.Task | None = None
         self._services: Sequence[asyncio.Task] = ()
@@ -182,6 +196,7 @@ class STTBot:
         async def on_ready() -> None:
             logger.info("Logged in as %s (ID: %s)", bot.user, bot.user.id)
             self._report_servers()
+            self._report_schedule()
             self._report_tools()
             self._processor.start(asyncio.get_running_loop())
             self._start_listen_watchdog()
@@ -281,6 +296,39 @@ class STTBot:
                 len(unknown),
                 ", ".join(f"{guild.name} ({guild.id})" for guild in unknown),
             )
+
+    @staticmethod
+    def _report_schedule() -> None:
+        """
+        Say which hours are written down, and complain about the ones that were not.
+
+        A schedule nothing survived reading captures nothing, which is the safe
+        way to be wrong and a poor thing to discover a week later by finding an
+        empty directory. It is reported as an error for that reason, while a
+        deployment that asked for no schedule at all is the ordinary case and is
+        not worth a line.
+        """
+        schedule = transcript_cfg.schedule
+
+        for problem in schedule.problems:
+            logger.error("%s: %s", file_cfg.path, problem)
+
+        if not schedule.configured:
+            return
+
+        if schedule.empty:
+            logger.error(
+                "Nothing in the transcript schedule could be read, so nothing will "
+                "be written down. Correct it, or remove it to capture everything."
+            )
+            return
+
+        logger.info(
+            "Transcripts are kept for sessions opening during: %s. One that opens "
+            "then runs until the channel empties, however late; one that opens "
+            "outside them is still transcribed and answered, and is not written down.",
+            schedule.describe(),
+        )
 
     def _report_tools(self) -> None:
         """Say which tools are in play, and complain about the ones that are not."""
@@ -408,6 +456,9 @@ class STTBot:
             logger.info("Joined voice channel: %s", channel)
         except Exception as exc:
             logger.error("Could not join %s: %s", channel, exc)
+            return
+
+        await self._refresh_presence()
 
     @staticmethod
     def _warn_on_colliding_channel(channel: Any, guild: Any) -> None:
@@ -456,6 +507,7 @@ class STTBot:
         await self._end_session(previous)
 
         voice_client.listen(STTAudioSink(self._processor, self._session_for(channel)))
+        await self._refresh_presence()
 
     async def _disconnect(self, voice_client: discord.VoiceClient | None) -> None:
         if voice_client is None:
@@ -473,6 +525,24 @@ class STTBot:
         await self._end_session(channel_id)
 
     # ── transcript sessions ───────────────────────
+
+    async def _refresh_presence(self) -> None:
+        """
+        Say whether anything is being kept, after anything that could change it.
+
+        Derived from the open sessions rather than tracked alongside them, so
+        there is one answer and no second copy of it to fall out of step. The
+        presence deduplicates, so calling this after a transition that changed
+        nothing costs nothing.
+
+        A suspended session still counts. It is held open for a reconnect and
+        will be appended to if one comes, so a transcript that is still going to
+        take more of the conversation is one the room should still be told
+        about; the alternative flickers the status through every resume window.
+        """
+        await self._presence.transcribing(
+            any(session.capturing for session in self._sessions.values())
+        )
 
     def _session_for(self, channel: Any) -> TranscriptSession:
         """
@@ -514,6 +584,7 @@ class STTBot:
         if not transcript_cfg.resume_enabled:
             del self._sessions[channel_id]
             await self._finalize(session)
+            await self._refresh_presence()
             return
 
         self._expiries[channel_id] = asyncio.create_task(
@@ -529,6 +600,7 @@ class STTBot:
             del self._sessions[channel_id]
 
         await self._finalize(session)
+        await self._refresh_presence()
 
     def _cancel_expiry(self, channel_id: int) -> bool:
         """Stop a pending seal, reporting whether there was one."""
@@ -571,6 +643,8 @@ class STTBot:
         for channel_id in list(self._sessions):
             self._cancel_expiry(channel_id)
             await self._finalize(self._sessions.pop(channel_id))
+
+        await self._refresh_presence()
 
     # ── shutdown ──────────────────────────────────
 
@@ -616,3 +690,76 @@ class STTBot:
             await self._disconnect(ctx.voice_client)
             await ctx.send("👋 Left the voice channel.")
             logger.info("Left voice channel.")
+
+        @bot.command(name=START_TRANSCRIBING_COMMAND)
+        @commands.has_permissions(administrator=True)
+        async def cmd_start_transcribing(ctx: commands.Context) -> None:
+            """Put the session in the author's guild on the record."""
+            session = self._session_in(ctx)
+            if session is None:
+                await ctx.send(NOT_IN_A_CHANNEL)
+                return
+
+            if not session.start_capturing():
+                await ctx.send("📝 Already transcribing this conversation.")
+                return
+
+            await self._refresh_presence()
+            await ctx.send(
+                "📝 Transcribing from here on. Nothing said before this was kept."
+            )
+            logger.info(
+                "Transcription started by hand in %s.", session.source.relative_directory
+            )
+
+        @bot.command(name=STOP_TRANSCRIBING_COMMAND)
+        @commands.has_permissions(administrator=True)
+        async def cmd_stop_transcribing(ctx: commands.Context) -> None:
+            """Take the session in the author's guild off the record."""
+            session = self._session_in(ctx)
+            if session is None:
+                await ctx.send(NOT_IN_A_CHANNEL)
+                return
+
+            if not session.stop_capturing():
+                await ctx.send("🙊 Not transcribing this conversation.")
+                return
+
+            await self._refresh_presence()
+            await ctx.send("🙊 Stopped transcribing. What was already written stays.")
+            logger.info(
+                "Transcription stopped by hand in %s.", session.source.relative_directory
+            )
+
+        for command in (cmd_start_transcribing, cmd_stop_transcribing):
+            command.error(self._refuse_without_permission)
+
+    def _session_in(self, ctx: commands.Context) -> TranscriptSession | None:
+        """
+        The open session for the channel the bot is in, in the asker's server.
+
+        Through the voice client rather than the author's own channel: the bot
+        holds one voice connection per server, and the session being asked about
+        is the one it is sitting in, whether or not whoever typed this is there.
+        """
+        channel = getattr(ctx.voice_client, "channel", None)
+        if channel is None:
+            return None
+
+        return self._sessions.get(getattr(channel, "id", UNKNOWN_ID))
+
+    @staticmethod
+    async def _refuse_without_permission(ctx: commands.Context, error: Exception) -> None:
+        """
+        Say no out loud, for the one refusal these commands can produce.
+
+        A command that does nothing and says nothing is one somebody keeps
+        trying. Anything else is re-raised rather than swallowed, so a real
+        failure still reaches the log it would have reached.
+        """
+        if not isinstance(error, commands.MissingPermissions):
+            raise error
+
+        await ctx.send(
+            f"❌ `{ctx.prefix}{ctx.invoked_with}` needs Administrator on this server."
+        )

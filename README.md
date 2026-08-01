@@ -117,6 +117,30 @@ Guild and channel are not repeated in the line because the path already carries 
 
 Timestamps carry an explicit UTC offset, resolved through `TZ`.
 
+### The capture schedule
+
+**When a session may start being written down is `settings.transcripts.schedule`**, a list of a day and a 24-hour range:
+
+```yaml
+settings:
+  transcripts:
+    schedule:
+      - Wed 17:00-00:00
+      - Sat 12:00-14:00
+```
+
+Saying nothing writes everything down, which is what a deployment that has never set this already has.
+
+**A window is when an evening may *start* being recorded, not how long it may run for.** The schedule is read once per session, at the moment the bot joins, and the answer holds until the session seals: **a session that opens inside a window keeps writing until everybody disconnects**, however far past the end of the window that is. An evening does not stop being the evening at midnight, and a transcript cut off mid-conversation is worse than either the whole of it or none of it.
+
+The same rule runs the other way, which is the part worth knowing before setting one. **A session opened a minute early is off the record for its whole length** — it does not start writing when the window arrives — and so is one opened by a rejoin after a pod restart at two in the morning. Leaving the channel and coming back is what fixes both, since that is what opens a new session.
+
+**Only the writing down is scheduled.** Off the record the bot still joins, still transcribes, and still hands each line to the tools that read one utterance at a time — a fine is announced and counted whether or not the evening is being kept, because [`verbal-morality`](#verbal-morality) is given the utterance rather than the file. What the schedule decides is whether anything is left afterwards for a summary to be written from, or for somebody to go back and read. A session that wrote nothing down seals as an empty one and takes its own file away, so an off-the-record evening leaves no trace in the tree and produces no summary. It is logged when it opens, so that is a fact about the deployment rather than something to work out from an empty directory.
+
+**An end at or before the start runs into the following day**, which is how one line says "Wednesday evening": `Wed 17:00-00:00` opens sessions from Wednesday 17:00 until midnight, and `Wed 21:00-02:00` until two in the morning on Thursday. `24:00` may be written for the end of a day, and an end equal to the start is the whole 24 hours. The start is included and the end is not, so `Wed 17:00-00:00` and `Thu 00:00-02:00` meet without overlapping and without leaving a minute between them. Days are `Mon` through `Sun`, or written out, in any case. The clock is `TZ`, the one the transcripts are stamped with and the one somebody writing `Wed 17:00` was reading.
+
+**A schedule nothing could be read out of writes nothing down**, rather than falling back to writing everything down. An entry that cannot be read is dropped and reported at startup, and if none of them survive, the bot says so as an error and captures nothing. A schedule is written by somebody narrowing what is recorded, and a typo in it must not widen it back out: an evening not written down can be had again, and one that should not have been written down cannot be taken back.
+
 ---
 
 ## Summaries
@@ -756,6 +780,15 @@ Where transcripts are written is `TRANSCRIPT_DIR`, and what clock they are stamp
 |---|---|---|
 | `retention_days` | `-1` | Days to keep. `-1`, or any value below `1`, keeps forever |
 | `resume_seconds` | `5.0` | How long a transcript is held open for a reconnect to the same channel. `0` seals it on disconnect |
+| `schedule` | *(unset)* | When a session may start being written down, as a list of `Wed 17:00-00:00`. Unset writes everything down. Read once, when the bot joins: a session opening inside a window runs until the channel empties, and one opening outside it is still transcribed, fined, and answered. See [The capture schedule](#the-capture-schedule) |
+
+### `presence`
+
+What the bot says about itself while a conversation is being kept. Per deployment and necessarily so: Discord has one presence per bot rather than one per server. See [The status](#the-status).
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `transcribing` | `🎙️ transcribing...` | Shown under the bot's name while any session is on the record, and cleared when none is. Empty turns the signal off. The emoji goes in the words — a custom status has an emoji field of its own, and Discord does not apply it for a bot |
 
 ### `llm`
 
@@ -890,6 +923,34 @@ Pruning is **off by default**. Any value below `1` disables it entirely, so `0` 
 With `AUTOJOIN` enabled the bot connects as soon as a non-bot member enters a voice channel, and disconnects once the channel empties of humans. A bot can occupy only one voice channel per guild, so if a second channel becomes active it stays where it is rather than hopping, which would fragment both transcripts.
 
 The `!join` and `!leave` commands remain available either way. They require **Message Content Intent** to be enabled in the Discord Developer Portal.
+
+### Starting and stopping by hand
+
+Two commands override [the capture schedule](#the-capture-schedule) for the session the bot is currently in, for an evening it did not cover or one it did that nobody wanted kept:
+
+| Command | Effect |
+|---|---|
+| `!start-transcribing` | Puts the open session on the record **from here on**. Nothing said before it was buffered anywhere, so there is nothing to backfill — this starts a transcript rather than completing one |
+| `!stop-transcribing` | Takes the open session off the record. **What is already written stays written**; stopping is a decision about what happens next, not a retraction. A session that never wrote anything still takes its own file away when it seals |
+
+**Both require Administrator on the server**, since what they decide is whether everybody in the room is on the record. A refusal is said out loud rather than silently ignored — a rule nobody is told about is one everybody keeps testing.
+
+**The override dies with the session.** Rejoining opens a new one, which consults the schedule afresh. It does survive a resume-window reconnect, since that is the same session.
+
+### The status
+
+While any session is on the record the bot sets its own status to `settings.presence.transcribing` — `🎙️ transcribing...` by default — and clears it when none is.
+
+This is a **transparency signal, not a status readout**. Everybody can see the bot sitting in a channel, and hearing on its own retains nothing material: a fine is counted and the words behind it are gone. What is worth announcing is the part that leaves something afterwards — a transcript on disk, and the summaries and retellings written off it. So there is a wording for being on the record and deliberately none for listening.
+
+It **follows sessions, not speech.** A session being written down shows the status whether or not anybody is talking; driving it off utterances would flicker and spend the gateway's presence budget saying nothing new. Updates are deduplicated and only sent on a transition. A session held open for a reconnect still counts, since it will be appended to if one comes.
+
+Two things are worth knowing before relying on it:
+
+- **The presence is one per bot, not one per server.** Discord has no per-guild presence for bots, so a bot in two servers that is recording in one says so in both. Accepted rather than worked around — the alternative is one bot application per server — and it errs toward saying a conversation may be kept when it is not, which is the safe direction for this particular signal.
+- **The emoji is part of the text.** A custom status carries an emoji field of its own, and Discord does not apply it for bots, so the only spelling that reaches anybody is one written inside the words.
+
+Setting the wording to empty turns the signal off.
 
 ---
 

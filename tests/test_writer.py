@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 import miss_quote.transcript.writer as writer_module
+from miss_quote.transcript.schedule import ALWAYS, Schedule
 from miss_quote.transcript.writer import Source, TranscriptWriter, slugify
 
 TIMEZONE = "America/Los_Angeles"
@@ -42,9 +43,14 @@ def frozen_clock(monkeypatch):
     return move_to
 
 
-def _writer(tmp_path, retention_days: int = KEEP_FOREVER) -> TranscriptWriter:
+def _writer(
+    tmp_path, retention_days: int = KEEP_FOREVER, schedule: Schedule = ALWAYS
+) -> TranscriptWriter:
     return TranscriptWriter(
-        directory=tmp_path, timezone=TIMEZONE, retention_days=retention_days
+        directory=tmp_path,
+        timezone=TIMEZONE,
+        retention_days=retention_days,
+        schedule=schedule,
     )
 
 
@@ -175,6 +181,128 @@ def test_a_transcript_survives_a_line_it_cannot_parse(tmp_path, frozen_clock):
         "good",
         "also good",
     ]
+
+
+# ── the capture schedule ──────────────────────────
+
+# 2026-07-29 is a Wednesday.
+EVENING = Schedule.parse(["Wed 17:00-00:00"])
+
+
+def test_a_session_opening_inside_the_window_is_written_down(tmp_path, frozen_clock):
+    zone = ZoneInfo(TIMEZONE)
+
+    frozen_clock(datetime(2026, 7, 29, 18, 0, 0, tzinfo=zone))
+    session = _writer(tmp_path, schedule=EVENING).open(SOURCE)
+    session.write(USER_ID, USER, "on the record")
+
+    assert session.capturing
+    assert session.utterances == 1
+    assert "on the record" in session.path.read_text()
+
+
+def test_a_session_opening_outside_the_window_is_handed_over_and_not_written_down(
+    tmp_path, frozen_clock
+):
+    """
+    The tools read one utterance at a time, and are handed this object rather
+    than the file: a channel off the record is still fined and still answered.
+    """
+    zone = ZoneInfo(TIMEZONE)
+
+    frozen_clock(datetime(2026, 7, 29, 11, 0, 0, tzinfo=zone))
+    session = _writer(tmp_path, schedule=EVENING).open(SOURCE)
+    utterance = session.write(USER_ID, USER, "off the record")
+
+    assert not session.capturing
+    assert utterance.text == "off the record"
+    assert utterance.user == USER
+    assert session.utterances == 0
+    assert session.path.read_text() == ""
+
+
+def test_a_session_keeps_writing_past_the_end_of_its_window(tmp_path, frozen_clock):
+    """
+    A window says when an evening may start being recorded, not how long it may
+    run for. An evening does not stop being the evening at midnight, and a
+    transcript cut off mid-conversation is worse than the whole of it or none.
+    """
+    zone = ZoneInfo(TIMEZONE)
+
+    frozen_clock(datetime(2026, 7, 29, 23, 59, 0, tzinfo=zone))
+    session = _writer(tmp_path, schedule=EVENING).open(SOURCE)
+    session.write(USER_ID, USER, "before midnight")
+
+    frozen_clock(datetime(2026, 7, 30, 3, 0, 30, tzinfo=zone))
+    session.write(USER_ID, USER, "long after midnight")
+
+    assert session.utterances == 2
+    assert [json.loads(line)[writer_module.TEXT_FIELD] for line in
+            session.path.read_text().strip().splitlines()] == [
+        "before midnight",
+        "long after midnight",
+    ]
+
+
+def test_a_session_opened_early_does_not_start_writing_when_the_window_arrives(
+    tmp_path, frozen_clock
+):
+    """The decision is taken once, at open. The other half of the rule above."""
+    zone = ZoneInfo(TIMEZONE)
+
+    frozen_clock(datetime(2026, 7, 29, 16, 59, 0, tzinfo=zone))
+    session = _writer(tmp_path, schedule=EVENING).open(SOURCE)
+
+    frozen_clock(datetime(2026, 7, 29, 20, 0, 0, tzinfo=zone))
+    session.write(USER_ID, USER, "well inside the window")
+
+    assert not session.capturing
+    assert session.utterances == 0
+
+
+def test_rejoining_after_the_window_opens_a_session_that_is_written_down(
+    tmp_path, frozen_clock
+):
+    """Which is what makes the decision recoverable: leave, and come back."""
+    zone = ZoneInfo(TIMEZONE)
+    writer = _writer(tmp_path, schedule=EVENING)
+
+    frozen_clock(datetime(2026, 7, 29, 16, 59, 0, tzinfo=zone))
+    early = writer.open(SOURCE)
+    early.close()
+
+    frozen_clock(datetime(2026, 7, 29, 17, 0, 0, tzinfo=zone))
+    later = writer.open(SOURCE)
+    later.write(USER_ID, USER, "on the record")
+
+    assert not early.capturing
+    assert later.capturing
+    assert later.utterances == 1
+
+
+def test_a_session_off_the_record_leaves_no_file(tmp_path, frozen_clock):
+    """It seals as an empty session, which is what it is: nothing was written down."""
+    zone = ZoneInfo(TIMEZONE)
+
+    frozen_clock(datetime(2026, 7, 29, 11, 0, 0, tzinfo=zone))
+    session = _writer(tmp_path, schedule=EVENING).open(SOURCE)
+    session.write(USER_ID, USER, "off the record")
+
+    transcript = session.close()
+
+    assert transcript.empty
+    assert not transcript.path.exists()
+
+
+def test_no_schedule_writes_every_session_down(tmp_path, frozen_clock):
+    zone = ZoneInfo(TIMEZONE)
+
+    frozen_clock(datetime(2026, 7, 29, 4, 0, 0, tzinfo=zone))
+    session = _writer(tmp_path).open(SOURCE)
+    session.write(USER_ID, USER, "at an unreasonable hour")
+
+    assert session.capturing
+    assert session.utterances == 1
 
 
 # ── format and layout ─────────────────────────────

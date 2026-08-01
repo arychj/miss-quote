@@ -8,6 +8,14 @@ in one file and a reconnect starts a new one.
 
 Files are filed under `<guild>/<channel>/`, so the path carries the origin of
 every utterance and the lines themselves do not have to repeat it.
+
+Whether a session is written down at all is qualified by `transcript.schedule`,
+which is how a deployment says when an evening may start being recorded. The
+question is asked once, when the session opens, and its answer holds until the
+session seals: an evening that started on the record stays on it until everybody
+disconnects. One opened outside every window is transcribed and answered like
+any other and writes nothing down, so it seals as an empty session and takes its
+own file away again.
 """
 
 from __future__ import annotations
@@ -20,6 +28,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from miss_quote.config import transcript_cfg
+from miss_quote.transcript.schedule import ALWAYS, Schedule
 from miss_quote.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -236,13 +245,28 @@ class TranscriptSession:
     utterance, so nothing writing to a session that is still going has to handle
     a path that is not there. A session nobody ever spoke in takes it away again
     when it seals; see `close`.
+
+    Whether it writes anything down is settled here, against the moment it
+    opened, and does not change afterwards. A window says when an evening may
+    start being recorded rather than how long it may run for, so a session that
+    opens inside one keeps writing until everybody disconnects — an evening does
+    not stop being the evening at midnight, and a transcript cut off
+    mid-conversation is worse than either the whole of it or none of it.
     """
 
-    def __init__(self, path: Path, source: Source, opened: datetime, zone: ZoneInfo) -> None:
+    def __init__(
+        self,
+        path: Path,
+        source: Source,
+        opened: datetime,
+        zone: ZoneInfo,
+        schedule: Schedule = ALWAYS,
+    ) -> None:
         self._path = path
         self._source = source
         self._opened = opened
         self._zone = zone
+        self._capturing = schedule.covers(opened)
         self._utterances = 0
         self._suspended: datetime | None = None
         self._closed: datetime | None = None
@@ -263,17 +287,64 @@ class TranscriptSession:
         return self._opened
 
     @property
+    def capturing(self) -> bool:
+        """Whether this session is on the record, as the schedule decided at open."""
+        return self._capturing
+
+    def start_capturing(self) -> bool:
+        """
+        Put a session on the record from here on, reporting whether it moved.
+
+        From here on and no earlier: nothing said while off the record was kept
+        anywhere to be written down now, so this starts a transcript rather than
+        completing one. What comes back is whether anything changed, so a caller
+        can tell somebody who asked for this twice.
+        """
+        return self._capture(True)
+
+    def stop_capturing(self) -> bool:
+        """
+        Take a session off the record, reporting whether it moved.
+
+        What is already written stays written. Stopping is a decision about what
+        happens next, not a retraction, and a session that has anything in it
+        seals with what it had rather than being taken away.
+        """
+        return self._capture(False)
+
+    def _capture(self, capturing: bool) -> bool:
+        moved = self._capturing != capturing
+        self._capturing = capturing
+
+        return moved
+
+    @property
     def utterances(self) -> int:
         return self._utterances
 
     def write(self, user_id: int, user: str, text: str) -> Utterance:
-        """Append one utterance and return it."""
+        """
+        Note one utterance, appending it if this session is on the record.
+
+        The utterance comes back either way. What the schedule decides is
+        whether the line is written down, not whether it happened: the tools
+        that read one at a time are handed this object rather than the file, so
+        a channel off the record is still transcribed, still fined, and still
+        answered out loud.
+
+        `utterances` counts what reached disk, on the same reasoning. It is what
+        `close` reads to decide whether a session left anything behind, and a
+        file of no lines is not a record that the bot was there.
+        """
         utterance = Utterance(
             timestamp=datetime.now(self._zone),
             user_id=user_id,
             user=user,
             text=text,
         )
+
+        if not self._capturing:
+            return utterance
 
         with self._path.open("a", encoding="utf-8") as handle:
             handle.write(utterance.as_line() + "\n")
@@ -341,12 +412,14 @@ class TranscriptWriter:
         directory: Path | None = None,
         timezone: str | None = None,
         retention_days: int | None = None,
+        schedule: Schedule | None = None,
     ) -> None:
         self._directory = Path(directory or transcript_cfg.directory)
         self._zone = ZoneInfo(timezone or transcript_cfg.timezone)
         self._retention_days = (
             transcript_cfg.retention_days if retention_days is None else retention_days
         )
+        self._schedule = transcript_cfg.schedule if schedule is None else schedule
 
         self._directory.mkdir(parents=True, exist_ok=True)
         self.prune()
@@ -362,16 +435,32 @@ class TranscriptWriter:
         Pruning runs here. Sessions are the only recurring event the writer sees
         now that files no longer roll over on a date, and a bot that joins
         nothing for a week has nothing worth pruning anyway.
+
+        This is the only moment the schedule is consulted, so it is also the
+        only moment at which a session being off the record is worth saying: the
+        alternative is finding out by looking for a transcript that was never
+        going to be written.
         """
         self.prune()
 
         opened = datetime.now(self._zone)
-        return TranscriptSession(
+        session = TranscriptSession(
             path=self._path_for(source, opened),
             source=source,
             opened=opened,
             zone=self._zone,
+            schedule=self._schedule,
         )
+
+        if not session.capturing:
+            logger.info(
+                "Session in %s opened off the record; the capture schedule covers "
+                "nothing at %s, so nothing said will be written down.",
+                source.relative_directory,
+                opened.strftime(transcript_cfg.filename_timestamp_format),
+            )
+
+        return session
 
     def prune(self) -> list[Path]:
         """
