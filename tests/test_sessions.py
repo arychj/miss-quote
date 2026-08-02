@@ -31,13 +31,17 @@ WINDOWS_TO_WAIT = 10
 
 
 class Collector(Tool):
-    """Remembers every finished transcript it is handed."""
+    """Remembers every finished transcript it is handed, and every channel joined."""
 
     name = TOOL_NAME
     transcripts: list = []
+    joined: list = []
 
     async def handle_finished(self, transcript) -> None:
         Collector.transcripts.append(transcript)
+
+    async def handle_joined(self, source) -> None:
+        Collector.joined.append(source)
 
 
 class FakeChannel:
@@ -92,7 +96,19 @@ class FakeProcessor:
 @pytest.fixture(autouse=True)
 def collected():
     Collector.transcripts = []
+    Collector.joined = []
     return Collector.transcripts
+
+
+@pytest.fixture
+def joined(collected):
+    """
+    The channels the tools were told about, in the order they were taken up.
+
+    Taken after `collected`, which is what empties both: a list grabbed before
+    that would be the previous test's.
+    """
+    return Collector.joined
 
 
 @pytest.fixture
@@ -386,6 +402,51 @@ async def test_moving_channels_ends_one_transcript_and_starts_another(
     assert CHANNEL_ID not in bot._sessions
     assert collected == [first.close()]
     assert bot._sessions[OTHER_CHANNEL_ID].path.parent.name == "side-room"
+
+
+async def test_joining_tells_the_tools_which_channel(bot, joined):
+    """A tool whose output lives on the channel has a new room to address."""
+    await bot._connect(FakeChannel())
+
+    assert [(source.guild_id, source.channel_id) for source in joined] == [
+        (SERVER, CHANNEL_ID)
+    ]
+
+
+async def test_moving_tells_the_tools_about_the_channel_arrived_in(
+    bot, joined, resume_window
+):
+    resume_window(NO_RESUMING)
+    channel = FakeChannel()
+    await bot._connect(channel)
+
+    elsewhere = FakeChannel(OTHER_CHANNEL_ID, "side-room")
+    await bot._move(channel.voice_client, elsewhere)
+
+    assert [source.channel for source in joined] == ["general-voice", "side-room"]
+
+
+async def test_leaving_tells_the_tools_nothing(bot, joined, resume_window):
+    """The channel being left keeps whatever it was last shown."""
+    resume_window(NO_RESUMING)
+    channel = FakeChannel()
+    await bot._connect(channel)
+
+    await bot._disconnect(channel.voice_client)
+
+    assert len(joined) == 1
+
+
+async def test_a_join_that_never_happened_tells_the_tools_nothing(bot, joined):
+    """Nothing was taken up, so there is no room to put anything on."""
+
+    class Unreachable(FakeChannel):
+        async def connect(self, **kwargs):
+            raise RuntimeError("the gateway said no")
+
+    await bot._connect(Unreachable())
+
+    assert joined == []
 
 
 async def test_ending_a_channel_that_was_never_joined_is_harmless(bot, collected):

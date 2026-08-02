@@ -391,7 +391,7 @@ There is nothing to configure per server. What the tally is counted in and how o
 
 **It is enabled separately from whatever is counting.** A server that wants fines announced but not tallied enables `verbal-morality` and not this; the fines are announced and nothing is kept, and the log says so once at startup rather than leaving it to be discovered by wondering why the channel topic is empty.
 
-**The standings go in the voice channel topic**, as `Eli: -9 Erik: -2 Luke: -1 Ryan: 0`, which makes the topic the scoreboard — visible without asking the bot anything. A fine is a **debit**: everybody starts at nothing and goes down, so the number beside a name reads as what swearing has cost them rather than as points collected. Nothing assumes that direction, and `quotes` calls `credit` to pay for a title named in time, so a balance can climb back toward nothing and past it.
+**The standings go in the voice channel topic**, as `Eli: -9 Erik: -2 Luke: -1 Ryan: 0`, which makes the topic the scoreboard — visible without asking the bot anything. They go up as soon as the bot takes up a channel and are kept current for as long as it sits there; a channel the bot leaves keeps the last board it was shown. A fine is a **debit**: everybody starts at nothing and goes down, so the number beside a name reads as what swearing has cost them rather than as points collected. Nothing assumes that direction, and `quotes` calls `credit` to pay for a title named in time, so a balance can climb back toward nothing and past it.
 
 The board holds the **four furthest into the red, worst first**. A leaderboard rearranges itself every time somebody passes somebody else, which is the objection to publishing a whole roster in name order; at four places it is short enough to read at a glance. Ties break on the name, so two people on the same balance do not swap places between one edit and the next for no reason anybody can see.
 
@@ -502,7 +502,7 @@ Only used by `scoreboard`. Where the tally is written down is `CREDITS_FILE`.
 |---|---|---|
 | `currency` | `credit` | What a balance is denominated in, in the singular. The plural is grown from it by the spelling, so `penny` announces as `2 pennies`. Wording only — it changes nothing about what is counted |
 | `save_seconds` | `5.0` | How often a changed tally is written to disk. `0`, or any value below it, stops the loop: the tally is kept in memory and written only on shutdown |
-| `topic_seconds` | `10.0` | How often a changed tally is published to the voice channel topic — set as the channel **status**, a voice channel having no topic. `0`, or any value below it, keeps the tally off the channel entirely |
+| `topic_seconds` | `10.0` | How often a changed tally is published to the voice channel topic — set as the channel **status**, a voice channel having no topic. The board also goes up the moment the bot takes up a channel, changed or not, so a fresh room is not left blank until somebody swears. `0`, or any value below it, keeps the tally off the channel entirely |
 
 ### settings.fines {#settings-fines}
 

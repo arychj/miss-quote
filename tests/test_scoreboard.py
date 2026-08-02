@@ -10,10 +10,14 @@ from miss_quote.ledger.credits import CreditLedger
 from miss_quote.tools.base import ToolContext
 from miss_quote.tools.runner import ToolRunner
 from miss_quote.tools.scoreboard import Scoreboard
+from miss_quote.transcript.writer import Source
 
 SERVER_ID = 123456789012345678
 SERVER = "first-server"
 OTHER_SERVER = "second-server"
+
+CHANNEL_ID = 987654321098765432
+CHANNEL = "The Long Table"
 
 ELI, ELI_ID = "Eli", 1
 ERIK, ERIK_ID = "Erik", 2
@@ -109,6 +113,15 @@ def _board(topic=None, server: str = SERVER, users=None) -> Scoreboard:
             users=ROSTER if users is None else users,
             topic=RecordingTopic() if topic is None else topic,
         )
+    )
+
+
+def _joined() -> Source:
+    return Source(
+        guild_id=SERVER_ID,
+        guild_alias=SERVER,
+        channel_id=CHANNEL_ID,
+        channel=CHANNEL,
     )
 
 
@@ -240,6 +253,58 @@ async def test_a_board_with_nobody_on_it_publishes_nothing(ledger, topic):
     await _board(topic, users={}).publish()
 
     assert topic.published == []
+
+
+# ── joining a channel ─────────────────────────────
+
+
+async def test_joining_a_channel_publishes_a_board_that_has_not_changed(ledger, topic):
+    """
+    The whole point of the moment.
+
+    A revision says whether the board changed, not whether the channel now
+    reading it has ever been shown one, so the same line goes up again.
+    """
+    board = _board(topic)
+    board.debit(ELI_ID, ELI, ONE_CREDIT)
+    await board.publish()
+
+    await board.handle_joined(_joined())
+
+    assert topic.published == [f"{ELI}: -1 {ERIK}: 0"] * 2
+
+
+async def test_joining_a_channel_with_nobody_on_the_board_publishes_nothing(
+    ledger, topic
+):
+    """A blank status would wipe whatever somebody put there by hand."""
+    await _board(topic, users={}).handle_joined(_joined())
+
+    assert topic.published == []
+
+
+async def test_a_board_the_joined_channel_would_not_take_is_published_later(
+    ledger, topic
+):
+    """A join publishes through the same gate, so a refusal is still owed."""
+    topic.accepting = False
+    board = _board(topic)
+    await board.handle_joined(_joined())
+
+    topic.accepting = True
+    await board.publish()
+
+    assert topic.published == [f"{ELI}: 0 {ERIK}: 0"]
+
+
+async def test_the_interval_does_not_republish_what_a_join_just_put_up(ledger, topic):
+    """The join brings the watermark up, so the next tick finds nothing new."""
+    board = _board(topic)
+    await board.handle_joined(_joined())
+
+    await board.publish()
+
+    assert len(topic.published) == 1
 
 
 # ── the topic's own interval ──────────────────────
@@ -432,14 +497,23 @@ def _servers() -> dict[int, ServerConfig]:
     }
 
 
-def test_a_board_is_a_tool_that_runs_rather_than_listens(ledger):
+def test_a_board_runs_and_watches_for_a_join_rather_than_listening(ledger):
     """It hears nothing and says nothing, which is not the same as being inert."""
     runner = ToolRunner(_servers(), {Scoreboard.name: Scoreboard})
 
     assert runner.describe() == {SERVER: (Scoreboard.name,)}
     assert runner.problems == []
     assert [type(tool) for tool in runner._serving] == [Scoreboard]
+    assert [type(tool) for tool in runner._on_joined[SERVER_ID]] == [Scoreboard]
     assert runner._on_utterance == {}
+
+
+async def test_the_runner_puts_a_board_up_on_the_channel_it_joined(ledger, topic):
+    runner = ToolRunner(_servers(), {Scoreboard.name: Scoreboard}, topic=topic)
+
+    await runner.dispatch_joined(_joined())
+
+    assert topic.published == [f"{ELI}: 0 {ERIK}: 0"]
 
 
 async def test_the_runner_closes_a_board(ledger, path):

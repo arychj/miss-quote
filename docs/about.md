@@ -42,6 +42,7 @@ graph TD
     J --> K["TRANSCRIPT_DIR/guild/channel/session.jsonl"]
     J -->|"handle_utterance"| L["Tools for this server"]
     K -.->|"handle_finished, on disconnect"| L
+    A -.->|"handle_joined, on connect"| L
 
     L -.->|"tts.play"| T["<b>tts</b> tool<br/><i>one per server</i>"]
     T -.->|"a phrase"| M["Speech cache<br/><i>Ogg Opus in SPEECH_DIR/cache</i>"]
@@ -229,7 +230,7 @@ It is a separate directory from the cache and that is the whole point: nothing w
 
 ## Writing a tool
 
-A tool reads a server's transcripts and does something with them. Configuration decides only **which servers a tool applies to** and **what settings it is handed**; the tool itself decides when it runs, by defining any of three methods:
+A tool reads a server's transcripts and does something with them. Configuration decides only **which servers a tool applies to** and **what settings it is handed**; the tool itself decides when it runs, by defining any of four methods:
 
 ```python
 class Example(Tool):
@@ -241,6 +242,9 @@ class Example(Tool):
     async def handle_finished(self, transcript) -> None:
         """Called once the session is sealed."""
 
+    async def handle_joined(self, source) -> None:
+        """Called once the bot has taken up a voice channel."""
+
     async def run(self) -> None:
         """Started once the bot has connected, and left going."""
 ```
@@ -249,13 +253,14 @@ A tool is also handed a `topic`, which is somewhere to put one line where the ch
 
 A topic and an announcer are different things and not two spellings of one. A topic is a single line that replaces the last one under a voice channel's name — a tally worth glancing at. An announcement is a message that joins the ones before it in a channel somebody scrolls back through — a summary worth reading later. `scoreboard` uses the first and `summary` the second.
 
-None of the three moments exists on the base class, so their absence is meaningful: the runner inspects each instance once at startup and files it under the moments it handles. A tool that defines none of them is reported as configured-but-inert rather than silently doing nothing.
+None of the four moments exists on the base class, so their absence is meaningful: the runner inspects each instance once at startup and files it under the moments it handles. A tool that defines none of them is reported as configured-but-inert rather than silently doing nothing.
 
 - **`handle_utterance`** is dispatched after the line is on disk, so a tool that reads the file sees the same thing it was handed. It is not called for an empty transcription.
 - **`handle_finished`** is dispatched once the resume window has passed without a reconnect, so a tool sees one whole conversation rather than a fragment per disconnect. On shutdown, open sessions are sealed immediately rather than waiting the window out. It is not called for a session nobody spoke in.
+- **`handle_joined`** is dispatched once the bot has taken up a voice channel, whether it walked in or moved there — a move being a leave and a join. Nothing was said and nothing is being read; it is for a tool whose output lives **on** the channel, which has just been handed a different room. `scoreboard` uses it to put the board up without waiting for the tally to change. Leaving dispatches nothing, so a channel the bot walks out of keeps whatever it was last shown.
 - **`run`** is the tool's own, started once after the bot connects and left going for the life of the process. A tool that only runs never sees a transcript, which is fine — it is still that server's tool, built with that server's settings and roster.
 
-All three are coroutines running on the bot's event loop; anything blocking is the tool's own business to push onto a thread. A tool is constructed **once per server** that elects into it, so it may hold state, but its handlers can be entered concurrently — utterances are transcribed in parallel and dispatched as they land, not in the order they were spoken.
+All four are coroutines running on the bot's event loop; anything blocking is the tool's own business to push onto a thread. A tool is constructed **once per server** that elects into it, so it may hold state, but its handlers can be entered concurrently — utterances are transcribed in parallel and dispatched as they land, not in the order they were spoken.
 
 ### Warming and closing
 

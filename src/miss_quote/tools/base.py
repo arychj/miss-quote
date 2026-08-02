@@ -2,23 +2,31 @@
 What a transcript tool is.
 
 A tool is handed a server's transcripts and does something with them. It runs at
-one or more of three moments, and it says which by defining the matching method:
+one or more of four moments, and it says which by defining the matching method:
 
     async def handle_utterance(self, utterance, session) -> None
     async def handle_finished(self, transcript) -> None
+    async def handle_joined(self, source) -> None
     async def run(self) -> None
 
 None of them is defined on `Tool`, so their absence is meaningful; the runner
 inspects each instance once at startup and only calls what is there. A tool that
 defines none of them is configured but inert, which the runner reports.
 
-The first two are dispatched: something was said, or a conversation ended. The
-third is the tool's own, started once after the bot has connected and left going
-for as long as the process is — a tally published on an interval is the one that
-exists. A tool that only runs never sees a transcript, which is fine: it is still
-that server's tool, built with that server's settings and roster.
+The first three are dispatched: something was said, a conversation ended, or the
+bot took up a channel. The last is the tool's own, started once after the bot has
+connected and left going for as long as the process is — a tally published on an
+interval is the one that exists. A tool that only runs never sees a transcript,
+which is fine: it is still that server's tool, built with that server's settings
+and roster.
 
-All three are coroutines. Anything blocking — a model call, a large read, a
+The join is the odd one out, in that nothing was said and nothing is being read.
+It is for a tool whose output lives *on* the channel rather than in a transcript:
+the room the bot is addressing has just changed, and anything already put where
+that room can see it is now hanging under somewhere else. A tool with nothing on
+a channel has no use for it.
+
+All four are coroutines. Anything blocking — a model call, a large read, a
 database round trip — is the tool's own business to push onto a thread; the
 handlers run on the bot's event loop, and one that blocks stops audio being
 received.
@@ -386,6 +394,13 @@ class FinishedHandler(Protocol):
     """A tool that wants the whole conversation once the bot has left."""
 
     async def handle_finished(self, transcript: Transcript) -> None: ...
+
+
+@runtime_checkable
+class JoinHandler(Protocol):
+    """A tool that wants to know when the bot has taken up a channel."""
+
+    async def handle_joined(self, source: Source) -> None: ...
 
 
 @runtime_checkable

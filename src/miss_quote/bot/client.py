@@ -486,6 +486,7 @@ class STTBot:
             return
 
         await self._refresh_presence()
+        await self._tools.dispatch_joined(source_for(channel))
 
     @staticmethod
     def _warn_on_colliding_channel(channel: Any, guild: Any) -> None:
@@ -521,7 +522,8 @@ class STTBot:
 
         A bot holds one voice connection per guild, so a move is a leave and a
         join. Carrying the session across would file one channel's speech under
-        another channel's directory.
+        another channel's directory, and a tool that writes on the channel is
+        addressing a room it has not said anything to yet.
         """
         previous = getattr(voice_client.channel, "id", UNKNOWN_ID)
 
@@ -535,6 +537,7 @@ class STTBot:
 
         voice_client.listen(STTAudioSink(self._processor, self._session_for(channel)))
         await self._refresh_presence()
+        await self._tools.dispatch_joined(source_for(channel))
 
     async def _disconnect(self, voice_client: discord.VoiceClient | None) -> None:
         if voice_client is None:
