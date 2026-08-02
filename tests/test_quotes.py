@@ -1,11 +1,13 @@
 """What sets a quote off, what comes back, how long the line stays spent, and who is paid for placing it."""
 
 import asyncio
+from collections.abc import Mapping
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
 import pytest
+import yaml
 
 import miss_quote.tools.tts as tts_tool
 from miss_quote.config import (
@@ -26,7 +28,6 @@ from miss_quote.tools.quotes import (
     DEFAULT_SELF_ANSWER_ANNOUNCEMENT,
     DEFAULT_SELF_ANSWER_PENALTY,
     DEFAULT_TIE_ANNOUNCEMENT,
-    FIRST_ROW,
     PENALIZE_SELF_ANSWERS_KEY,
     REMARKS_KEY,
     SELF_ANSWER_ANNOUNCEMENT_KEY,
@@ -78,21 +79,40 @@ GENERAL_QUOTE = "Sounds like someone has a case of the Mondays."
 SPECIFIC_TRIGGER = "case of the monday"
 SPECIFIC_QUOTE = "No. No man."
 
-# A line with a comma in it, which the file has to quote and the reader unquote.
+# A line with a comma in it, which the format no longer has to do anything about.
 COMMA_TRIGGER = "give up"
 COMMA_QUOTE = "Never give up, never surrender!"
 
 PERSONAL_TRIGGER = "question"
 PERSONAL_QUOTE = "{user} question is dumb."
 
-HEADER = "movie,trigger,quote"
-ROWS = (
-    f"{MOVIE},{TRIGGER},{QUOTE}",
-    f"{OTHER_MOVIE},{OTHER_TRIGGER},{OTHER_QUOTE}",
-)
+QUOTES = {
+    MOVIE: {TRIGGER: QUOTE},
+    OTHER_MOVIE: {OTHER_TRIGGER: OTHER_QUOTE},
+}
+
+
+def _besides(trigger: str, quote: str) -> dict[str, dict[str, str]]:
+    """
+    The two-quote file with one more entry, written first.
+
+    Merged into the first title rather than added beside it, because a mapping
+    keyed on the title would otherwise replace it and quietly take the entry
+    under test back out again. First so that it is the second line of the file,
+    which is what a test about the reported line number wants.
+    """
+    return {
+        MOVIE: {trigger: quote, **QUOTES[MOVIE]},
+        OTHER_MOVIE: QUOTES[OTHER_MOVIE],
+    }
+
 
 # Taken from the config rather than rebuilt here, so a moved file is one edit.
 BUNDLED = BUNDLED_QUOTES
+
+# Wide enough that safe_dump never folds a line across two of them, which would
+# be a fixture testing the dumper rather than the loader.
+NO_FOLDING = 4096
 
 # A window of its own, so a test about the backoff is not also a test of what the
 # deployment set it to.
@@ -233,16 +253,46 @@ def speaker() -> RecordingSpeaker:
     return RecordingSpeaker()
 
 
+def _drawn(monkeypatch, last: bool = False) -> None:
+    """
+    Settle which of several the tool draws, overriding the autouse `settled`.
+
+    For the two things it leaves to chance — the ending an announcement takes,
+    and the answer a trigger listing several gives — where a test is about the
+    drawing rather than about what was drawn.
+    """
+    monkeypatch.setattr(
+        "miss_quote.tools.quotes._chosen", lambda options: options[-1 if last else 0]
+    )
+
+
 @pytest.fixture
 def quotes_file(monkeypatch, tmp_path) -> Path:
     """A file of two quotes, in place of whatever the deployment ships."""
-    return _written(monkeypatch, tmp_path, HEADER, *ROWS)
+    return _written(monkeypatch, tmp_path, QUOTES)
 
 
-def _written(monkeypatch, directory: Path, *lines: str) -> Path:
+def _written(
+    monkeypatch, directory: Path, quotes: Mapping[str, Mapping[str, str | list[str]]]
+) -> Path:
     """A quotes file the tool will read, whatever it holds."""
-    path = directory / "quotes.csv"
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return _raw(
+        monkeypatch,
+        directory,
+        yaml.safe_dump(quotes, allow_unicode=True, sort_keys=False, width=NO_FOLDING),
+    )
+
+
+def _raw(monkeypatch, directory: Path, text: str) -> Path:
+    """
+    The same, for a document a mapping cannot express.
+
+    A key written twice and a file that is not YAML at all are both things the
+    loader has an opinion about and neither is something `safe_dump` can be
+    asked for.
+    """
+    path = directory / "quotes.yaml"
+    path.write_text(text, encoding="utf-8")
     _pointed_at(monkeypatch, path)
 
     return path
@@ -268,19 +318,6 @@ def settled(monkeypatch) -> None:
     """
     monkeypatch.setattr(
         "miss_quote.tools.quotes._chosen", lambda remarks: remarks[0]
-    )
-
-
-def _drawn(monkeypatch, last: bool = False) -> None:
-    """
-    Settle which of several the tool draws, overriding the autouse `settled`.
-
-    For the two things it leaves to chance — the ending an announcement takes,
-    and the answer a repeated trigger gives — where a test is about the drawing
-    rather than about what was drawn.
-    """
-    monkeypatch.setattr(
-        "miss_quote.tools.quotes._chosen", lambda options: options[-1 if last else 0]
     )
 
 
@@ -405,7 +442,7 @@ def _warmed_awards(
 # ── the file ──────────────────────────────────────
 
 
-def test_a_quote_is_loaded_for_every_row(quotes_file):
+def test_a_quote_is_loaded_for_every_entry(quotes_file):
     assert _load(quotes_file) == {
         TRIGGER: (Quote(movie=MOVIE, trigger=TRIGGER, text=QUOTE),),
         OTHER_TRIGGER: (
@@ -415,87 +452,124 @@ def test_a_quote_is_loaded_for_every_row(quotes_file):
 
 
 def test_a_missing_file_will_not_start(monkeypatch, tmp_path, speech, speaker):
-    _pointed_at(monkeypatch, tmp_path / "absent.csv")
+    _pointed_at(monkeypatch, tmp_path / "absent.yaml")
 
     with pytest.raises(ValueError, match="Could not read"):
         _tool(speaker)
 
 
-def test_a_file_with_no_quote_column_will_not_start(monkeypatch, tmp_path):
-    path = _written(monkeypatch, tmp_path, "movie,trigger", f"{MOVIE},{TRIGGER}")
+def test_a_file_that_will_not_parse_will_not_start(monkeypatch, tmp_path):
+    path = _raw(monkeypatch, tmp_path, f'{MOVIE}:\n  {TRIGGER}: "unclosed\n')
 
-    with pytest.raises(ValueError, match="quote"):
+    with pytest.raises(ValueError, match="not valid YAML"):
         _load(path)
 
 
-def test_a_file_with_only_a_header_will_not_start(monkeypatch, tmp_path):
-    path = _written(monkeypatch, tmp_path, HEADER)
+def test_a_file_that_is_not_a_mapping_will_not_start(monkeypatch, tmp_path):
+    """It is not a file with a bad entry in it, it is not this file."""
+    path = _raw(monkeypatch, tmp_path, f"- {MOVIE}\n- {OTHER_MOVIE}\n")
+
+    with pytest.raises(ValueError, match="mapping of titles"):
+        _load(path)
+
+
+def test_an_empty_document_will_not_start(monkeypatch, tmp_path):
+    path = _written(monkeypatch, tmp_path, {})
 
     with pytest.raises(ValueError, match="no usable quotes"):
         _load(path)
 
 
-def test_a_row_missing_its_trigger_is_dropped(monkeypatch, tmp_path):
+def test_an_entry_missing_its_trigger_is_dropped(monkeypatch, tmp_path):
     """One typo in fifty lines should cost that line and no more."""
-    path = _written(monkeypatch, tmp_path, HEADER, f"{MOVIE},,{QUOTE}", *ROWS)
+    path = _written(monkeypatch, tmp_path, _besides("", QUOTE))
 
     assert set(_load(path)) == {TRIGGER, OTHER_TRIGGER}
 
 
-def test_a_row_missing_its_quote_is_dropped(monkeypatch, tmp_path):
-    path = _written(monkeypatch, tmp_path, HEADER, f"{MOVIE},{GENERAL_TRIGGER},", *ROWS)
+def test_an_entry_missing_its_quote_is_dropped(monkeypatch, tmp_path):
+    path = _written(monkeypatch, tmp_path, _besides(GENERAL_TRIGGER, ""))
 
     assert set(_load(path)) == {TRIGGER, OTHER_TRIGGER}
 
 
 def test_a_quote_with_an_unfillable_placeholder_is_dropped(monkeypatch, tmp_path):
     """Checked at load rather than at the moment somebody says the trigger."""
-    path = _written(
-        monkeypatch, tmp_path, HEADER, f"{MOVIE},{GENERAL_TRIGGER},it is {{tally}}", *ROWS
-    )
+    path = _written(monkeypatch, tmp_path, _besides(GENERAL_TRIGGER, "it is {tally}"))
 
     assert set(_load(path)) == {TRIGGER, OTHER_TRIGGER}
 
 
-def test_every_row_sharing_a_trigger_is_kept(monkeypatch, tmp_path):
-    """A phrase worth answering two ways says so by being written down twice."""
-    path = _written(monkeypatch, tmp_path, HEADER, *ROWS, f"{MOVIE},{TRIGGER},{OTHER_QUOTE}")
-
-    assert [quote.text for quote in _load(path)[TRIGGER]] == [QUOTE, OTHER_QUOTE]
-
-
-def test_rows_sharing_a_trigger_keep_the_order_of_the_file(monkeypatch, tmp_path):
-    """So that a seeded draw picks the same answer twice running."""
-    path = _written(
+def test_a_title_that_holds_no_mapping_is_dropped(monkeypatch, tmp_path):
+    path = _raw(
         monkeypatch,
         tmp_path,
-        HEADER,
-        f"{MOVIE},{TRIGGER},{OTHER_QUOTE}",
-        f"{MOVIE},{TRIGGER},{QUOTE}",
+        f"{MOVIE}: just a line\n\n{OTHER_MOVIE}:\n  {OTHER_TRIGGER}: {OTHER_QUOTE}\n",
     )
 
-    assert [quote.text for quote in _load(path)[TRIGGER]] == [OTHER_QUOTE, QUOTE]
+    assert set(_load(path)) == {OTHER_TRIGGER}
 
 
-def test_rows_sharing_a_trigger_in_different_cases_are_one_trigger(monkeypatch, tmp_path):
-    """The trigger is folded before it is keyed, so case is not what tells them apart."""
+def test_a_trigger_repeated_under_one_title_keeps_the_first(monkeypatch, tmp_path):
+    """
+    Which the format cannot express, so nothing but the raw text can say it.
+
+    `safe_load` would keep the last of them without a word. The file is read top
+    to bottom, so the line somebody has to go and delete is the later one.
+    """
+    path = _raw(
+        monkeypatch,
+        tmp_path,
+        f"{MOVIE}:\n  {TRIGGER}: {QUOTE}\n  {TRIGGER}: {OTHER_QUOTE}\n",
+    )
+
+    assert _load(path)[TRIGGER][0].text == QUOTE
+
+
+def test_a_trigger_repeated_under_another_title_keeps_the_first(monkeypatch, tmp_path):
+    """A trigger answers with one line, wherever in the file it was written."""
     path = _written(
         monkeypatch,
         tmp_path,
-        HEADER,
-        f"{MOVIE},{TRIGGER},{QUOTE}",
-        f"{MOVIE},{TRIGGER.upper()},{OTHER_QUOTE}",
+        {MOVIE: {TRIGGER: QUOTE}, OTHER_MOVIE: {TRIGGER: OTHER_QUOTE}},
     )
 
     loaded = _load(path)
     assert set(loaded) == {TRIGGER}
-    assert len(loaded[TRIGGER]) == 2
+    assert loaded[TRIGGER][0].movie == MOVIE
+
+
+def test_the_repeated_trigger_says_where_the_first_one_is(monkeypatch, tmp_path, caplog):
+    path = _written(
+        monkeypatch,
+        tmp_path,
+        {MOVIE: {TRIGGER: QUOTE}, OTHER_MOVIE: {TRIGGER: OTHER_QUOTE}},
+    )
+
+    with caplog.at_level("WARNING"):
+        _load(path)
+
+    assert MOVIE in caplog.text
+    assert OTHER_MOVIE in caplog.text
+
+
+def test_triggers_differing_only_in_case_are_one_trigger(monkeypatch, tmp_path):
+    """The trigger is folded before it is keyed, so case is not what tells them apart."""
+    path = _written(
+        monkeypatch,
+        tmp_path,
+        {MOVIE: {TRIGGER: QUOTE}, OTHER_MOVIE: {TRIGGER.upper(): OTHER_QUOTE}},
+    )
+
+    loaded = _load(path)
+    assert set(loaded) == {TRIGGER}
+    assert loaded[TRIGGER][0].text == QUOTE
 
 
 def test_two_triggers_may_share_a_quote(monkeypatch, tmp_path):
     """Which is how the file says two phrases deserve the same answer."""
     path = _written(
-        monkeypatch, tmp_path, HEADER, *ROWS, f"{MOVIE},{GENERAL_TRIGGER},{QUOTE}"
+        monkeypatch, tmp_path, {MOVIE: {TRIGGER: QUOTE, GENERAL_TRIGGER: QUOTE}}
     )
 
     loaded = _load(path)
@@ -503,42 +577,44 @@ def test_two_triggers_may_share_a_quote(monkeypatch, tmp_path):
 
 
 def test_a_quote_may_hold_a_comma(monkeypatch, tmp_path):
-    """It is a CSV of film dialogue; most of the punctuation is in the last column."""
-    path = _written(monkeypatch, tmp_path, HEADER, f'{MOVIE},{COMMA_TRIGGER},"{COMMA_QUOTE}"')
+    """Which the format no longer has to be told about."""
+    path = _written(monkeypatch, tmp_path, {MOVIE: {COMMA_TRIGGER: COMMA_QUOTE}})
 
-    assert path.read_text(encoding="utf-8").count('"') == 2
     assert _load(path)[COMMA_TRIGGER][0].text == COMMA_QUOTE
 
 
-def test_a_row_with_an_unquoted_comma_is_dropped(monkeypatch, tmp_path):
+@pytest.mark.parametrize("written", ("no", "1917"))
+def test_an_entry_yaml_did_not_read_as_text_is_dropped(monkeypatch, tmp_path, written):
     """
-    What survives it is the line cut at the comma, which is worse than silence.
+    An unquoted `no` is a boolean and an unquoted `1917` is an integer.
 
-    The only mistake in the file that loads cleanly: the reader files the rest of
-    the sentence under an overflow nothing reads, so `Boy, that escalated
-    quickly.` becomes `Boy` and nothing anywhere says so.
+    Both look entirely correct in the file and neither is something the matcher
+    can ever compare against, which is the mistake this format makes possible
+    and a CSV could not.
     """
-    path = _written(
-        monkeypatch, tmp_path, HEADER, f"{MOVIE},{COMMA_TRIGGER},{COMMA_QUOTE}", *ROWS
+    path = _raw(
+        monkeypatch,
+        tmp_path,
+        f"{MOVIE}:\n  {written}: {QUOTE}\n\n{OTHER_MOVIE}:\n"
+        f"  {OTHER_TRIGGER}: {OTHER_QUOTE}\n",
     )
 
-    assert set(_load(path)) == {TRIGGER, OTHER_TRIGGER}
+    assert set(_load(path)) == {OTHER_TRIGGER}
 
 
-def test_the_dropped_row_says_which_line_and_why(monkeypatch, tmp_path, caplog):
-    path = _written(
-        monkeypatch, tmp_path, HEADER, f"{MOVIE},{COMMA_TRIGGER},{COMMA_QUOTE}", *ROWS
-    )
+def test_the_dropped_entry_says_which_line_and_where(monkeypatch, tmp_path, caplog):
+    path = _written(monkeypatch, tmp_path, _besides(GENERAL_TRIGGER, "it is {tally}"))
 
     with caplog.at_level("WARNING"):
         _load(path)
 
-    assert f"line {FIRST_ROW}" in caplog.text
-    assert "comma" in caplog.text
+    assert f"{path}:" in caplog.text or str(path) in caplog.text
+    assert "line 2" in caplog.text
+    assert "placeholder" in caplog.text
 
 
 def test_a_trigger_is_folded_for_matching(monkeypatch, tmp_path):
-    path = _written(monkeypatch, tmp_path, HEADER, f"{MOVIE},{TRIGGER.upper()},{QUOTE}")
+    path = _written(monkeypatch, tmp_path, {MOVIE: {TRIGGER.upper(): QUOTE}})
 
     assert set(_load(path)) == {TRIGGER}
 
@@ -549,7 +625,7 @@ def test_the_shipped_file_loads(speech, speaker):
 
     Nothing here counts anything. How many quotes the file holds is content, and
     a test that pins the number is one that fails the next time somebody adds a
-    line. What is worth asserting is that every row came back usable: `_load`
+    line. What is worth asserting is that every entry came back usable: `_load`
     raises on a file with nothing in it, so reaching the loop at all is the
     other half of it.
     """
@@ -594,7 +670,7 @@ async def test_a_trigger_inside_a_longer_word_is_not_a_trigger(quotes_file, spee
 
 
 async def test_a_trigger_of_several_words_is_heard(monkeypatch, tmp_path, speech, speaker):
-    _written(monkeypatch, tmp_path, HEADER, f"{MOVIE},{SPECIFIC_TRIGGER},{SPECIFIC_QUOTE}")
+    _written(monkeypatch, tmp_path, {MOVIE: {SPECIFIC_TRIGGER: SPECIFIC_QUOTE}})
 
     await _hear(_tool(speaker), f"I have a {SPECIFIC_TRIGGER} today")
 
@@ -647,9 +723,7 @@ async def test_the_more_specific_of_two_overlapping_triggers_wins(
     _written(
         monkeypatch,
         tmp_path,
-        HEADER,
-        f"{MOVIE},{GENERAL_TRIGGER},{GENERAL_QUOTE}",
-        f"{MOVIE},{SPECIFIC_TRIGGER},{SPECIFIC_QUOTE}",
+        {MOVIE: {GENERAL_TRIGGER: GENERAL_QUOTE, SPECIFIC_TRIGGER: SPECIFIC_QUOTE}},
     )
 
     await _hear(_tool(speaker), f"somebody has a {SPECIFIC_TRIGGER}")
@@ -660,16 +734,39 @@ async def test_the_more_specific_of_two_overlapping_triggers_wins(
 # ── a trigger with more than one answer ───────────
 
 
+def test_a_trigger_may_list_several_answers(monkeypatch, tmp_path):
+    """Written out as a list, rather than inferred from a key written twice."""
+    path = _written(monkeypatch, tmp_path, {MOVIE: {TRIGGER: [QUOTE, OTHER_QUOTE]}})
+
+    assert [quote.text for quote in _load(path)[TRIGGER]] == [QUOTE, OTHER_QUOTE]
+
+
+def test_a_listed_answer_keeps_the_order_of_the_file(monkeypatch, tmp_path):
+    """So that a seeded draw picks the same answer twice running."""
+    path = _written(monkeypatch, tmp_path, {MOVIE: {TRIGGER: [OTHER_QUOTE, QUOTE]}})
+
+    assert [quote.text for quote in _load(path)[TRIGGER]] == [OTHER_QUOTE, QUOTE]
+
+
+def test_one_bad_answer_costs_that_answer(monkeypatch, tmp_path):
+    """A list of four with one typo in it should still answer three ways."""
+    path = _written(
+        monkeypatch, tmp_path, {MOVIE: {TRIGGER: [QUOTE, "it is {tally}", OTHER_QUOTE]}}
+    )
+
+    assert [quote.text for quote in _load(path)[TRIGGER]] == [QUOTE, OTHER_QUOTE]
+
+
+def test_a_trigger_listing_nothing_is_dropped(monkeypatch, tmp_path):
+    path = _written(monkeypatch, tmp_path, {MOVIE: {TRIGGER: [], **QUOTES[MOVIE]}})
+
+    assert set(_load(path)) == {TRIGGER}
+
+
 async def test_a_trigger_with_two_answers_gives_one_of_them(
     monkeypatch, tmp_path, speech, speaker
 ):
-    _written(
-        monkeypatch,
-        tmp_path,
-        HEADER,
-        f"{MOVIE},{TRIGGER},{QUOTE}",
-        f"{MOVIE},{TRIGGER},{OTHER_QUOTE}",
-    )
+    _written(monkeypatch, tmp_path, {MOVIE: {TRIGGER: [QUOTE, OTHER_QUOTE]}})
 
     await _hear(_tool(speaker), TRIGGER)
 
@@ -686,13 +783,7 @@ async def test_which_answer_a_trigger_gives_is_drawn_each_time(
     which is a file with two answers in it and a channel that only ever hears
     the one.
     """
-    _written(
-        monkeypatch,
-        tmp_path,
-        HEADER,
-        f"{MOVIE},{TRIGGER},{QUOTE}",
-        f"{MOVIE},{TRIGGER},{OTHER_QUOTE}",
-    )
+    _written(monkeypatch, tmp_path, {MOVIE: {TRIGGER: [QUOTE, OTHER_QUOTE]}})
     _drawn(monkeypatch, last=True)
 
     tool = _tool(speaker, config={})
@@ -705,13 +796,7 @@ async def test_every_answer_a_trigger_can_give_is_warmed(
     monkeypatch, tmp_path, speech, speaker
 ):
     """Warming any less would leave the channel waiting on the coin toss."""
-    _written(
-        monkeypatch,
-        tmp_path,
-        HEADER,
-        f"{MOVIE},{TRIGGER},{QUOTE}",
-        f"{MOVIE},{TRIGGER},{OTHER_QUOTE}",
-    )
+    _written(monkeypatch, tmp_path, {MOVIE: {TRIGGER: [QUOTE, OTHER_QUOTE]}})
 
     await _render(_tool(speaker))
 
@@ -722,13 +807,7 @@ async def test_a_trigger_with_two_answers_still_fires_once_per_window(
     monkeypatch, tmp_path, speech, speaker
 ):
     """The backoff is on the trigger, so several answers are spent together."""
-    _written(
-        monkeypatch,
-        tmp_path,
-        HEADER,
-        f"{MOVIE},{TRIGGER},{QUOTE}",
-        f"{MOVIE},{TRIGGER},{OTHER_QUOTE}",
-    )
+    _written(monkeypatch, tmp_path, {MOVIE: {TRIGGER: [QUOTE, OTHER_QUOTE]}})
 
     tool = _tool(speaker)
     await _hear(tool, TRIGGER)
@@ -741,7 +820,7 @@ async def test_a_trigger_with_two_answers_still_fires_once_per_window(
 
 
 async def test_a_quote_can_name_whoever_set_it_off(monkeypatch, tmp_path, speech, speaker):
-    _written(monkeypatch, tmp_path, HEADER, f"{MOVIE},{PERSONAL_TRIGGER},{PERSONAL_QUOTE}")
+    _written(monkeypatch, tmp_path, {MOVIE: {PERSONAL_TRIGGER: PERSONAL_QUOTE}})
 
     await _hear(_tool(speaker), f"I have a {PERSONAL_TRIGGER}")
 
@@ -750,7 +829,7 @@ async def test_a_quote_can_name_whoever_set_it_off(monkeypatch, tmp_path, speech
 
 async def test_the_name_comes_from_the_utterance(monkeypatch, tmp_path, speech, speaker):
     """Which is the roster name where a server configured one."""
-    _written(monkeypatch, tmp_path, HEADER, f"{MOVIE},{PERSONAL_TRIGGER},{PERSONAL_QUOTE}")
+    _written(monkeypatch, tmp_path, {MOVIE: {PERSONAL_TRIGGER: PERSONAL_QUOTE}})
 
     await _hear(_tool(speaker), PERSONAL_TRIGGER, user="Someone Else")
 
@@ -873,7 +952,7 @@ async def test_a_quote_naming_nobody_is_warmed_once_however_many_speakers(
 async def test_a_quote_naming_the_speaker_is_warmed_per_name(
     monkeypatch, tmp_path, speech, speaker
 ):
-    _written(monkeypatch, tmp_path, HEADER, f"{MOVIE},{PERSONAL_TRIGGER},{PERSONAL_QUOTE}")
+    _written(monkeypatch, tmp_path, {MOVIE: {PERSONAL_TRIGGER: PERSONAL_QUOTE}})
 
     await _render(_tool(speaker, users=ROSTER))
 
@@ -907,7 +986,7 @@ async def test_a_quote_naming_the_speaker_warms_nothing_without_a_roster(
     monkeypatch, tmp_path, speech, speaker
 ):
     """Their Discord name is not knowable from here, and not a closed set."""
-    _written(monkeypatch, tmp_path, HEADER, f"{MOVIE},{PERSONAL_TRIGGER},{PERSONAL_QUOTE}")
+    _written(monkeypatch, tmp_path, {MOVIE: {PERSONAL_TRIGGER: PERSONAL_QUOTE}})
 
     await _render(_tool(speaker))
 
@@ -1415,9 +1494,7 @@ async def test_an_answer_does_not_set_off_another_quote(
     _written(
         monkeypatch,
         tmp_path,
-        HEADER,
-        f"{MOVIE},{TRIGGER},{QUOTE}",
-        f"{OTHER_MOVIE},{MOVIE.lower()},{OTHER_QUOTE}",
+        {MOVIE: {TRIGGER: QUOTE}, OTHER_MOVIE: {MOVIE.lower(): OTHER_QUOTE}},
     )
     tool = _tool(speaker, board=board)
     await _quoted(tool)
@@ -1427,10 +1504,10 @@ async def test_an_answer_does_not_set_off_another_quote(
     assert speech.asked == [QUOTE, _announced(SPEAKER)]
 
 
-async def test_a_row_that_names_no_film_asks_nothing(
+async def test_an_entry_that_names_no_film_asks_nothing(
     monkeypatch, tmp_path, speech, speaker, board
 ):
-    _written(monkeypatch, tmp_path, HEADER, f",{TRIGGER},{QUOTE}")
+    _written(monkeypatch, tmp_path, {"": {TRIGGER: QUOTE}})
     tool = _tool(speaker, board=board)
     await _quoted(tool)
 

@@ -109,7 +109,7 @@ settings:
     # volume_floor: 0.25
 
   # The `quotes` tool, for every server that enables it. The triggers and the
-  # lines themselves are a CSV at QUOTES_FILE.
+  # lines themselves are a YAML file at QUOTES_FILE.
   quotes:
     # How long a trigger stays spent after it fires, so a channel that keeps
     # saying the same word hears the line once. 0, or below, answers every

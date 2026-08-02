@@ -81,7 +81,7 @@ ENV PYTHONUNBUFFERED=1 \
     SUMMARY_DIR=/summaries \
     SPEECH_DIR=/speech \
     CREDITS_FILE=/credits/credits.json \
-    QUOTES_FILE=/app/src/miss_quote/resources/quotes.csv
+    QUOTES_FILE=/app/src/miss_quote/resources/quotes.yaml
 
 # The speech directories and the credits directory are created either way.
 # Mounting a volume over each is what makes rendered speech and the tally

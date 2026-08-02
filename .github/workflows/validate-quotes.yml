@@ -8,13 +8,13 @@ on:
   push:
     branches: [main]
     paths:
-      - 'src/miss_quote/resources/quotes.csv'
+      - 'src/miss_quote/resources/quotes.yaml'
       - 'scripts/validate_quotes.py'
       - '.github/workflows/validate-quotes.yml'
   pull_request:
     branches: [main]
     paths:
-      - 'src/miss_quote/resources/quotes.csv'
+      - 'src/miss_quote/resources/quotes.yaml'
       - 'scripts/validate_quotes.py'
       - '.github/workflows/validate-quotes.yml'
   # A file mounted over the shipped one is the supported way to change the list,
@@ -24,10 +24,10 @@ on:
       path:
         description: 'Quote file to check, relative to the repository root'
         required: false
-        default: 'src/miss_quote/resources/quotes.csv'
+        default: 'src/miss_quote/resources/quotes.yaml'
 
 env:
-  QUOTES_FILE: ${{ inputs.path || 'src/miss_quote/resources/quotes.csv' }}
+  QUOTES_FILE: ${{ inputs.path || 'src/miss_quote/resources/quotes.yaml' }}
 
 jobs:
   validate:
@@ -35,9 +35,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # No container, no dependency install and no cache: the validator is
-      # standard library only, so there is no environment to reproduce, and the
-      # runner's own Python is enough to run it. QUOTES_FILE reaches the
-      # Makefile through the environment.
+      # No container and no image build: the validator needs PyYAML and nothing
+      # else, so what has to be reproduced here is one pure wheel. Installing a
+      # parser is not the same as installing the tool, which would mean
+      # discord.py, onnxruntime and several minutes for a job that reads a text
+      # file. An interpreter is asked for by name rather than taken from the
+      # runner so that a pip install lands somewhere it is allowed to.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install the parser
+        run: python -m pip install --disable-pip-version-check pyyaml
+
+      # QUOTES_FILE reaches the Makefile through the environment.
       - name: Check the quote file
-        run: make validate-quotes
+        run: make validate-quotes PYTHON=python

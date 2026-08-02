@@ -228,7 +228,7 @@ Changing the quote list needs none of it. `make validate-quotes` is standard lib
 
 ```bash
 make validate-quotes                                   # the shipped file
-python scripts/validate_quotes.py /path/to/yours.csv   # one you mount over it
+python scripts/validate_quotes.py /path/to/yours.yaml  # one you mount over it
 ```
 
 The `Validate Quotes` workflow runs it on every push and pull request that touches the file, and takes a path as a `workflow_dispatch` input for checking a list that lives outside this repository. What it checks, and why each rule exists, is under [quotes]({{ '/configuration/#the-quote-file' | relative_url }}).
