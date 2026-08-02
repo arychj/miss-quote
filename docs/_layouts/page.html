@@ -1,0 +1,26 @@
+---
+layout: default
+---
+
+<main id="content" class="doc-shell wrap">
+
+  <aside class="doc-sidebar" id="doc-sidebar">
+    <div class="doc-sidebar-inner">
+      <p class="toc-label">On this page</p>
+      <nav class="toc" id="toc" aria-label="Table of contents"></nav>
+    </div>
+  </aside>
+
+  <article class="doc-body">
+    <header class="doc-head">
+      {% if page.eyebrow %}<p class="eyebrow">{{ page.eyebrow }}</p>{% endif %}
+      <h1>{{ page.title }}</h1>
+      {% if page.lede %}<p class="lede">{{ page.lede }}</p>{% endif %}
+    </header>
+
+    <div class="prose" id="prose">
+      {{ content }}
+    </div>
+  </article>
+
+</main>

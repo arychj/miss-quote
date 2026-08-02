@@ -1,0 +1,22 @@
+<a class="skip-link" href="#content">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap header-inner">
+    <a class="brand" href="{{ '/' | relative_url }}">
+      <img src="{{ '/assets/img/miss-quote.png' | relative_url }}" alt="" width="32" height="32">
+      <span class="brand-name">miss<span class="brand-dash">-</span>quote</span>
+    </a>
+
+    <nav class="site-nav" aria-label="Primary">
+      {% for item in site.nav %}
+        {% assign target = item.url | relative_url %}
+        <a href="{{ target }}"{% if page.url == item.url %} class="current" aria-current="page"{% endif %}>{{ item.title }}</a>
+      {% endfor %}
+      <a class="nav-repo" href="{{ site.github_url }}">GitHub</a>
+      <button type="button" class="theme-toggle" id="theme-toggle" aria-label="Toggle colour scheme">
+        <span class="theme-toggle-dark">◐</span>
+        <span class="theme-toggle-light">◑</span>
+      </button>
+    </nav>
+  </div>
+</header>
