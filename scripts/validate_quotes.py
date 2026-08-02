@@ -21,6 +21,12 @@ file that has already been parsed, so what it reports has no line number in it
 at all. `--config` checks them here, where the file can be composed and a
 problem still names somewhere to go.
 
+Where that key names a file rather than holding the quotes — a path or a URL —
+the name is left alone and the file behind it is checked by being passed here as
+a path of its own. A path written in a config file is a path inside the
+deployment it configures, and this script makes no network calls; see
+`_referenced`.
+
 PyYAML and nothing else. It imports nothing from `miss_quote`: pulling in the
 tool would mean discord.py, onnxruntime and the rest of the runtime for a job
 that reads a text file, and what keeps this a thirty-second answer on every pull
@@ -189,13 +195,16 @@ def config_problems(path: Path) -> list[Problem]:
         return found
 
     for additions in _additions(document):
+        if _referenced(additions):
+            continue
+
         if not isinstance(additions, yaml.MappingNode):
             found.append(
                 Problem(
                     path,
                     _at(additions),
                     f"{ADDITIONAL_QUOTES_KEY} must be a mapping of titles, each "
-                    f"holding its triggers",
+                    f"holding its triggers, or a path or URL to a file holding one",
                 )
             )
             continue
@@ -259,6 +268,20 @@ def _additions(document: yaml.Node) -> Iterator[yaml.Node]:
             continue
 
         yield additions
+
+
+def _referenced(node: yaml.Node) -> bool:
+    """
+    Whether a block names a file to read the quotes from rather than holding them.
+
+    Which is as far as this goes with one. A path in a config file is a path
+    inside the deployment it configures, and resolving it here would be
+    checking whatever happens to sit at the same path on a CI runner; a URL is
+    a network call, and this stays a pure-YAML script that makes none. Either
+    way the file behind the name is checked the way any quote file is, by
+    passing it to this script as a path.
+    """
+    return isinstance(node, yaml.ScalarNode) and node.tag == STRING_TAG
 
 
 def _under(node: yaml.Node | None, key: str) -> yaml.Node | None:

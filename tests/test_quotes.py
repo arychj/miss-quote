@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
+from urllib.error import URLError
 
 import pytest
 import yaml
@@ -101,9 +102,21 @@ ADDED_TRIGGER = "game over"
 ADDED_QUOTE = "Game over man, game over!"
 OVERRIDE_QUOTE = "Gorram it."
 
+ADDED = {ADDED_MOVIE: {ADDED_TRIGGER: ADDED_QUOTE}}
 
-def _adding(block: Mapping | None = None) -> dict:
-    """One server's tool config, with quotes of its own in it."""
+# Where a server keeps a list of its own instead of writing it into the config
+# file: somewhere on disk, or somewhere to download it from.
+ELSEWHERE_NAME = "elsewhere.yaml"
+QUOTES_URL = "https://quotes.example/elsewhere.yaml"
+
+
+def _adding(block: Mapping | str | None = None) -> dict:
+    """
+    One server's tool config, with quotes of its own in it.
+
+    A mapping is the block written out; a string is somewhere to go and read it
+    from, which the tool takes in place of the quotes themselves.
+    """
     return {ADDITIONAL_QUOTES_KEY: block or {ADDED_MOVIE: {ADDED_TRIGGER: ADDED_QUOTE}}}
 
 
@@ -311,6 +324,65 @@ def _raw(monkeypatch, directory: Path, text: str) -> Path:
     _pointed_at(monkeypatch, path)
 
     return path
+
+
+def _kept(directory: Path, quotes: Mapping | None = None, name: str = ELSEWHERE_NAME) -> Path:
+    """
+    A list written where a server can point at it, rather than as the deployment's.
+
+    Nothing is aimed at this: the whole point of the file is that only the
+    server naming it reads it.
+    """
+    path = directory / name
+    path.write_text(
+        yaml.safe_dump(
+            ADDED if quotes is None else quotes,
+            allow_unicode=True,
+            sort_keys=False,
+            width=NO_FOLDING,
+        ),
+        encoding="utf-8",
+    )
+
+    return path
+
+
+class FakeResponse:
+    """What `urlopen` hands back, as much of it as the loader touches."""
+
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def __enter__(self) -> "FakeResponse":
+        return self
+
+    def __exit__(self, *_) -> bool:
+        return False
+
+    def read(self) -> bytes:
+        return self._body
+
+
+def _served(monkeypatch, text: str = "", failing: Exception | None = None) -> list[str]:
+    """
+    Serve one document over HTTP, keeping what was asked for.
+
+    Patched at `urllib` rather than at the tool, so what is under test is the
+    download the tool actually performs rather than a seam beside it.
+    """
+    asked: list[str] = []
+
+    def _urlopen(url, timeout=None):
+        asked.append(url)
+
+        if failing is not None:
+            raise failing
+
+        return FakeResponse(text.encode("utf-8"))
+
+    monkeypatch.setattr("urllib.request.urlopen", _urlopen)
+
+    return asked
 
 
 def _pointed_at(monkeypatch, path: Path) -> None:
@@ -841,6 +913,159 @@ def test_a_dropped_addition_says_which_server_and_where(caplog):
     assert SERVER_ALIAS in caplog.text
     assert ADDITIONAL_QUOTES_KEY in caplog.text
     assert "placeholder" in caplog.text
+
+
+# ── a list a server keeps elsewhere ───────────────
+
+
+def test_a_path_is_read_the_way_the_block_is(tmp_path):
+    """The quotes themselves, or one string saying where they are; the same list either way."""
+    assert _added(SERVER_ALIAS, str(_kept(tmp_path))) == _added(SERVER_ALIAS, ADDED)
+
+
+def test_a_path_may_be_written_from_the_home_directory(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _kept(tmp_path)
+
+    assert set(_added(SERVER_ALIAS, f"~/{ELSEWHERE_NAME}")) == {ADDED_TRIGGER}
+
+
+def test_a_url_is_downloaded(monkeypatch):
+    asked = _served(monkeypatch, yaml.safe_dump(ADDED))
+
+    assert set(_added(SERVER_ALIAS, QUOTES_URL)) == {ADDED_TRIGGER}
+    assert asked == [QUOTES_URL]
+
+
+async def test_a_referenced_trigger_is_answered(quotes_file, tmp_path, speech, speaker):
+    await _hear(_tool(speaker, config=_adding(str(_kept(tmp_path)))), ADDED_TRIGGER)
+
+    assert speech.asked == [ADDED_QUOTE]
+
+
+async def test_the_shipped_list_is_still_heard_beside_a_referenced_one(
+    quotes_file, tmp_path, speech, speaker
+):
+    await _hear(_tool(speaker, config=_adding(str(_kept(tmp_path)))), TRIGGER)
+
+    assert speech.asked == [QUOTE]
+
+
+async def test_a_referenced_trigger_the_file_answers_says_this_server_s_line(
+    quotes_file, tmp_path, speech, speaker
+):
+    """Merged over the shipped list, exactly as a block written inline is."""
+    path = _kept(tmp_path, {MOVIE: {TRIGGER: OVERRIDE_QUOTE}})
+
+    await _hear(_tool(speaker, config=_adding(str(path))), TRIGGER)
+
+    assert speech.asked == [OVERRIDE_QUOTE]
+
+
+def test_a_referenced_file_is_held_to_the_files_rules(tmp_path):
+    """
+    Composed rather than parsed, so the tag survives the way it does in the file.
+
+    An unquoted `no` is a boolean and an unquoted `1917` is an integer, and
+    neither is text the matcher can compare against.
+    """
+    path = tmp_path / ELSEWHERE_NAME
+    path.write_text(
+        f"{ADDED_MOVIE}:\n  {ADDED_TRIGGER}: {ADDED_QUOTE}\n  no: {QUOTE}\n",
+        encoding="utf-8",
+    )
+
+    assert set(_added(SERVER_ALIAS, str(path))) == {ADDED_TRIGGER}
+
+
+def test_a_dropped_entry_names_the_file_and_the_line(tmp_path, caplog):
+    """
+    Which is the one thing an inline block cannot say.
+
+    `config.yaml` has been parsed by something that kept no line numbers by the
+    time the tool sees it; a file it points at is still a file.
+    """
+    path = _kept(
+        tmp_path, {ADDED_MOVIE: {ADDED_TRIGGER: ADDED_QUOTE, TRIGGER: "it is {tally}"}}
+    )
+
+    with caplog.at_level("WARNING"):
+        _added(SERVER_ALIAS, str(path))
+
+    assert f"{path} line 3" in caplog.text
+    assert SERVER_ALIAS in caplog.text
+
+
+def test_a_file_that_is_not_there_adds_nothing(tmp_path, caplog):
+    """Reported and dropped rather than raised on, as an unusable block is."""
+    with caplog.at_level("WARNING"):
+        assert _added(SERVER_ALIAS, str(tmp_path / "absent.yaml")) == {}
+
+    assert "Could not read" in caplog.text
+    assert SERVER_ALIAS in caplog.text
+
+
+def test_a_server_that_will_not_answer_adds_nothing(monkeypatch, caplog):
+    _served(monkeypatch, failing=URLError("connection refused"))
+
+    with caplog.at_level("WARNING"):
+        assert _added(SERVER_ALIAS, QUOTES_URL) == {}
+
+    assert "Could not download" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("written", "detail"),
+    (
+        pytest.param(
+            f'{ADDED_MOVIE}:\n  {ADDED_TRIGGER}: "unclosed\n',
+            "not valid YAML",
+            id="unparseable",
+        ),
+        pytest.param(
+            f"- {ADDED_MOVIE}\n- {MOVIE}\n", "mapping of titles", id="not a mapping"
+        ),
+    ),
+)
+def test_a_referenced_file_that_is_unusable_adds_nothing(tmp_path, caplog, written, detail):
+    """
+    Where the deployment's own file would stop the tool.
+
+    A tool listening for nothing should be said out loud on the way up; a server
+    whose own file has gone bad still has the whole shipped list, and taking its
+    tool down over one it did not have to write is a worse answer.
+    """
+    path = tmp_path / ELSEWHERE_NAME
+    path.write_text(written, encoding="utf-8")
+
+    with caplog.at_level("WARNING"):
+        assert _added(SERVER_ALIAS, str(path)) == {}
+
+    assert detail in caplog.text
+    assert SERVER_ALIAS in caplog.text
+
+
+async def test_an_unreadable_reference_leaves_the_shipped_list_alone(
+    quotes_file, tmp_path, speech, speaker
+):
+    tool = _tool(speaker, config=_adding(str(tmp_path / "absent.yaml")))
+
+    await _hear(tool, TRIGGER)
+
+    assert speech.asked == [QUOTE]
+
+
+def test_a_reference_naming_nowhere_adds_nothing(caplog):
+    with caplog.at_level("WARNING"):
+        assert _added(SERVER_ALIAS, "  ") == {}
+
+    assert ADDITIONAL_QUOTES_KEY in caplog.text
+
+
+async def test_a_referenced_line_is_warmed(quotes_file, tmp_path, speech, speaker):
+    await _render(_tool(speaker, config=_adding(str(_kept(tmp_path)))))
+
+    assert speech.warmed == [QUOTE, OTHER_QUOTE, ADDED_QUOTE]
 
 
 # ── detection ─────────────────────────────────────

@@ -116,7 +116,7 @@ quotes:
 | `announcement` | no | What the winner is told. `{user}`, `{credits}`, and `{remark}` |
 | `tie_announcement` | no | What anyone paid on a tie is told. The same placeholders |
 | `self_answer_announcement` | no | What somebody naming their own line is told. The same placeholders, where `{credits}` is what it cost |
-| `additional_quotes` | no | Quotes this server hears and the others do not, in the [quote file's](#the-quote-file) own shape. Merged over the deployment's list; see [what a server adds for itself](#what-a-server-adds-for-itself) |
+| `additional_quotes` | no | Quotes this server hears and the others do not, in the [quote file's](#the-quote-file) own shape — or a path or URL to a file holding them. Merged over the deployment's list; see [what a server adds for itself](#what-a-server-adds-for-itself) |
 
 #### The quote file
 
@@ -194,7 +194,7 @@ quotes:
         over the top: "Over the top, {user}!"
 ```
 
-Everything the file can say, this can say: a trigger answering several ways lists its lines, a line naming whoever set it off writes `{user}`, and the two quoting rules above still bite — a title like `1917` and a line starting with `{user}` both need their quotes.
+Everything the file can say, this can say: a trigger answering several ways lists its lines, a line naming whoever set it off writes `{user}`, and the two quoting rules above still bite — a title like `1917` and a line starting with `{user}` both need their quotes. A server that would rather keep its list in a file of its own writes the name of that file here instead; see [keeping that list somewhere else](#keeping-that-list-somewhere-else).
 
 **These are the same rules, applied per server.** A trigger appears once in one server's block, its lines are checked the same way, and an entry that fails is logged and dropped. What it does *not* do is stop the tool: the block is optional, and a server that gets it wrong still has the whole shipped list rather than nothing.
 
@@ -203,6 +203,45 @@ Everything the file can say, this can say: a trigger answering several ways list
 **Titles merge.** The list is keyed on the trigger and carries the title beside each line, so `Firefly` written in both places is one film with everything either of them said under it — and a round asking where either line came from asks about the same title.
 
 **They are checked in CI like the file is.** `scripts/validate_quotes.py --config config.yaml` walks every server's block and applies the table above, so a broken addition fails a pull request rather than becoming a log line. Each block is checked on its own: a trigger a server shares with the shipped list is the override, not a collision.
+
+#### Keeping that list somewhere else {#keeping-that-list-somewhere-else}
+
+A list long enough to be worth its own file does not have to live in `config.yaml`. Write `additional_quotes` as one string instead of the quotes themselves — a path on disk, mounted wherever the rest of the deployment's configuration is:
+
+```yaml
+quotes:
+  enabled: true
+  config:
+    additional_quotes: /config/quotes/beer-wars.yaml
+```
+
+or somewhere to download it from, which is read once on the way up:
+
+```yaml
+quotes:
+  enabled: true
+  config:
+    additional_quotes: https://quotes.example.com/beer-wars.yaml
+```
+
+A string beginning `http://` or `https://` is downloaded; anything else is a path, where a leading `~` is the home directory. There is no second key saying which — the scheme is the whole rule.
+
+| | What to expect |
+|---|---|
+| What the file holds | Exactly what the block would have: a mapping of titles, each holding its triggers. The [file's rules](#the-quote-file) in full |
+| When it is read | Once, at startup. A list that changes afterwards reaches the channel at the next restart, which is the promise `QUOTES_FILE` makes too |
+| How it is merged | As an inline block is — over the deployment's list, for that server alone |
+| What a download waits | 10 seconds, then the server starts without it |
+
+**A file it cannot get is a log line and nothing worse.** Missing, unreadable, not valid YAML, not a mapping of titles, a server that will not answer — each is reported and the server keeps the whole shipped list, on the same terms as a block written inline that turns out to be nonsense. The deployment's own file is the one that stops the tool starting; a server's is not.
+
+**A dropped entry names the line it was written on**, which is the one thing an inline block cannot do: `config.yaml` has been parsed by the time the tool sees it, and a file it points at is still a file.
+
+**CI does not follow the name.** `validate_quotes.py --config` leaves a path or URL alone — a path in a config file is a path inside the deployment it configures, and the validator makes no network calls. Check the file behind it by passing it in like any other quote file:
+
+```bash
+python scripts/validate_quotes.py quotes/beer-wars.yaml --config config.yaml
+```
 
 #### Matching and backoff
 
@@ -668,7 +707,7 @@ Volumes multiply as knobs, so a tool asking for half of a deployment set to half
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `QUOTES_FILE` | `/app/src/miss_quote/resources/quotes.yaml` | The triggers and the lines they answer with, as a YAML mapping of title to trigger to line. The deployment's list; the image ships the one in `resources/`, and mounting a file over that path replaces it. A server may add to it under [`additional_quotes`](#what-a-server-adds-for-itself) |
+| `QUOTES_FILE` | `/app/src/miss_quote/resources/quotes.yaml` | The triggers and the lines they answer with, as a YAML mapping of title to trigger to line. The deployment's list; the image ships the one in `resources/`, and mounting a file over that path replaces it. A path and only a path; a server that wants a list fetched over HTTP says so under [`additional_quotes`](#keeping-that-list-somewhere-else) |
 
 ### Credits {#env-credits}
 

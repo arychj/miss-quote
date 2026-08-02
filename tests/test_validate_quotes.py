@@ -555,13 +555,32 @@ def test_a_block_written_and_left_empty_is_clean(tmp_path):
     assert config_problems(path) == []
 
 
-@pytest.mark.parametrize("written", ("nonsense", f"[{MOVIE}]"))
-def test_additions_that_are_not_a_mapping_of_titles_are_reported(tmp_path, written):
+@pytest.mark.parametrize("written", (f"[{MOVIE}]", "1917", "true"))
+def test_additions_that_are_neither_titles_nor_a_reference_are_reported(tmp_path, written):
     path = _raw_config(
         tmp_path, f"{PREAMBLE}          {ADDITIONAL_QUOTES_KEY}: {written}\n"
     )
 
     assert "must be a mapping of titles" in _config_details(path)[0]
+
+
+@pytest.mark.parametrize(
+    "written",
+    (
+        pytest.param("/config/extra-quotes.yaml", id="a path"),
+        pytest.param("https://quotes.example/extra.yaml", id="a url"),
+    ),
+)
+def test_a_block_naming_a_file_to_read_is_left_alone(tmp_path, written):
+    """
+    A path here is a path inside the deployment, and a URL is a call this does
+    not make. The file behind either is checked by being passed in as a path.
+    """
+    path = _raw_config(
+        tmp_path, f"{PREAMBLE}          {ADDITIONAL_QUOTES_KEY}: {written}\n"
+    )
+
+    assert config_problems(path) == []
 
 
 @pytest.mark.parametrize(
