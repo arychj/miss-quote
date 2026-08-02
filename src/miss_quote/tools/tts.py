@@ -17,6 +17,11 @@ onto the front, and a gain is a multiplication, and neither is a thing you can d
 to an encoded packet. The speaker makes that call from the gain and the type it
 is given, so this decides only whether to hand over a phrase or a stream.
 
+`play_held` is `play` for a sentence that does not exist yet. A tool that has to
+go and think before it can answer hands over whatever is doing the thinking, and
+gets music under the wait and the answer straight after it, as one clip. See
+`audio.hold` for why an open-ended clip is not simply fed to the player.
+
 `enqueue` and `run` are the other half. A tool that can work out at startup what
 it will have to say says so, and this renders it in the background while the bot
 is already in the channel — rather than each tool blocking the start-up on its
@@ -27,9 +32,11 @@ enforces; see `SpeechCache.warm`.
 from __future__ import annotations
 
 import asyncio
+from asyncio import Future
 from collections.abc import AsyncIterator, Iterable
 
 from miss_quote.audio.chimes import shared_chimes
+from miss_quote.audio.hold import DEFAULT_HOLD_VOLUME, HoldMusic
 from miss_quote.config import UNITY_VOLUME, tts_cfg
 from miss_quote.tools.base import Tool, ToolContext
 from miss_quote.transcript.writer import Source
@@ -42,6 +49,8 @@ logger = get_logger(__name__)
 # phrases and a line per phrase is a log nobody reads; one line per batch is the
 # same information at a length somebody will.
 REPORT_EVERY = 25
+
+NOTHING = b""
 
 
 class Tts(Tool):
@@ -133,6 +142,90 @@ class Tts(Tool):
             yield chunk
 
         async for chunk in words:
+            yield chunk
+
+    async def play_held(
+        self,
+        source: Source,
+        words: Future[str],
+        *,
+        hold: str | None = None,
+        hold_volume: float = DEFAULT_HOLD_VOLUME,
+        scale: float = UNITY_VOLUME,
+        keep: bool = True,
+    ) -> None:
+        """
+        Say something that has not been decided yet, with music over the wait.
+
+        For a tool that has already announced it is going to be a moment and now
+        has to be one. `words` is whatever is producing the sentence — a task
+        running a completion, usually — and it is handed over rather than
+        awaited, because the whole point is to be playing something while it
+        runs.
+
+        `hold` names a clip in the chime directory, without its extension, and
+        is what turns the feature on: with nothing to play, this waits for the
+        sentence and then says it, which is exactly `play`.
+
+        `hold_volume` is the music's alone, and is why it is not `scale`. The
+        two are applied in different places — the music's inside the envelope,
+        the caller's by the speaker, to everything — because the sentence should
+        arrive at the loudness it would have had anyway.
+        """
+        clip = await self._chimes.clip(hold) if hold else NOTHING
+        music = HoldMusic(clip, hold_volume)
+
+        if not music.playable:
+            await self.play(source, await words, scale=scale, keep=keep)
+            return
+
+        await self._speaker.play(source, self._holding(music, words, keep), scale)
+
+    async def _holding(
+        self, music: HoldMusic, words: Future[str], keep: bool
+    ) -> AsyncIterator[bytes]:
+        """
+        The music and then the sentence, as one clip rather than two.
+
+        One clip for the same reason the chime is: the speaker plays one thing
+        at a time per server and arms the player afresh for each, so two calls
+        would put a gap exactly where this is trying not to have one.
+
+        There are two waits here and the music covers both. The first is the
+        one everybody means — whatever is composing the sentence. The second is
+        the synthesizer, which has to be sent the sentence and asked for a head
+        start on it before there is anything to play, and which would otherwise
+        be a second silence immediately after the one that was just covered up.
+        Only once that head start is in hand does the music start leaving, so
+        the fade ends where the first word begins.
+
+        A sentence that never arrives fades the music out and then raises. What
+        went wrong is the caller's to report; what this owes the channel is an
+        ending rather than a cut.
+        """
+        async for frame in music.until(words):
+            yield frame
+
+        try:
+            text = await words
+        except Exception:
+            async for frame in music.fading_out():
+                yield frame
+            raise
+
+        speech = self._speech.stream(text, keep=keep).pcm()
+        opening = asyncio.ensure_future(_lead(speech, tts_cfg.lead_bytes))
+
+        async for frame in music.until(opening):
+            yield frame
+
+        async for frame in music.fading_out():
+            yield frame
+
+        for chunk in await opening:
+            yield chunk
+
+        async for chunk in speech:
             yield chunk
 
     def locate(self, chime: str | None) -> str | None:

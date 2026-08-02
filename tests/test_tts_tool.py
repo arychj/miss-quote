@@ -26,6 +26,19 @@ CHIME_NAME = "chime"
 CHIME_FILE = f"{CHIME_NAME}{CHIME_SUFFIX}"
 CHIME_AUDIO = "♪"
 
+HOLD_NAME = "hold"
+HOLD_FILE = f"{HOLD_NAME}{CHIME_SUFFIX}"
+HOLD_AUDIO = "♫"
+
+# One frame of the loop and the way out of it. The envelope over real samples is
+# `test_hold`'s; what these are for is reading the order back off a string.
+HOLD_FRAME = "~"
+HOLD_FADE = "…"
+
+# What the model came back with, and what it said instead of coming back.
+LATE_WORDS = "it was a quiet night"
+BROKEN = "the model is on fire"
+
 # A phrase in pieces, for the tests about what is held back before playback.
 CHUNKS = ("one", "two", "three")
 NO_HEAD_START = 0
@@ -134,6 +147,56 @@ class FakeChimes:
         path = self.path(name)
 
         return path.read_text(encoding="utf-8") if path.is_file() else ""
+
+
+class FakeHoldMusic:
+    """
+    Stands in for the envelope, so a wait reads back as one frame per stretch.
+
+    The real one is paced against a wall clock and would make every test that
+    covers a wait take as long as the wait. What is under test here is the order
+    the pieces arrive in and what the music is played at, both of which survive
+    a loop of exactly one frame.
+    """
+
+    def __init__(self, clip, volume=None, **_) -> None:
+        self.clip = clip
+        self.volume = volume
+
+    @property
+    def playable(self) -> bool:
+        return bool(self.clip)
+
+    async def until(self, finished):
+        while self.playable and not finished.done():
+            yield HOLD_FRAME
+            await asyncio.wait([finished])
+
+    async def fading_out(self):
+        if self.playable:
+            yield HOLD_FADE
+
+
+@pytest.fixture(autouse=True)
+def music(monkeypatch) -> list[FakeHoldMusic]:
+    """Every performance the tool set going, so a test can read what it asked for."""
+    built: list[FakeHoldMusic] = []
+
+    def build(clip, volume=None, **rest):
+        performance = FakeHoldMusic(clip, volume, **rest)
+        built.append(performance)
+        return performance
+
+    monkeypatch.setattr(tts_tool, "HoldMusic", build)
+
+    return built
+
+
+@pytest.fixture
+def hold(chimes) -> str:
+    """A hold clip sitting in the chime directory, beside the flourishes."""
+    (chimes.directory / HOLD_FILE).write_text(HOLD_AUDIO, encoding="utf-8")
+    return HOLD_NAME
 
 
 @pytest.fixture(autouse=True)
@@ -329,6 +392,124 @@ async def test_a_phrase_shorter_than_the_head_start_is_not_waited_on(speech):
     held = await tts_tool._lead(words, len("".join(CHUNKS)) + 1)
 
     assert held == list(CHUNKS)
+
+
+# ── holding ───────────────────────────────────────
+
+
+def _pending() -> asyncio.Future:
+    """A sentence somebody is still working out."""
+    return asyncio.get_running_loop().create_future()
+
+
+async def test_the_music_covers_the_wait_and_the_words_follow_it(speaker, hold):
+    words = _pending()
+    playing = asyncio.create_task(
+        _tool(speaker).play_held(SOURCE, words, hold=hold, keep=False)
+    )
+
+    await asyncio.sleep(0)
+    words.set_result(LATE_WORDS)
+    await playing
+
+    _, spoken = speaker.played[0]
+    assert spoken == HOLD_FRAME + HOLD_FRAME + HOLD_FADE + LATE_WORDS
+
+
+async def test_the_music_covers_the_synthesizer_as_well_as_the_model(
+    speech, speaker, hold
+):
+    """
+    The second wait, and the one nothing else would have covered: a sentence
+    that arrives instantly still has to be rendered before there is anything to
+    play, and the music is what is over that too.
+    """
+    speech.chunks = CHUNKS
+    words = _pending()
+    words.set_result(LATE_WORDS)
+
+    await _tool(speaker).play_held(SOURCE, words, hold=hold, keep=False)
+
+    _, spoken = speaker.played[0]
+    assert spoken == HOLD_FRAME + HOLD_FADE + "".join(CHUNKS)
+
+
+async def test_the_music_is_played_at_its_own_loudness(speaker, hold, music):
+    """
+    The channel's loudness is the sentence's, and the music is a fraction of it.
+    Two settings in two places, because only one of them reaches the speaker.
+    """
+    words = _pending()
+    words.set_result(LATE_WORDS)
+
+    await _tool(speaker).play_held(SOURCE, words, hold=hold, hold_volume=QUIETER)
+
+    assert music[0].volume == QUIETER
+    assert speaker.scales == [UNITY_VOLUME]
+
+
+async def test_nothing_to_hold_with_is_the_wait_there_always_was(speaker, chimes):
+    """
+    Unset is the default, and the default has to cost nothing. A sentence with
+    no music under it is handed over exactly as `play` would hand it over,
+    encoded path and all.
+    """
+    words = _pending()
+    words.set_result(LATE_WORDS)
+
+    await _tool(speaker).play_held(SOURCE, words)
+
+    assert speaker.played == [(SOURCE, LATE_WORDS)]
+    assert speaker.encoded == [True]
+    assert chimes.asked == []
+
+
+async def test_a_missing_hold_clip_costs_the_music_and_not_the_answer(speaker):
+    words = _pending()
+    words.set_result(LATE_WORDS)
+
+    await _tool(speaker).play_held(SOURCE, words, hold="never-mounted")
+
+    assert speaker.played == [(SOURCE, LATE_WORDS)]
+
+
+async def test_a_silent_wait_is_waited_out_before_the_player_is_armed(speaker):
+    """
+    The player is armed the moment the speaker is handed a clip, and gives up on
+    one that has produced nothing for `stall_seconds`. With music there is
+    always something to feed it; without, the wait has to happen first.
+    """
+    words = _pending()
+    playing = asyncio.create_task(_tool(speaker).play_held(SOURCE, words))
+
+    await asyncio.sleep(0)
+    assert speaker.played == []
+
+    words.set_result(LATE_WORDS)
+    await playing
+
+    assert speaker.played == [(SOURCE, LATE_WORDS)]
+
+
+async def test_a_sentence_that_never_arrives_ends_the_music_rather_than_cutting_it():
+    """What went wrong is the caller's to report; the channel is owed an ending."""
+    tool = _tool()
+    words = _pending()
+    played: list[str] = []
+
+    async def collect() -> None:
+        async for frame in tool._holding(FakeHoldMusic(HOLD_AUDIO), words, keep=False):
+            played.append(frame)
+
+    collecting = asyncio.create_task(collect())
+
+    await asyncio.sleep(0)
+    words.set_exception(RuntimeError(BROKEN))
+
+    with pytest.raises(RuntimeError, match=BROKEN):
+        await collecting
+
+    assert played == [HOLD_FRAME, HOLD_FADE]
 
 
 # ── rendering in advance ──────────────────────────

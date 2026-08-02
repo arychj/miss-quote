@@ -40,6 +40,18 @@ settings:
     #
     # lead_ms: 500
 
+    # How music played under a wait arrives and leaves, in milliseconds. Only
+    # the summary tool asks for any, and only for a channel that named a clip;
+    # see `hold_music` further down.
+    #
+    # Up quickly, because the gap the music is covering has already started by
+    # the time it begins. Down slowly, because what replaces it is a sentence,
+    # and the fade is timed to end where the first word starts. 0 for either is
+    # no fade at that end, which is a cut.
+    #
+    # hold_fade_in_ms: 500
+    # hold_fade_out_ms: 2000
+
     # Days a rendered clip survives in SPEECH_DIR/cache without being played,
     # counted from the last time it was. 0, or any value below 1, keeps them
     # forever. Chimes live in SPEECH_DIR/chimes and are never reaped, whatever
@@ -496,6 +508,26 @@ servers:
               # preamble.
               #
               # closing: "I wonder what'll happen tonight?"
+
+              # Music under the wait, for the part of it the preamble does not
+              # cover. Off unless you name a clip, and nothing is shipped: this
+              # is a WAV you put in SPEECH_DIR/chimes yourself, named here
+              # without its extension, exactly like a tool's `chime`.
+              #
+              # It loops, so what belongs there is a short passage that meets
+              # itself rather than a track — and it is read into memory whole
+              # and held for the life of the process, so ten to thirty seconds
+              # is the size to author. It fades up when the preamble ends and
+              # is gone by the first word of the retelling; the two spans are
+              # settings.tts.hold_fade_in_ms and hold_fade_out_ms.
+              #
+              # `hold_volume` is a fraction of PLAYBACK_VOLUME, so it is however
+              # much quieter than the talking the music should be. It is per
+              # channel because the clip is: two pieces of music are not the
+              # same loudness. Anything outside 0 to 1 is clamped to it.
+              #
+              # hold_music: on-hold
+              # hold_volume: 0.15
 
               # What the bot answers to, and how asking starts. Both replace
               # their defaults rather than adding to them: they are a matching

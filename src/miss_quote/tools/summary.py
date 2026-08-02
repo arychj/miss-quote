@@ -17,7 +17,8 @@ prompt that turns a thing you read into a thing you say. That is
 inference between the question and the answer. The bot fills them with a phrase
 rendered at startup — and, crucially, **starts the inference before it starts
 saying it**, so the announcement covers the wait rather than being followed by
-one. See `_recall`.
+one. A channel that names a clip gets music over whatever is left of the wait
+after the announcement runs out. See `_recall`.
 
 Two things sit under that sentence and are not in it. One evening is not always
 one session, so what is retold is the whole run of them rather than the newest;
@@ -49,7 +50,8 @@ from datetime import date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from miss_quote.config import transcript_cfg
+from miss_quote.audio.hold import DEFAULT_HOLD_VOLUME
+from miss_quote.config import SILENT_VOLUME, UNITY_VOLUME, transcript_cfg
 from miss_quote.llm import client as llm
 from miss_quote.summary import dialogue, prompts, when as clauses
 from miss_quote.config import MONITORED_CHANNELS_KEY, SCHEDULE_KEY
@@ -77,6 +79,8 @@ PREAMBLE_KEY = "preamble"
 EMPTY_KEY = "empty"
 MISSING_KEY = "missing"
 CLOSING_KEY = "closing"
+HOLD_MUSIC_KEY = "hold_music"
+HOLD_VOLUME_KEY = "hold_volume"
 NAME_KEY = "name"
 TRIGGERS_KEY = "triggers"
 
@@ -100,6 +104,8 @@ CHANNEL_KEYS = (
     EMPTY_KEY,
     MISSING_KEY,
     CLOSING_KEY,
+    HOLD_MUSIC_KEY,
+    HOLD_VOLUME_KEY,
     NAME_KEY,
     TRIGGERS_KEY,
 )
@@ -152,6 +158,13 @@ DEFAULT_MISSING = "I don't have any notes from then."
 # fixed sentence after one that has just said goodbye is one goodbye too many.
 # Unset, so a channel that wants the second one writes it.
 NO_CLOSING = ""
+
+# What plays under the wait, once the preamble has finished covering the start
+# of it. Unset, because the audio is not the bot's: it is a clip in the chime
+# directory that somebody has to put there, and a name defaulted to a file that
+# is not going to exist is a warning on every start-up for a feature nobody
+# asked for. A channel that wants music names one.
+NO_HOLD_MUSIC = ""
 
 # What the bot answers to. Several spellings because none of them is what an ASR
 # will necessarily have written down: a name it has never been told is guessed
@@ -237,6 +250,8 @@ class Monitored:
     empty: str
     missing: str
     closing: str
+    hold_music: str
+    hold_volume: float
     address: re.Pattern[str]
     triggers: re.Pattern[str]
 
@@ -339,6 +354,12 @@ class Summary(Tool):
                 Tts.name,
             )
             return
+
+        # Says now which hold clips are not where they were said to be. Kept
+        # either way — the directory is usually a mounted volume, and a file
+        # that arrives later should start playing without a restart.
+        for monitored in self._monitored.values():
+            speech.locate(monitored.hold_music or None)
 
         # A channel that asked for no closing has nothing to render for it, and
         # an empty phrase is a synthesizer round trip for silence.
@@ -496,8 +517,8 @@ class Summary(Tool):
         """
         Go and look at the notes, out loud.
 
-        The order of these four steps is the feature, and each of them is where
-        it is for a reason:
+        The order of these steps is the feature, and each of them is where it is
+        for a reason:
 
         The **lookup comes first**, because it is a file read and costs nothing.
         A bot that announced it was going to look and then found nothing has
@@ -514,12 +535,20 @@ class Summary(Tool):
 
         And the **retelling is awaited last**, by which point the model has had
         the length of the announcement to work in. If it needed longer, the wait
-        is what is left of it rather than all of it.
+        is what is left of it rather than all of it — which is what the music is
+        for. `Tts.play_held` takes the completion rather than its result and
+        plays the two as one clip, so a channel that named a clip hears
+        something for the rest of the wait and a channel that did not hears
+        exactly what it always did.
 
         The **backoff is checked between the lookup and the announcement**, once
         it is known which evening was asked for. Somebody asking twice for the
         same story is what it is there to stop; somebody asking for a different
-        one is asking a different question and gets an answer.
+        one is asking a different question and gets an answer. It is *recorded*
+        at the end, once the story has actually been told: the ask that arrives
+        during one is dropped by `_telling` rather than by this, and a window
+        measured from the start of a minute of narration is most of the way
+        through by the time anybody could use it.
         """
         speech = self._tts()
         if speech is None:
@@ -549,7 +578,17 @@ class Summary(Tool):
 
         try:
             await speech.play(source, monitored.preamble)
-            retelling = await telling
+
+            # Not kept: this is one evening's account, composed for this moment,
+            # and nobody will ever ask for those exact words again. See
+            # `SpeechCache.stream`.
+            await speech.play_held(
+                source,
+                telling,
+                hold=monitored.hold_music or None,
+                hold_volume=monitored.hold_volume,
+                keep=False,
+            )
         except llm.CompletionError as exc:
             logger.error("[%s] Could not retell %s: %s", self.server, chain.name, exc)
             return
@@ -559,7 +598,7 @@ class Summary(Tool):
             telling.cancel()
 
         logger.info(
-            "📖 [%s] %s asked what happened; retelling %s (%d part(s)).",
+            "📖 [%s] %s asked what happened; retold %s (%d part(s)).",
             self.server,
             asker,
             chain.name,
@@ -568,11 +607,7 @@ class Summary(Tool):
 
         self._told[(monitored.name, chain.name)] = time.monotonic()
 
-        # Not kept: this is one evening's account, composed for this moment, and
-        # nobody will ever ask for those exact words again. See `SpeechCache.stream`.
-        await speech.play(source, retelling, keep=False)
-
-        # And a fixed line after it, for a channel that asked for one. The prompt
+        # A fixed line after it, for a channel that asked for one. The prompt
         # is what ordinarily says the story is over; this is for a server that
         # would rather hear the same sentence every time.
         if monitored.closing:
@@ -701,6 +736,10 @@ def _channel(
         empty=str(raw.get(EMPTY_KEY) or DEFAULT_EMPTY),
         missing=str(raw.get(MISSING_KEY) or DEFAULT_MISSING),
         closing=str(raw.get(CLOSING_KEY) or NO_CLOSING),
+        hold_music=str(raw.get(HOLD_MUSIC_KEY) or NO_HOLD_MUSIC).strip(),
+        hold_volume=_loudness(
+            HOLD_VOLUME_KEY, raw.get(HOLD_VOLUME_KEY), DEFAULT_HOLD_VOLUME
+        ),
         address=pattern(_spoken(NAME_KEY, raw.get(NAME_KEY), DEFAULT_NAME)),
         triggers=pattern(_spoken(TRIGGERS_KEY, raw.get(TRIGGERS_KEY), DEFAULT_TRIGGERS)),
     )
@@ -794,4 +833,25 @@ def _span(key: str, value: Any, default: float, unit: str) -> float:
     except (TypeError, ValueError) as exc:
         raise ValueError(
             f"'{key}' must be a number of {unit}, not {value!r}: {exc}"
+        ) from exc
+
+
+def _loudness(key: str, value: Any, default: float) -> float:
+    """
+    A fraction of the channel's own loudness, or the default it did not set.
+
+    Clamped rather than refused. Everything either side of the range means the
+    same as its nearest end — silence below, and as loud as the channel gets
+    above — so there is nothing to tell somebody that they do not already know
+    from what they hear.
+    """
+    if value is None:
+        return default
+
+    try:
+        return min(UNITY_VOLUME, max(SILENT_VOLUME, float(value)))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"'{key}' must be a fraction between {SILENT_VOLUME} and "
+            f"{UNITY_VOLUME}, not {value!r}: {exc}"
         ) from exc
