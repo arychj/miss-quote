@@ -155,7 +155,9 @@ class RecentViolations:
 
     def scale(self, user_id: int, now: float | None = None) -> float:
         """
-        How loud the next announcement for a speaker should be, as a fraction.
+        How loud the next announcement for a speaker should be, as a fraction of
+        the channel's own loudness — and of the loudness rather than of the
+        amplitude, so a step off it is a step somebody can hear.
 
         Read before the violation being announced is recorded, so somebody's
         first swear in a window is announced at full volume: the backoff is for

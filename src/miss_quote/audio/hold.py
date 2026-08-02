@@ -20,9 +20,12 @@ itself, not a track.
 **It fades.** Up quickly, because the silence it is covering has already begun
 by the time it starts; down slowly, because what replaces it is a sentence, and
 music that stops dead a beat before somebody starts talking sounds like a fault.
-The envelope is linear in amplitude and constant within a frame — a fade of two
-seconds is a hundred steps of a hundred and fiftieth of full scale, which is
-nowhere near coarse enough to hear as stepping.
+The envelope is a volume rather than a multiplier and moves linearly through it,
+which `audio.gain` turns into the amplitude that sounds that way: a fade that is
+even to listen to rather than one that arrives all at once and then crawls. It
+is constant within a frame, and a fade of two seconds is a hundred steps of a
+hundredth of the loudness it is heading for, which is nowhere near coarse enough
+to hear as stepping.
 
 **It waits.** Every other clip in this process is finite and is fed to the
 player as fast as it can be produced, because the end of it is never far away.
