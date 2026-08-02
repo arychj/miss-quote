@@ -68,6 +68,16 @@ def test_no_head_start_waits_for_nothing(monkeypatch, tmp_path) -> None:
     assert reloaded.tts_cfg.lead_bytes == 0
 
 
+def test_the_fades_over_a_wait_have_defaults_and_can_be_set(
+    monkeypatch, tmp_path
+) -> None:
+    """Up quickly and down slowly, unless a deployment says otherwise."""
+    reloaded = _reload_with_setting(monkeypatch, tmp_path, "tts", "hold_fade_in_ms", 250)
+
+    assert reloaded.tts_cfg.hold_fade_in_ms == 250.0
+    assert reloaded.tts_cfg.hold_fade_out_ms == 2000.0
+
+
 def test_the_playback_volume_is_read_as_a_scale(monkeypatch) -> None:
     monkeypatch.setenv("PLAYBACK_VOLUME", "0.8")
 

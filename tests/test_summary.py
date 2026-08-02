@@ -12,6 +12,7 @@ import pytest
 import miss_quote.llm.client as llm_module
 import miss_quote.summary.store as store_module
 import miss_quote.tools.summary as summary_module
+from miss_quote.audio.hold import DEFAULT_HOLD_VOLUME
 from miss_quote.config import SummaryConfig, TranscriptConfig, transcript_cfg
 from miss_quote.llm.client import CompletionError
 from miss_quote.tools.base import Tool, ToolContext, Toolbox
@@ -37,6 +38,11 @@ PREAMBLE = "Sure! Let me go look at my notes."
 EMPTY = "I don't have any notes from this channel yet."
 MISSING = "I don't have any notes from then."
 CLOSING = "I wonder what'll happen tonight?"
+
+# What a channel names to have something played under the wait, and how loud it
+# asked for it. The clip itself is the chime library's business.
+HOLD_MUSIC = "on-hold"
+QUIETER = 0.4
 
 ASKER = "Erik"
 ENOUGH_UTTERANCES = 12
@@ -69,11 +75,23 @@ class FakeTts(Tts):
         Tool.__init__(self, context)
         self.played: list[str] = []
         self.warmed: list[str] = []
+        self.located: list[str | None] = []
+        self.holds: list[tuple[str | None, float]] = []
         self.kept: dict[str, bool] = {}
 
     async def play(self, source, text, *, scale=1.0, chime=None, keep=True) -> None:
         self.played.append(text)
         self.kept[text] = keep
+
+    async def play_held(
+        self, source, words, *, hold=None, hold_volume=1.0, scale=1.0, keep=True
+    ) -> None:
+        self.holds.append((hold, hold_volume))
+        await self.play(source, await words, scale=scale, keep=keep)
+
+    def locate(self, chime) -> str | None:
+        self.located.append(chime)
+        return chime
 
     def enqueue(self, phrases) -> int:
         self.warmed.extend(phrases)
@@ -809,3 +827,80 @@ async def test_the_retelling_is_not_kept_but_the_fixed_lines_are(summaries, mode
     )
 
     assert speech.kept == {PREAMBLE: True, RETELLING: False, CLOSING: True}
+
+
+# ── the music over the wait ───────────────────────
+
+
+async def test_a_channel_holds_with_the_clip_it_named(summaries, model):
+    tool, speech = _tool(hold_music=HOLD_MUSIC, hold_volume=QUIETER)
+    model.answers = [SUMMARY, RETELLING]
+    await tool.handle_finished(_transcript(summaries, WATCHED_SOURCE))
+
+    await tool.handle_utterance(
+        _said("Miss Quote, what happened last session?"), Session(WATCHED_SOURCE)
+    )
+
+    assert speech.holds == [(HOLD_MUSIC, QUIETER)]
+    assert speech.played == [PREAMBLE, RETELLING, CLOSING]
+
+
+async def test_a_channel_that_named_nothing_waits_the_way_it_always_did(
+    summaries, model
+):
+    tool, speech = _tool()
+    model.answers = [SUMMARY, RETELLING]
+    await tool.handle_finished(_transcript(summaries, WATCHED_SOURCE))
+
+    await tool.handle_utterance(
+        _said("Miss Quote, what happened last session?"), Session(WATCHED_SOURCE)
+    )
+
+    assert speech.holds == [(None, DEFAULT_HOLD_VOLUME)]
+
+
+async def test_a_hold_clip_is_looked_for_before_anybody_asks(summaries, model):
+    """
+    A name that is not in the directory should be a line on the way up rather
+    than a discovery made the first time somebody asks a question.
+    """
+    tool, speech = _tool(hold_music=HOLD_MUSIC)
+
+    await tool.prewarm()
+
+    assert speech.located == [HOLD_MUSIC]
+
+
+async def test_music_nobody_named_is_not_looked_for(summaries, model):
+    tool, speech = _tool()
+
+    await tool.prewarm()
+
+    assert speech.located == [None]
+
+
+@pytest.mark.parametrize(
+    ("wanted", "played"),
+    [(2.0, 1.0), (-1.0, 0.0), (0.4, 0.4)],
+)
+async def test_music_is_clamped_to_the_channels_own_loudness(
+    summaries, model, wanted, played
+):
+    """
+    Either side of the range means the same as its nearest end, so there is
+    nothing to tell somebody that they will not hear for themselves.
+    """
+    tool, speech = _tool(hold_music=HOLD_MUSIC, hold_volume=wanted)
+    model.answers = [SUMMARY, RETELLING]
+    await tool.handle_finished(_transcript(summaries, WATCHED_SOURCE))
+
+    await tool.handle_utterance(
+        _said("Miss Quote, what happened last session?"), Session(WATCHED_SOURCE)
+    )
+
+    assert speech.holds == [(HOLD_MUSIC, played)]
+
+
+async def test_music_that_is_not_a_number_stops_the_tool_from_starting(summaries):
+    with pytest.raises(ValueError, match="hold_volume"):
+        _tool(hold_music=HOLD_MUSIC, hold_volume="loud")

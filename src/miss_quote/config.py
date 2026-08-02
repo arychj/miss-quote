@@ -109,6 +109,8 @@ PRESENCE_SECTION = "presence"
 TIMEOUT_SECONDS_KEY = "timeout_seconds"
 STALL_SECONDS_KEY = "stall_seconds"
 LEAD_MS_KEY = "lead_ms"
+HOLD_FADE_IN_MS_KEY = "hold_fade_in_ms"
+HOLD_FADE_OUT_MS_KEY = "hold_fade_out_ms"
 CACHE_RETENTION_DAYS_KEY = "cache_retention_days"
 CURRENCY_KEY = "currency"
 SAVE_SECONDS_KEY = "save_seconds"
@@ -134,6 +136,8 @@ SETTINGS_SCHEMA: Mapping[str, Mapping[str, type]] = {
         TIMEOUT_SECONDS_KEY: float,
         STALL_SECONDS_KEY: float,
         LEAD_MS_KEY: float,
+        HOLD_FADE_IN_MS_KEY: float,
+        HOLD_FADE_OUT_MS_KEY: float,
         CACHE_RETENTION_DAYS_KEY: int,
     },
     CREDITS_SECTION: {
@@ -499,6 +503,21 @@ class TTSConfig:
     # the first chunk, as a synthesizer that streams as it renders wants.
     lead_ms: float = field(
         default_factory=lambda: file_cfg.setting(TTS_SECTION, LEAD_MS_KEY, 500.0)
+    )
+
+    # How music played under a wait arrives and leaves. Up quickly, because the
+    # gap it is covering has already started by the time it begins; down slowly,
+    # because it is being replaced by a sentence and a fade that ends where the
+    # first word starts sounds like one clip rather than two.
+    hold_fade_in_ms: float = field(
+        default_factory=lambda: file_cfg.setting(
+            TTS_SECTION, HOLD_FADE_IN_MS_KEY, 500.0
+        )
+    )
+    hold_fade_out_ms: float = field(
+        default_factory=lambda: file_cfg.setting(
+            TTS_SECTION, HOLD_FADE_OUT_MS_KEY, 2000.0
+        )
     )
 
     # How long a rendered clip survives on disk without being played. Aged by

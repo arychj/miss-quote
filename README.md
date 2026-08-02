@@ -521,6 +521,22 @@ The part worth explaining is the silence. Inference takes seconds, so the bot pl
 - **The completion is started before the preamble is played, not after.** Playback returns when the clip has finished, so asking the model on the next line would put the inference *after* the announcement meant to cover it. `tests/test_summary.py` guards this as a deadlock rather than a timing assertion: the fake preamble will not finish until the model has started, so getting the order wrong hangs the test instead of quietly passing.
 - **The preamble, the `empty` line and the `missing` one are rendered at startup**, so each begins on a file read rather than a synthesizer round trip.
 
+#### Hold music
+
+The preamble covers a couple of seconds. A completion routinely runs longer, and what is left over is dead air: the bot has said it is going to look at its notes, and then the channel hears nothing at all until it starts talking. `hold_music` fills that.
+
+It is **off unless a channel names a clip**, and nothing is shipped — the audio is yours. Drop a 16-bit WAV in `SPEECH_DIR/chimes` beside the flourishes and name it here without its extension, on exactly the same terms as a tool's `chime`. It **loops**, so what belongs there is a short passage that meets itself rather than a track; and since a clip is read into memory whole and held for the life of the process, ten to thirty seconds is the size to author, not three minutes.
+
+The shape of it is the whole feature:
+
+- **It fades up** over `settings.tts.hold_fade_in_ms` (500 ms) as soon as the preamble ends. Quickly, because the gap it is covering has already started.
+- **It loops for as long as the wait lasts** — the model thinking, and then the synthesizer starting on the answer. Both are covered, which matters more than it sounds: a completion that returns instantly still leaves the `lead_ms` head start to be waited out, and that would otherwise be a second silence immediately after the first one was papered over.
+- **It fades down** over `settings.tts.hold_fade_out_ms` (2 s), starting only once the first speech is in hand, so the music reaches silence exactly where the first word begins rather than being cut off at it.
+
+The music and the retelling are **one clip**, armed once. The speaker plays one thing at a time per server and arms the player afresh for each call, so two calls would put a gap exactly where this is trying not to have one — the same reasoning that chains a chime onto the front of a phrase. `hold_volume` is a fraction of `PLAYBACK_VOLUME` and applies to the music alone; the retelling arrives at the loudness it would have had anyway. It is per channel because the clip is: two pieces of music are not the same loudness.
+
+A clip that is missing, or will not parse, costs the music and not the answer — the wait goes back to being silent, which is what it was before anybody configured anything. The name is checked at startup and reported if it is not there, and kept regardless, so a volume mounted later starts working without a restart.
+
 A second ask while a retelling is still going is dropped rather than queued — what is queued behind a minute of narration is a minute of the same narration — and `backoff_seconds` is how soon after one the channel can be told it again. The window is per **evening**, not per channel: what it exists to stop is the same story twice, and somebody asking about a different night is asking a second question with a different answer.
 
 **The story ends itself.** A retelling runs to a minute and ends wherever the model chose to end it, so a channel that has been listening has no way to tell "finished" from "stopped" — which is a thing to ask the prompt for rather than a thing to bolt on after it. `bard` is told to close on a line that means the tale is over, in the voice it has been telling it in, and that sign-off is what the room hears. A custom retelling prompt gets the same instruction by writing `{retelling_closing}`.
@@ -563,6 +579,8 @@ A prompt of your own can pull in the text the shipped ones share by naming it in
 | `empty` | `I don't have any notes from this channel yet.` | What plays when nothing has ever been written down in this room |
 | `missing` | `I don't have any notes from then.` | What plays when there are notes, just not from the evening that was named |
 | `closing` | — | A fixed line played once the story is told, for a server that wants the same words every time. Unset, and the retelling prompt's own sign-off is what says it finished |
+| `hold_music` | — | A WAV in `SPEECH_DIR/chimes`, named without its `.wav`, looped under the wait once the preamble runs out. Unset leaves the wait silent |
+| `hold_volume` | `0.15` | How loud that music is, as a fraction of `PLAYBACK_VOLUME`. Clamped to `0`–`1` |
 | `name` | `miss quote`, `misquote`, `missquote`, `mis quote`, `ms quote`, `mizquote` | What the bot answers to, in the spellings a transcriber returns for a name it has never been told. **Replaces** the default |
 | `triggers` | `what happened`, `what did we do`, `recap`, `read me your notes`, `tell me about` | How asking **starts**; which evening is a clause after it. **Replaces** the default |
 
@@ -631,6 +649,15 @@ if speech is not None:
 ```
 
 It returns once the clip has finished, so a tool that says two things in a row gets them in that order rather than on top of each other. `scale` is relative to the deployment's own loudness rather than absolute — `1.0` is however loud the channel asked to be interrupted, and a tool with a reason to be quieter has no business knowing what usual is. `chime` names a WAV in `SPEECH_DIR/chimes`, **without its extension**, played ahead of the words; a chime that is missing costs the chime and not the announcement.
+
+**`play_held` is `play` for a sentence that does not exist yet**, for a tool that has to go and think before it can answer:
+
+```python
+thinking = asyncio.create_task(self._ask_the_model(...))
+await speech.play_held(source, thinking, hold="on-hold", hold_volume=0.15)
+```
+
+The task is handed over rather than awaited, because the point is to be playing something while it runs. The music and the answer come out as one clip: it fades up, loops for as long as the completion *and* the synthesizer behind it take, and fades down to reach silence where the first word begins. With no `hold` — or a clip that is not there — it waits for the sentence and then says it, which is `play` and nothing more. See [hold music](#hold-music) for the shape of it and `audio/hold.py` for why an open-ended clip cannot simply be fed to the player.
 
 **How a clip reaches Discord is decided here, and it is the difference between free and not.** A phrase with nothing in front of it and nothing to be done to it is handed over exactly as it was stored — Opus packets, no decode, no encode, no resample, and no encoder even constructed. A chime, or any volume below the channel's own, means samples: there is nothing to join onto an encoded packet and nothing in one to multiply. So `quotes`, which never uses a chime and never turns itself down, takes the free path every time, and a backed-off fine with a flourish in front of it does not.
 
@@ -733,7 +760,7 @@ A hit is a file read — 0.85 ms end to end for a three-second clip, against a 2
 
 ### Chimes
 
-`SPEECH_DIR/chimes` holds **clips nobody synthesized** — a flourish a tool plays ahead of what it has to say. Drop a 16-bit WAV in and name it from the tool's config, without the extension; it is read once, converted to playback PCM, and held for the life of the process.
+`SPEECH_DIR/chimes` holds **clips nobody synthesized** — a flourish a tool plays ahead of what it has to say, and the `summary` tool's [hold music](#hold-music), which loops under a wait instead of playing once. Drop a 16-bit WAV in and name it from the tool's config, without the extension; it is read once, converted to playback PCM, and held for the life of the process.
 
 It is a separate directory from the cache and that is the whole point: nothing writes here and nothing reaps here, so a clip somebody put there deliberately is never on a retention clock meant for a phrase said once. Names are resolved against the directory rather than taken at their word — a bare name or a path below it, and anything that climbs out is refused — so a setting cannot be pointed at an arbitrary file on the host. The directory does not have to exist; an absent one is a missing chime, reported by whichever tool asked for it, rather than a failure to start.
 
@@ -750,6 +777,8 @@ Only used by tools that answer out loud. Where the synthesizer *is* is `TTS_HOST
 | `timeout_seconds` | `30.0` | Budget for a **single** wait on the synthesizer, not for a whole clip — a long phrase arriving steadily is not cut off for taking a long time |
 | `stall_seconds` | `10.0` | How long the player waits mid-clip for audio that never comes before ending it |
 | `lead_ms` | `500.0` | How much speech to have in hand before a clip starts playing, so a synthesizer that renders a phrase whole leaves no gap behind a chime. `0` starts on the first chunk |
+| `hold_fade_in_ms` | `500.0` | How quickly music under a wait arrives. Only the `summary` tool asks for any, and only for a channel that set `hold_music`. `0` is a cut |
+| `hold_fade_out_ms` | `2000.0` | How slowly it leaves, timed to reach silence where the first word starts. `0` is a cut |
 | `cache_retention_days` | `90` | Days anything in `SPEECH_DIR/cache` survives without being played, counted from the last time it was. Also what clears out clips an earlier version wrote as WAVs, and `.partial` files orphaned by a process killed mid-write. Any value below `1` keeps them forever. Chimes live elsewhere and are never reaped |
 
 ### `credits`
@@ -1017,6 +1046,7 @@ miss-quote/
 │       │   ├── opus.py        # Encode to what Discord sends, and the Ogg it is kept in
 │       │   ├── gain.py        # Playback loudness
 │       │   ├── chimes.py      # Clips kept by hand, read out of SPEECH_DIR/chimes
+│       │   ├── hold.py        # One of those looped under a wait, with an envelope
 │       │   └── ring_buffer.py # Pre-speech context buffer
 │       ├── stt/
 │       │   ├── vad.py         # Silero VAD via onnxruntime
