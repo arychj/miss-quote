@@ -6,16 +6,21 @@ import time
 import numpy as np
 import pytest
 
+from miss_quote.audio.gain import LOUDEST_SAMPLE, LOUDNESS_EXPONENT
 from miss_quote.audio.hold import HoldMusic
 from miss_quote.config import audio_cfg
 
 FRAME_BYTES = audio_cfg.playback_frame_bytes
 FRAME_MS = audio_cfg.playback_frame_ms
 
-# A flat clip, so the peak of a frame divided by this is the gain that frame was
-# played at. A tone would need a window to measure and would say nothing extra:
-# what is under test is the envelope, not the resampler.
-FULL_SCALE = 10_000
+# A flat clip, and as loud a one as int16 holds, so the peak of a frame says
+# where the envelope was when that frame went out. Near full scale because the
+# quiet end of a fade is where the resolution runs out: the envelope is a volume
+# and the samples are an amplitude, and reading the first back off the second
+# magnifies whatever the truncation lost. A tone would need a window to measure
+# and would say nothing extra — what is under test is the envelope, not the
+# resampler.
+FULL_SCALE = LOUDEST_SAMPLE
 
 HOLD_VOLUME = 0.15
 FADE_IN_MS = 500.0
@@ -28,9 +33,11 @@ FADE_OUT_FRAMES = int(FADE_OUT_MS / FRAME_MS)
 # it is the pace being tested.
 UNPACED_MS = 600_000.0
 
-# A gain is measured off int16 samples that were scaled in float and truncated,
-# so it is right to about a part in ten thousand rather than exactly.
-GAIN_TOLERANCE = 1e-3
+# Where the envelope was, read back off samples that were scaled in float and
+# truncated to int16. Comfortably finer than any step these tests assert on, and
+# loose enough for the last frame of a fade, which is quieter than int16 has a
+# value for and therefore reads as the silence it is.
+VOLUME_TOLERANCE = 5e-3
 
 
 def _clip(frames: int, level: int = FULL_SCALE) -> bytes:
@@ -53,9 +60,17 @@ def _music(clip: bytes | None = None, **overrides) -> HoldMusic:
     return HoldMusic(_clip(FADE_IN_FRAMES) if clip is None else clip, **settings)
 
 
-def _gain(frame: bytes) -> float:
-    """How loud one frame was played, as a fraction of the clip's own level."""
-    return float(np.abs(np.frombuffer(frame, dtype=np.int16)).max()) / FULL_SCALE
+def _volume(frame: bytes) -> float:
+    """
+    Where the envelope was for one frame, as a position on the knob.
+
+    The samples carry an amplitude and the envelope is a volume, so this is the
+    curve in `audio.gain` run backwards — which is what lets a fade be asserted
+    on in the terms it is written in.
+    """
+    peak = float(np.abs(np.frombuffer(frame, dtype=np.int16)).max()) / FULL_SCALE
+
+    return peak ** (1 / LOUDNESS_EXPONENT)
 
 
 async def _sustain(music: HoldMusic, frames: int) -> list[bytes]:
@@ -121,9 +136,9 @@ async def test_the_music_arrives_rather_than_starting():
 
     played = await _sustain(music, FADE_IN_FRAMES)
 
-    assert _gain(played[0]) == pytest.approx(0.0, abs=GAIN_TOLERANCE)
-    assert _gain(played[halfway]) == pytest.approx(
-        HOLD_VOLUME * halfway / FADE_IN_FRAMES, abs=GAIN_TOLERANCE
+    assert _volume(played[0]) == pytest.approx(0.0, abs=VOLUME_TOLERANCE)
+    assert _volume(played[halfway]) == pytest.approx(
+        HOLD_VOLUME * halfway / FADE_IN_FRAMES, abs=VOLUME_TOLERANCE
     )
 
 
@@ -132,11 +147,11 @@ async def test_the_fade_in_stops_at_the_loudness_it_was_asked_for():
 
     played = await _sustain(music, FADE_IN_FRAMES * 2)
 
-    assert _gain(played[FADE_IN_FRAMES]) == pytest.approx(
-        HOLD_VOLUME, abs=GAIN_TOLERANCE
+    assert _volume(played[FADE_IN_FRAMES]) == pytest.approx(
+        HOLD_VOLUME, abs=VOLUME_TOLERANCE
     )
     assert all(
-        _gain(frame) == pytest.approx(HOLD_VOLUME, abs=GAIN_TOLERANCE)
+        _volume(frame) == pytest.approx(HOLD_VOLUME, abs=VOLUME_TOLERANCE)
         for frame in played[FADE_IN_FRAMES:]
     )
 
@@ -151,8 +166,8 @@ async def test_the_fade_in_spans_both_halves_of_a_wait():
     first = await _sustain(music, FADE_IN_FRAMES // 2)
     second = await _sustain(music, FADE_IN_FRAMES)
 
-    assert _gain(second[0]) > _gain(first[-1])
-    assert _gain(second[-1]) == pytest.approx(HOLD_VOLUME, abs=GAIN_TOLERANCE)
+    assert _volume(second[0]) > _volume(first[-1])
+    assert _volume(second[-1]) == pytest.approx(HOLD_VOLUME, abs=VOLUME_TOLERANCE)
 
 
 async def test_the_music_leaves_over_the_span_it_was_given():
@@ -162,9 +177,9 @@ async def test_the_music_leaves_over_the_span_it_was_given():
     leaving = await _drain(music)
 
     assert len(leaving) == FADE_OUT_FRAMES
-    assert _gain(leaving[0]) == pytest.approx(HOLD_VOLUME, abs=GAIN_TOLERANCE)
-    assert _gain(leaving[-1]) == pytest.approx(
-        HOLD_VOLUME / FADE_OUT_FRAMES, abs=GAIN_TOLERANCE
+    assert _volume(leaving[0]) == pytest.approx(HOLD_VOLUME, abs=VOLUME_TOLERANCE)
+    assert _volume(leaving[-1]) == pytest.approx(
+        HOLD_VOLUME / FADE_OUT_FRAMES, abs=VOLUME_TOLERANCE
     )
 
 
@@ -175,8 +190,10 @@ async def test_the_fade_out_starts_from_wherever_the_music_got_to():
 
     leaving = await _drain(music)
 
-    assert _gain(leaving[0]) == pytest.approx(_gain(rising[-1]), abs=GAIN_TOLERANCE)
-    assert _gain(leaving[0]) < HOLD_VOLUME
+    assert _volume(leaving[0]) == pytest.approx(
+        _volume(rising[-1]), abs=VOLUME_TOLERANCE
+    )
+    assert _volume(leaving[0]) < HOLD_VOLUME
 
 
 async def test_music_that_barely_arrived_leaves_at_the_same_rate_it_would_have():
@@ -190,7 +207,7 @@ async def test_music_that_barely_arrived_leaves_at_the_same_rate_it_would_have()
     rising = await _sustain(music, reached)
     leaving = await _drain(music)
 
-    proportionate = FADE_OUT_FRAMES * _gain(rising[-1]) / HOLD_VOLUME
+    proportionate = FADE_OUT_FRAMES * _volume(rising[-1]) / HOLD_VOLUME
 
     assert len(leaving) == pytest.approx(proportionate, abs=1)
 

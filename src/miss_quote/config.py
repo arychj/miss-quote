@@ -26,9 +26,14 @@ FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 BYTES_PER_INT16_SAMPLE = 2
 MILLISECONDS_PER_SECOND = 1000
 
-# Playback at whatever loudness the audio was authored or synthesized at, and
-# the quietest a scale can ask for. Below silence a factor inverts the waveform
-# rather than lowering it, which is not what anybody setting a volume meant.
+# The two ends of every volume in this process. Playback at whatever loudness
+# the audio was authored or synthesized at, and the quietest anything can ask
+# for. Below silence a factor inverts the waveform rather than lowering it,
+# which is not what anybody setting a volume meant.
+#
+# What lies between them is a knob rather than a multiplier: a half is half as
+# loud to listen to, not half the amplitude. See `audio.gain.amplitude`, which
+# is where a setting becomes samples.
 UNITY_VOLUME = 1.0
 SILENT_VOLUME = 0.0
 
@@ -333,10 +338,10 @@ class AudioConfig:
     # full one, so playback is framed rather than streamed byte by byte.
     playback_frame_ms: int = 20
 
-    # What a clip is scaled by on its way to the player, where 1.0 is however
-    # loud the synthesizer rendered it: 0.8 is 20% quieter, 1.2 is 20% louder
-    # and clipped rather than wrapped. Floored at silence, since a negative
-    # factor inverts a waveform instead of quietening it.
+    # How loud this deployment is, where 1.0 is however loud the synthesizer
+    # rendered a clip: 0.8 is 20% quieter to listen to, 1.2 is 20% louder and
+    # clipped rather than wrapped. Floored at silence, since a negative factor
+    # inverts a waveform instead of quietening it.
     playback_volume: float = field(
         default_factory=lambda: max(
             SILENT_VOLUME, _env_float("PLAYBACK_VOLUME", UNITY_VOLUME)
@@ -797,11 +802,13 @@ class MoralityConfig:
         )
     )
 
-    # How much of an announcement each violation inside that window takes off.
-    # At the default, fifteen of them reach a floor of a quarter. 0 turns the
-    # backoff off, there being nothing to take off; anything above 100% would
-    # make one violation enough to reach the floor, and anything below 0 would
-    # make a repeat offender louder rather than quieter.
+    # How much of an announcement's loudness each violation inside that window
+    # takes off, and taken off the knob rather than the amplitude, so five
+    # percent is five percent quieter to listen to. At the default, fifteen of
+    # them reach a floor of a quarter. 0 turns the backoff off, there being
+    # nothing to take off; anything above 100% would make one violation enough
+    # to reach the floor, and anything below 0 would make a repeat offender
+    # louder rather than quieter.
     backoff_step: float = field(
         default_factory=lambda: min(
             UNITY_VOLUME,
@@ -812,9 +819,10 @@ class MoralityConfig:
         )
     )
 
-    # The quietest an announcement gets, as a fraction of PLAYBACK_VOLUME, once
-    # a speaker has earned enough of a backoff to reach it. 0 silences them
-    # entirely; 1 turns the backoff off, since there is nowhere to back off to.
+    # The quietest an announcement gets, once a speaker has earned enough of a
+    # backoff to reach it, as how loud it is next to PLAYBACK_VOLUME: a quarter
+    # is a quarter as loud. 0 silences them entirely; 1 turns the backoff off,
+    # since there is nowhere to back off to.
     volume_floor: float = field(
         default_factory=lambda: min(
             UNITY_VOLUME,

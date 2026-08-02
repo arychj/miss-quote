@@ -28,6 +28,14 @@ PATIENCE_SECONDS = 2.0
 HALF_VOLUME = 0.5
 SAMPLE_DTYPE = np.int16
 
+# A volume is a knob rather than a multiplier, so a test that reads samples has
+# to say where on the curve it is standing. A quarter is the position worth
+# standing on: 20 dB down is exactly a tenth of the amplitude, which is a whole
+# number, so the assertion is arithmetic rather than the curve restated. See
+# `audio.gain.amplitude`.
+QUARTER_VOLUME = 0.25
+TENTH_OF_THE_AMPLITUDE = 10
+
 # What a fake clip reports having been asked for, so a test can name the path
 # the speaker took rather than infer it.
 ENCODED = "packets"
@@ -136,13 +144,15 @@ def test_a_stalled_synthesizer_ends_the_clip(caplog):
 
 def test_a_clip_is_turned_down_on_the_way_in():
     """Fed rather than read, so every part of a clip is scaled once."""
-    stream = PCMStream(STALL_SECONDS, HALF_VOLUME)
+    stream = PCMStream(STALL_SECONDS, QUARTER_VOLUME)
     stream.feed(LOUD)
     stream.finish()
 
     frame = np.frombuffer(stream.read(), dtype=SAMPLE_DTYPE)
 
-    assert list(frame) == list(np.frombuffer(LOUD, dtype=SAMPLE_DTYPE) // 2)
+    assert list(frame) == list(
+        np.frombuffer(LOUD, dtype=SAMPLE_DTYPE) // TENTH_OF_THE_AMPLITUDE
+    )
 
 
 def test_audio_fed_in_pieces_is_reframed():
@@ -208,7 +218,13 @@ async def test_nothing_is_played_when_the_bot_has_moved_on():
 
 
 async def test_a_scale_is_applied_on_top_of_the_deployment_volume(monkeypatch):
-    """A tool says how much quieter than usual, not how loud."""
+    """
+    A tool says how much quieter than usual, not how loud.
+
+    Half of a half is a quarter of the loudness, and the two are multiplied as
+    knobs before either becomes an amplitude — which is a property of the curve
+    rather than an accident of where the multiplication happens to sit.
+    """
     monkeypatch.setattr(
         speaker_module, "audio_cfg", replace(audio_cfg, playback_volume=HALF_VOLUME)
     )
@@ -217,7 +233,9 @@ async def test_a_scale_is_applied_on_top_of_the_deployment_volume(monkeypatch):
     await _speaker(voice_client).play(SOURCE, _audio(LOUD), HALF_VOLUME)
 
     frame = np.frombuffer(voice_client.frames[0], dtype=SAMPLE_DTYPE)
-    assert list(frame) == list(np.frombuffer(LOUD, dtype=SAMPLE_DTYPE) // 4)
+    assert list(frame) == list(
+        np.frombuffer(LOUD, dtype=SAMPLE_DTYPE) // TENTH_OF_THE_AMPLITUDE
+    )
 
 
 async def test_a_clip_with_no_scale_is_played_at_the_deployment_volume():

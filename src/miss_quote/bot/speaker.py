@@ -222,10 +222,14 @@ class DiscordSpeaker:
         """
         Play one clip, encoded if nothing has to be done to it first.
 
-        The gain is the deployment's loudness times whatever the caller asked
-        for, and it is the whole of the decision: at unity there is nothing to
-        do to the audio, so a clip that can be had already encoded is sent as it
-        was stored. Anything quieter has to be multiplied, and multiplying means
+        The volume is the deployment's loudness times whatever the caller asked
+        for. Both are knobs and the product is another, which is why they can be
+        combined here and converted to an amplitude later; see
+        `audio.gain.amplitude`.
+
+        It is also the whole of the decision: at unity there is nothing to do to
+        the audio, so a clip that can be had already encoded is sent as it was
+        stored. Anything quieter has to be multiplied, and multiplying means
         samples.
         """
         async with self._lock_for(source.guild_id):
@@ -233,16 +237,16 @@ class DiscordSpeaker:
             if voice_client is None:
                 return
 
-            gain = audio_cfg.playback_volume * scale
+            volume = audio_cfg.playback_volume * scale
 
             if isinstance(audio, Encodable):
-                if gain == UNITY_VOLUME:
+                if volume == UNITY_VOLUME:
                     await self._play_encoded(voice_client, audio.packets())
                     return
 
                 audio = audio.pcm()
 
-            await self._play(voice_client, audio, gain)
+            await self._play(voice_client, audio, volume)
 
     def _lock_for(self, guild_id: int) -> asyncio.Lock:
         lock = self._locks.get(guild_id)
@@ -286,17 +290,17 @@ class DiscordSpeaker:
         cls,
         voice_client: discord.VoiceClient,
         audio: AsyncIterator[bytes],
-        gain: float = UNITY_VOLUME,
+        volume: float = UNITY_VOLUME,
     ) -> None:
         """
-        Feed one clip to the player as samples, at the gain `play` settled on.
+        Feed one clip to the player as samples, at the volume `play` settled on.
 
         The deployment's loudness and the caller's scale are multiplied before
         they arrive here, so `PLAYBACK_VOLUME` remains the only thing that says
         how loud a channel wants to be interrupted and a tool only says how much
         quieter than that this particular clip should be.
         """
-        await cls._drive(voice_client, PCMStream(tts_cfg.stall_seconds, gain), audio)
+        await cls._drive(voice_client, PCMStream(tts_cfg.stall_seconds, volume), audio)
 
     @classmethod
     async def _play_encoded(

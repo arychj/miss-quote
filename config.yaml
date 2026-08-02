@@ -93,13 +93,18 @@ settings:
     # somebody is back to full volume this long after their last violation. 0%
     # takes nothing off, which turns the backoff off entirely.
     #
+    # The percentage is off what a listener hears rather than off the amplitude,
+    # so 5% is a step somebody notices rather than the half a decibel it works
+    # out as otherwise. Every volume in this file reads that way.
+    #
     # backoff_seconds: 300
     # backoff_percent: 5
 
-    # The quietest a fine is announced, as a fraction of PLAYBACK_VOLUME, once
-    # somebody has sworn enough inside the window to earn the full backoff. At
-    # the defaults that is fifteen violations. 0 silences a repeat offender
-    # entirely; 1 turns the backoff off, there being nowhere to back off to.
+    # The quietest a fine is announced once somebody has sworn enough inside the
+    # window to earn the full backoff, as how loud it is next to
+    # PLAYBACK_VOLUME: a quarter is a quarter as loud. At the defaults that is
+    # fifteen violations. 0 silences a repeat offender entirely; 1 turns the
+    # backoff off, there being nowhere to back off to.
     #
     # volume_floor: 0.25
 
@@ -521,10 +526,13 @@ servers:
               # is gone by the first word of the retelling; the two spans are
               # settings.tts.hold_fade_in_ms and hold_fade_out_ms.
               #
-              # `hold_volume` is a fraction of PLAYBACK_VOLUME, so it is however
-              # much quieter than the talking the music should be. It is per
-              # channel because the clip is: two pieces of music are not the
-              # same loudness. Anything outside 0 to 1 is clamped to it.
+              # `hold_volume` says how loud the music is next to
+              # PLAYBACK_VOLUME, so it is however much quieter than the talking
+              # the music should be — 0.15 is 15% as loud, not 15% of the
+              # amplitude, which is a third as loud and the reason this is a
+              # curve rather than a multiplication. It is per channel because
+              # the clip is: two pieces of music are not the same loudness.
+              # Anything outside 0 to 1 is clamped to it.
               #
               # hold_music: on-hold
               # hold_volume: 0.15

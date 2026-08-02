@@ -79,8 +79,8 @@ class Speaker(Protocol):
 
         `scale` is relative to the deployment's own loudness rather than
         absolute: 1.0 is however loud the channel asked to be interrupted, and
-        0.5 is half of that. A tool with a reason to be quieter than usual has
-        no business knowing what usual is.
+        0.5 is half as loud as that. A tool with a reason to be quieter than
+        usual has no business knowing what usual is.
         """
         ...
 

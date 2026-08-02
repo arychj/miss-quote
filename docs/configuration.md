@@ -265,7 +265,7 @@ Keys are matched through the same slug that names the transcript directory, so `
 | `missing` | `I don't have any notes from then.` | What plays when there are notes, just not from the evening that was named |
 | `closing` | — | A fixed line played once the story is told. Unset, and the retelling prompt's own sign-off is what says it finished |
 | `hold_music` | — | A WAV in `SPEECH_DIR/chimes`, named without its `.wav`, looped under the wait once the preamble runs out. Unset leaves the wait silent |
-| `hold_volume` | `0.15` | How loud that music is, as a fraction of `PLAYBACK_VOLUME`. Clamped to `0`–`1` |
+| `hold_volume` | `0.15` | How loud that music is next to `PLAYBACK_VOLUME` — `0.15` is 15% as loud, not 15% of the amplitude ([how a volume is read](#volumes)). Clamped to `0`–`1` |
 | `name` | `miss quote`, `misquote`, `missquote`, `mis quote`, `ms quote`, `mizquote` | What the bot answers to, in the spellings a transcriber returns for a name it has never been told. **Replaces** the default |
 | `triggers` | `what happened`, `what did we do`, `recap`, `read me your notes`, `tell me about` | How asking **starts**; which evening is a clause after it. **Replaces** the default |
 
@@ -328,7 +328,7 @@ It is **off unless a channel names a clip**, and nothing is shipped — the audi
 - **It loops for as long as the wait lasts** — the model thinking, and then the synthesizer starting on the answer. Both are covered: a completion that returns instantly still leaves the `lead_ms` head start to be waited out.
 - **It fades down** over `settings.tts.hold_fade_out_ms` (2 s), starting only once the first speech is in hand, so the music reaches silence exactly where the first word begins rather than being cut off at it.
 
-The music and the retelling are **one clip**, armed once — two calls would put a gap exactly where this is trying not to have one. `hold_volume` is a fraction of `PLAYBACK_VOLUME` and applies to the music alone; the retelling arrives at the loudness it would have had anyway. A clip that is missing, or will not parse, costs the music and not the answer. The name is checked at startup and reported if it is not there, and kept regardless, so a volume mounted later starts working without a restart.
+The music and the retelling are **one clip**, armed once — two calls would put a gap exactly where this is trying not to have one. `hold_volume` says how loud the music is next to `PLAYBACK_VOLUME` and applies to the music alone; the retelling arrives at the loudness it would have had anyway. A clip that is missing, or will not parse, costs the music and not the answer. The name is checked at startup and reported if it is not there, and kept regardless, so a volume mounted later starts working without a restart.
 
 **The story ends itself.** A retelling runs to a minute and ends wherever the model chose to end it, so a channel that has been listening has no way to tell "finished" from "stopped". `bard` is told to close on a line that means the tale is over, in the voice it has been telling it in. `closing` is the other way to do it: a fixed sentence, played after the story. It is **unset by default**, since a fixed line following one that has just said goodbye is one goodbye too many.
 
@@ -448,7 +448,7 @@ What does not scale is the number of announcements. Three violations in one utte
 
 **Being fined twice in a row is worded differently.** A speaker fined again inside `settings.fines.repeat_seconds` gets `repeat_announcement` — "you are *also* fined" — because reading the whole sentence out again sounds like a bot that has lost track of what it just said. It is per speaker: somebody else swearing in the meantime does not make their first fine a repeat.
 
-**A repeat offender is announced more quietly.** Being fined is the joke, and the joke told fifteen times in five minutes is a denial of service on the conversation. Every violation inside a sliding `settings.fines.backoff_seconds` takes `settings.fines.backoff_percent` off the next announcement, down to `settings.fines.volume_floor` — at the defaults, 5% a violation over five minutes, floored at a quarter of `PLAYBACK_VOLUME`, so fifteen of them reach the bottom. The first swear in a window is announced at full volume: the backoff is for saying it again. The window is per speaker and per server, held in memory only. What it does **not** affect is the tally.
+**A repeat offender is announced more quietly.** Being fined is the joke, and the joke told fifteen times in five minutes is a denial of service on the conversation. Every violation inside a sliding `settings.fines.backoff_seconds` takes `settings.fines.backoff_percent` off the next announcement, down to `settings.fines.volume_floor` — at the defaults, 5% a violation over five minutes, floored at a quarter as loud as `PLAYBACK_VOLUME`, so fifteen of them reach the bottom. The percentage is off what a listener hears rather than off the amplitude ([how a volume is read](#volumes)), so each step is one somebody can actually notice. The first swear in a window is announced at full volume: the backoff is for saying it again. The window is per speaker and per server, held in memory only. What it does **not** affect is the tally.
 
 **The announcements are rendered at startup.** The roster is known before anybody speaks and so is the shape of the sentence, so on the way up the tool hands `tts` every name in `users` against one, two, and three violations, in both wordings. Three violations because that is what a sentence usually holds; a fourth is remarkable enough to wait for the synthesizer. What cannot be warmed is anyone **not** on the roster: they pay for their first fine and nobody pays for it again.
 
@@ -491,8 +491,8 @@ Only used by `verbal-morality`. What a fine is *worth* is the scoreboard's; thes
 |---|---|---|
 | `repeat_seconds` | `5.0` | How soon after being fined the same speaker is told they are "also fined" rather than hearing the whole sentence again. `0`, or any value below it, turns the second wording off |
 | `backoff_seconds` | `300.0` | The sliding window a violation counts for against how loudly the next one is announced |
-| `backoff_percent` | `5` | How much each violation inside that window takes off the next announcement. `0` takes nothing off, turning the backoff off; anything above `100` reaches the floor on the first repeat, and anything negative is treated as `0` rather than made louder |
-| `volume_floor` | `0.25` | The quietest a fine is announced, as a fraction of `PLAYBACK_VOLUME`, once a speaker has earned the full backoff. `0` silences a repeat offender entirely; `1` turns the backoff off |
+| `backoff_percent` | `5` | How much of the next announcement's loudness each violation inside that window takes off, and off the knob rather than the amplitude, so 5% is 5% quieter to listen to ([how a volume is read](#volumes)). `0` takes nothing off, turning the backoff off; anything above `100` reaches the floor on the first repeat, and anything negative is treated as `0` rather than made louder |
+| `volume_floor` | `0.25` | The quietest a fine is announced once a speaker has earned the full backoff, as how loud it is next to `PLAYBACK_VOLUME` — a quarter is a quarter as loud ([how a volume is read](#volumes)). `0` silences a repeat offender entirely; `1` turns the backoff off |
 
 ### settings.quotes {#settings-quotes}
 
@@ -595,8 +595,25 @@ Only used by tools that answer out loud. A deployment with no such tool enabled 
 | `TTS_HOST` | `localhost` | Hostname or service name of the Wyoming TTS server |
 | `TTS_PORT` | `10200` | Wyoming's conventional TTS port |
 | `TTS_VOICE` | — | Voice to ask for. Empty takes whatever the synthesizer considers its default, so a server with one voice loaded needs no setting |
-| `PLAYBACK_VOLUME` | `1.0` | Scales everything played into a channel, chime included. `1.0` is however loud the synthesizer rendered it, `0.8` is 20% quieter, `1.2` is 20% louder and clipped rather than wrapped. Any value below `0` is treated as silence. **Below `1.0` every clip is decoded and re-encoded on its way past**, so it has a CPU cost as well as a loudness one — turn a channel down at the Discord end where you can |
+| `PLAYBACK_VOLUME` | `1.0` | How loud everything played into a channel is, chime included. `1.0` is however loud the synthesizer rendered it, `0.8` is 20% quieter, `1.2` is 20% louder and clipped rather than wrapped. A knob rather than a multiplier — see [How a volume is read](#volumes). Any value below `0` is treated as silence. **Below `1.0` every clip is decoded and re-encoded on its way past**, so it has a CPU cost as well as a loudness one — turn a channel down at the Discord end where you can |
 | `SPEECH_DIR` | `/speech` | Audio on disk, as one root with a directory per kind. `cache/` is rendered speech as Ogg Opus, written and reaped by the bot — mount a writable volume here, since without one every phrase is synthesized again every time it is said. `chimes/` is where you put a WAV by hand |
+
+#### How a volume is read {#volumes}
+
+Every volume in this bot is a knob rather than a multiplier: `1` is full, `0` is silent, and **half is half as loud to listen to**. That covers `PLAYBACK_VOLUME`, `settings.fines.volume_floor`, `settings.fines.backoff_percent`, and each channel's `hold_volume`.
+
+It is worth stating because the obvious implementation gets it wrong. Hearing is logarithmic, so a clip at half the *amplitude* is under 3 dB down and still sounds around four fifths as loud; halving what somebody actually hears takes about 10 dB. The setting is converted on that curve on its way to the samples, which is why the numbers below do what they say:
+
+| Setting | Amplitude | Attenuation |
+|---|---|---|
+| `1.0` | `1.0` | 0 dB |
+| `0.8` | `0.690` | −3.2 dB |
+| `0.5` | `0.316` | −10 dB |
+| `0.25` | `0.100` | −20 dB |
+| `0.15` | `0.043` | −27.4 dB |
+| `0` | `0` | silence |
+
+Volumes multiply as knobs, so a tool asking for half of a deployment set to half is announced at a quarter — a quarter as loud, which is a tenth of the amplitude. Nothing has to be set in decibels, and a value from a deployment that predates this reads about as it used to at the loud end and considerably quieter below halfway.
 
 ### Quotes {#env-quotes}
 
