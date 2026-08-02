@@ -296,6 +296,7 @@ code, pre, kbd, samp { font-family: var(--font-mono); }
   max-width: 60ch;
   margin: 14px auto 0;
   line-height: 1.6;
+  text-wrap: balance;
 }
 
 .hero-actions {
