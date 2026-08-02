@@ -3,7 +3,11 @@
 # library rather than a wheel, and CI and a laptop then run the same thing.
 
 DOCKER ?= docker
-PYTHON ?= python3
+
+# The validator needs PyYAML, so prefer the checkout's virtualenv over whatever
+# python3 is first on PATH. Overridable for a machine that installed it another
+# way, and used by nothing else here.
+PYTHON ?= $(shell test -x .venv/bin/python && echo .venv/bin/python || echo python3)
 
 IMAGE ?= miss-quote
 RUNTIME_TAG ?= local
@@ -18,7 +22,7 @@ TEST_IMAGE := $(IMAGE):$(TEST_TAG)
 PYTEST_ARGS ?= -q
 
 VALIDATOR := scripts/validate_quotes.py
-QUOTES_FILE ?= src/miss_quote/resources/quotes.csv
+QUOTES_FILE ?= src/miss_quote/resources/quotes.yaml
 
 .DEFAULT_GOAL := help
 
@@ -41,9 +45,9 @@ test: test-image ## Run the test suite in the container
 shell: test-image ## Open a shell in the test image
 	$(DOCKER) run --rm -it --entrypoint bash $(TEST_IMAGE)
 
-# Not containerized, on purpose. The validator is standard library only, so
-# there is no environment to reproduce, and the workflow that calls it exists to
-# answer a quote-list change in seconds rather than after an image build.
+# Not containerized, on purpose. The validator needs PyYAML and nothing else, so
+# there is no image to build, and the workflow that calls it exists to answer a
+# quote-list change in seconds rather than after one.
 validate-quotes: ## Check the quote file against the validator
 	$(PYTHON) $(VALIDATOR) "$(QUOTES_FILE)"
 

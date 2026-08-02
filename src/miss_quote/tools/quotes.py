@@ -2,13 +2,18 @@
 Answers the channel with the film line it just walked into.
 
 Listens for a trigger phrase and, on hearing one, says the associated quote out
-loud where it was said. The pairs come from a CSV — a film, the phrase that sets
-it off, and the line — so adding a quote is a row rather than a deployment.
+loud where it was said. The pairs come from a YAML file — a film, and under it
+the phrases that set its lines off — so adding a quote is a key rather than a
+deployment.
 
-A trigger may appear on more than one row, and one of them is drawn at random
-each time it fires. That is how a phrase worth answering several ways says so —
-the file lists the answers and the channel gets one of them — and it is why the
-list is keyed on the trigger rather than the row. See `_load`.
+A trigger appears once in the whole file. Nesting under the title makes it a
+key, so a repeat under one title is not something the format can express at all;
+a repeat across two titles is refused for the same reason rather than being
+allowed to mean something a repeat under one title could not. A phrase worth
+answering several ways says so with a list of lines, and one of them is drawn
+each time it fires — written out rather than inferred from a repeated key, which
+would have relied on the parser keeping something the format does not promise to
+keep. See `_load`.
 
 A trigger that has just fired goes quiet for a while — five minutes by default.
 The joke is the recognition, and a channel that says "cool" four times in a
@@ -54,14 +59,15 @@ waits for it, and so can both wordings for everybody on the roster. See `prewarm
 
 from __future__ import annotations
 
-import csv
 import random
 import re
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypeVar
+
+import yaml
 
 from miss_quote.config import quotes_cfg, scoreboard_cfg
 from miss_quote.tools.base import Tool, ToolContext
@@ -76,24 +82,25 @@ logger = get_logger(__name__)
 
 T = TypeVar("T")
 
-MOVIE_COLUMN = "movie"
-TRIGGER_COLUMN = "trigger"
-QUOTE_COLUMN = "quote"
-COLUMNS = (MOVIE_COLUMN, TRIGGER_COLUMN, QUOTE_COLUMN)
+MOVIE_LABEL = "movie"
+TRIGGER_LABEL = "trigger"
+QUOTE_LABEL = "quote"
 
 FILE_ENCODING = "utf-8"
-COLUMN_SEPARATOR = ", "
 
-# Where `DictReader` files the fields a row has beyond its header. It is not a
-# column and nothing reads it, which is what makes an unquoted comma in a line
-# the one mistake that loads cleanly: the quote is cut at the comma and the rest
-# of the sentence lands here.
-OVERFLOW_COLUMN = None
+# What holds a title and a trigger apart in a line of the log, so a dropped
+# entry says where it is in the file's own words as well as by line number.
+KEY_SEPARATOR = " → "
 
-# Row 1 is the header, which `DictReader` consumes, so the first row of data is
-# the second line of the file. Counting the way an editor does is the point: a
-# reported line number nobody can go and look at is not worth reporting.
-FIRST_ROW = 2
+# The one tag a key or a value may resolve to. YAML reads an unquoted `no` as a
+# boolean and an unquoted `1917` as an integer, and neither is text the matcher
+# can compare against or the synthesizer can say.
+STRING_TAG = "tag:yaml.org,2002:str"
+
+# A node's mark counts lines from zero and an editor counts them from one.
+# Counting the way an editor does is the point: a reported line number nobody
+# can go and look at is not worth reporting.
+EDITOR_OFFSET = 1
 
 # A line that names whoever set it off. The only field a quote can interpolate:
 # the roster is the one thing knowable about a speaker, and a quote that could
@@ -175,8 +182,8 @@ ANYBODY = None
 # joke told once and then endured, and the tool says this every time anybody
 # gets one right.
 #
-# None of them says "film". The column is called `movie` because it was, but
-# what a row points at is a series, a game, or a book as often as not, and an
+# None of them says "film". The key is called `movie` because it was, but what
+# an entry points at is a series, a game, or a book as often as not, and an
 # announcement that gets that wrong is wrong out loud in front of everybody.
 REMARKS_KEY = "remarks"
 REMARK_FIELD = "remark"
@@ -221,7 +228,7 @@ WORD_SEPARATOR = r"\s+"
 
 @dataclass(frozen=True)
 class Quote:
-    """One row of the file: what sets a line off, and the line."""
+    """One entry in the file: what sets a line off, and the line."""
 
     movie: str
     trigger: str
@@ -253,7 +260,7 @@ class RecentQuotes:
     Keyed on the trigger rather than the quote, so two phrases that answer with
     the same line are two jokes and cool down separately. Nothing sweeps this;
     a trigger's timestamp is dropped when it is next read, and there are only as
-    many keys as the file has rows.
+    many keys as the file has triggers.
     """
 
     def __init__(self, window_seconds: float | None = None) -> None:
@@ -591,7 +598,7 @@ class Quotes(Tool):
         """
         Give the channel its window to name the title the line came from.
 
-        A row that names no title asks nothing: there is no question in it, and
+        An entry that names no title asks nothing: there is no question in it, and
         the round would be one nobody could answer. Two lines said within a few
         seconds of each other are two rounds rather than one replacing the
         other — an answer names its own title, so neither question is made
@@ -970,118 +977,252 @@ def _load(path: Path) -> Mapping[str, tuple[Quote, ...]]:
     """
     Every quote in the file, by the trigger that sets it off.
 
-    A trigger may appear on several rows, and each of them is kept: a phrase
-    worth answering more than one way says so by being written down more than
-    once, and which answer the channel gets is drawn when the trigger fires. The
-    reverse also holds — two rows may share an answer, which is how the file says
-    that two phrases deserve the same reply.
+    A trigger appears once in the whole file. It is a key under its title, so
+    writing it twice under one title is not something the file can say, and
+    writing it under two titles is refused here rather than allowed to mean
+    something the first form could not express. The first is kept, because a
+    file is read top to bottom and the line somebody has to delete should be the
+    later one.
 
-    Rows keep the order the file lists them in, so a run is reproducible for
+    A phrase worth answering several ways says so with a list, and one of them
+    is drawn when the trigger fires. Written out rather than inferred from a
+    repeated key: a list says what it means where a repeat would have relied on
+    the parser keeping something the format does not promise to keep. The
+    reverse also holds — two triggers may share an answer, which is how the file
+    says that two phrases deserve the same reply.
+
+    Answers keep the order the file lists them in, so a run is reproducible for
     anything that seeds the draw. The trigger is folded for matching, so a file
-    may write it however it reads best, and so `Cool` and `cool` are two answers
-    to one trigger rather than two triggers.
+    may write it however it reads best, and so `Cool` and `cool` are one trigger
+    rather than two.
 
-    A row that is unusable is reported and dropped rather than raised on: a
+    An entry that is unusable is reported and dropped rather than raised on: a
     typo in one of fifty lines should cost that line. A file that is missing,
-    unreadable, or holds no usable row at all is raised on, because a tool
-    listening for nothing is enabled and useless, which is worth a line at
-    startup instead of silence forever.
+    unreadable, unparseable, or holds no usable entry at all is raised on,
+    because a tool listening for nothing is enabled and useless, which is worth
+    a line at startup instead of silence forever.
     """
-    rows = _rows(path)
-    quotes: dict[str, list[Quote]] = {}
+    quotes: dict[str, tuple[Quote, ...]] = {}
+    titles: dict[str, str] = {}
 
-    for number, row in enumerate(rows, start=FIRST_ROW):
-        quote = _quote(path, number, row)
-        if quote is None:
+    for movie, key, value in _entries(path):
+        trigger = _trigger(path, movie, key)
+        if trigger is None:
             continue
 
-        quotes.setdefault(quote.trigger, []).append(quote)
+        if trigger in quotes:
+            logger.warning(
+                "%s line %d: %s already answers under %r; a trigger answers for one "
+                "title. Skipping it.",
+                path,
+                _at(key),
+                _where(movie, str(key.value)),
+                titles[trigger],
+            )
+            continue
+
+        answers = _answers(path, movie, trigger, value)
+        if not answers:
+            continue
+
+        quotes[trigger] = answers
+        titles[trigger] = movie
 
     if not quotes:
         raise ValueError(f"{path} holds no usable quotes, so there is nothing to listen for.")
 
-    answers = {trigger: tuple(found) for trigger, found in quotes.items()}
-
     logger.info(
         "Loaded %d quotes across %d triggers from %s.",
-        _counted(answers),
-        len(answers),
+        _counted(quotes),
+        len(quotes),
         path,
     )
 
-    return answers
+    return quotes
 
 
 def _counted(quotes: Mapping[str, tuple[Quote, ...]]) -> int:
-    """How many rows the file gave, where `len` gives how many triggers they set off."""
+    """How many lines the file gave, where `len` gives how many triggers they set off."""
     return sum(len(answers) for answers in quotes.values())
 
 
-def _rows(path: Path) -> list[Mapping[str, str]]:
-    """
-    The file's data rows, with its header read as the column names.
+def _where(*keys: str) -> str:
+    """Where in the file something is, in the file's own keys."""
+    return KEY_SEPARATOR.join(keys)
 
-    Anything short of the three columns is raised on rather than reported: it is
-    not a file with a bad row in it, it is not this file.
+
+def _at(node: yaml.Node) -> int:
+    """The line a node starts on, as an editor counts it."""
+    return node.start_mark.line + EDITOR_OFFSET
+
+
+def _text(node: yaml.Node) -> str | None:
+    """
+    What a node says, if what it says is text.
+
+    `compose` hands back the characters as written whatever the tag resolved to,
+    so an unquoted `no` would arrive here as a perfectly usable `"no"`. Reading
+    the tag rather than the value is what keeps this agreeing with
+    `scripts/validate_quotes.py`, which refuses the same thing before a merge.
+    """
+    if not isinstance(node, yaml.ScalarNode) or node.tag != STRING_TAG:
+        return None
+
+    return str(node.value)
+
+
+def _entries(path: Path) -> Iterator[tuple[str, yaml.Node, yaml.Node]]:
+    """
+    Every trigger in the file, with the title it sits under.
+
+    Composed rather than loaded, for three things a parsed mapping cannot say. A
+    key written twice survives composition and is dropped by `safe_load` without
+    a word, and the tool keeps the first rather than the last. Every key and
+    value carries the line it was written on, which is what lets a dropped entry
+    name somewhere an editor can go. And the tag survives, which is the only way
+    to tell an unquoted `no` from the word.
+
+    A file that will not parse, or that is not a mapping of titles, is raised on
+    rather than reported: it is not a file with a bad entry in it, it is not
+    this file.
     """
     try:
-        with path.open(encoding=FILE_ENCODING, newline="") as handle:
-            reader = csv.DictReader(handle)
-            missing = [column for column in COLUMNS if column not in (reader.fieldnames or ())]
-
-            if missing:
-                raise ValueError(
-                    f"{path} has no {COLUMN_SEPARATOR.join(missing)} column; "
-                    f"the header must name {COLUMN_SEPARATOR.join(COLUMNS)}."
-                )
-
-            return list(reader)
+        text = path.read_text(encoding=FILE_ENCODING)
     except OSError as exc:
         raise ValueError(f"Could not read the quotes at {path}: {exc}") from exc
 
+    try:
+        document = yaml.compose(text)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"The quotes at {path} are not valid YAML: {exc}") from exc
 
-def _quote(path: Path, number: int, row: Mapping[str, str]) -> Quote | None:
+    if not isinstance(document, yaml.MappingNode):
+        raise ValueError(
+            f"{path} must be a mapping of titles, each holding the triggers that "
+            f"set its lines off."
+        )
+
+    for title, entries in document.value:
+        movie = _text(title)
+
+        if movie is None:
+            logger.warning(
+                "%s line %d: %r is not a title in text; quote it, or YAML reads it "
+                "as something else. Skipping it.",
+                path,
+                _at(title),
+                title.value,
+            )
+            continue
+
+        if not isinstance(entries, yaml.MappingNode):
+            logger.warning(
+                "%s line %d: %r does not hold a mapping of triggers to lines; skipping it.",
+                path,
+                _at(title),
+                movie,
+            )
+            continue
+
+        for key, value in entries.value:
+            yield movie, key, value
+
+
+def _trigger(path: Path, movie: str, key: yaml.Node) -> str | None:
     """
-    One row as a quote, or None with a line in the log saying why not.
+    The phrase an entry listens for, folded for matching, or None with a reason.
 
-    A row with nothing to listen for or nothing to say is dropped, as is a line
-    carrying a placeholder nothing fills — which is checked here rather than at
-    the moment somebody says the trigger, by which point the tool has one job
-    and cannot do it.
-
-    So is a row with more fields than columns, which is what an unquoted comma
-    in a line looks like from here. That one is dropped rather than kept because
-    what survives it is the quote cut at the comma — "Boy" for "Boy, that
-    escalated quickly." — and a film line delivered with its second half missing
-    is worse out loud than not being said at all. `scripts/validate_quotes.py`
-    catches it before a merge; this catches it in a file mounted over the shipped
-    one, which never goes past CI.
+    A trigger YAML did not read as text is dropped along with it. An unquoted
+    `no` is a boolean and an unquoted `1917` is an integer, and both look
+    entirely correct in the file while being something the matcher can never
+    compare against. `scripts/validate_quotes.py` catches it before a merge;
+    this catches it in a file mounted over the shipped one, which never goes
+    past CI.
     """
-    trigger = (row.get(TRIGGER_COLUMN) or "").strip()
-    text = (row.get(QUOTE_COLUMN) or "").strip()
-    movie = (row.get(MOVIE_COLUMN) or "").strip()
+    trigger = _text(key)
 
-    overflow = row.get(OVERFLOW_COLUMN)
-    if overflow:
+    if trigger is None:
         logger.warning(
-            "%s line %d: %r has %d field(s) beyond %s, so %r would be cut at the "
-            "comma. Quote a value that contains one. Skipping it.",
+            "%s line %d: %s is not a %s written in text; quote it, or YAML reads it "
+            "as something else. Skipping it.",
             path,
-            number,
-            trigger or movie,
-            len(overflow),
-            COLUMN_SEPARATOR.join(COLUMNS),
-            text,
+            _at(key),
+            _where(movie, str(key.value)),
+            TRIGGER_LABEL,
         )
         return None
 
-    if not trigger or not text:
+    if not trigger.strip():
         logger.warning(
-            "%s line %d: a quote needs both a %s and a %s; skipping it.",
+            "%s line %d: a quote needs a %s to listen for; skipping it.",
+            path,
+            _at(key),
+            TRIGGER_LABEL,
+        )
+        return None
+
+    return trigger.strip().casefold()
+
+
+def _answers(path: Path, movie: str, trigger: str, value: yaml.Node) -> tuple[Quote, ...]:
+    """
+    Every line one trigger can answer with.
+
+    A trigger worth answering one way writes its line; one worth answering
+    several writes a list of them. Both arrive here as a sequence of nodes, so
+    that what the file chose is not something the rest of the tool has to know
+    about. Each answer is reported and dropped on its own, because one bad line
+    in a list of four should cost that line rather than the trigger.
+    """
+    nodes = tuple(value.value) if isinstance(value, yaml.SequenceNode) else (value,)
+
+    if not nodes:
+        logger.warning(
+            "%s line %d: %s lists no lines to answer with; skipping it.",
+            path,
+            _at(value),
+            _where(movie, trigger),
+        )
+        return ()
+
+    return tuple(
+        quote
+        for quote in (_quote(path, movie, trigger, node) for node in nodes)
+        if quote is not None
+    )
+
+
+def _quote(path: Path, movie: str, trigger: str, node: yaml.Node) -> Quote | None:
+    """
+    One answer as a quote, or None with a line in the log saying why not.
+
+    An answer with nothing to say is dropped, as is a line carrying a
+    placeholder nothing fills — which is checked here rather than at the moment
+    somebody says the trigger, by which point the tool has one job and cannot do
+    it. So is anything YAML did not read as text, for the reason `_trigger`
+    gives.
+    """
+    number = _at(node)
+    text = _text(node)
+
+    if text is None:
+        logger.warning(
+            "%s line %d: %s does not answer with text; quote it, or YAML reads it as "
+            "something else. Skipping it.",
             path,
             number,
-            TRIGGER_COLUMN,
-            QUOTE_COLUMN,
+            _where(movie, trigger),
+        )
+        return None
+
+    text = text.strip()
+
+    if not text:
+        logger.warning(
+            "%s line %d: a quote needs a %s to say; skipping it.",
+            path,
+            number,
+            QUOTE_LABEL,
         )
         return None
 
@@ -1099,4 +1240,4 @@ def _quote(path: Path, number: int, row: Mapping[str, str]) -> Quote | None:
         )
         return None
 
-    return Quote(movie=movie, trigger=trigger.casefold(), text=text)
+    return Quote(movie=movie.strip(), trigger=trigger, text=text)

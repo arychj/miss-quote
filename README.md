@@ -75,7 +75,7 @@ Runtime requirements are a reachable Wyoming ASR server, a writable volume at `S
 ```bash
 make test                          # the suite, inside the image CI uses
 make test PYTEST_ARGS="-k config"  # a narrower run
-make validate-quotes               # the quote file; stdlib only, no image build
+make validate-quotes               # the quote file; PyYAML only, no image build
 make help                          # everything else
 ```
 

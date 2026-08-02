@@ -840,7 +840,7 @@ class MoralityConfig:
 
 # The list the image ships with, found relative to this file so a checkout and a
 # container agree without either of them being told where they are.
-BUNDLED_QUOTES = Path(__file__).resolve().parent / "resources" / "quotes.csv"
+BUNDLED_QUOTES = Path(__file__).resolve().parent / "resources" / "quotes.yaml"
 
 
 @dataclass(frozen=True)
@@ -853,8 +853,8 @@ class QuotesConfig:
     too, and a list per server is a second file to keep current.
     """
 
-    # A CSV of `movie,trigger,quote`. Mount one over this path, or point the
-    # variable at it, to say something the shipped list does not.
+    # A mapping of titles to the triggers under them. Mount one over this path,
+    # or point the variable at it, to say something the shipped list does not.
     file: Path = field(
         default_factory=lambda: Path(_env_str("QUOTES_FILE", str(BUNDLED_QUOTES)))
     )

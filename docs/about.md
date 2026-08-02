@@ -354,7 +354,7 @@ miss-quote/
 │       ├── ledger/
 │       │   └── credits.py     # What everybody has left, per server
 │       ├── resources/
-│       │   ├── quotes.csv     # Triggers and the film lines they answer with
+│       │   ├── quotes.yaml    # Triggers and the film lines they answer with
 │       │   └── prompts.yaml   # What the model is told to do, as prose
 │       ├── tools/
 │       │   ├── base.py        # What a tool is: its moments, and what it is handed

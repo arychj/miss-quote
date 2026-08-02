@@ -119,41 +119,62 @@ quotes:
 
 #### The quote file
 
-Everything else is per deployment. The pairs come from a CSV at `QUOTES_FILE` — a film, the phrase that sets it off, and the line — so adding a quote is a row rather than a deployment. The image ships the list in `resources/quotes.csv`; mount your own over that path to say something it does not.
+Everything else is per deployment. The lines come from a YAML file at `QUOTES_FILE` — a film, and under it the phrases that set its lines off — so adding a quote is a key rather than a deployment. The image ships the list in `resources/quotes.yaml`; mount your own over that path to say something it does not.
 
-```
-movie,trigger,quote
-Firefly,cool,Shiny.
-Firefly,behave,I aim to misbehave.
-The Princess Bride,impossible,Inconceivable!
-Project Hail Mary,question,{user} question is dumb.
+```yaml
+Firefly:
+  cool: Shiny.
+  behave: I aim to misbehave.
+
+Project Hail Mary:
+  question: "{user} question is dumb."
+
+The Princess Bride:
+  impossible: Inconceivable!
 ```
 
-| Column | Purpose |
+| Where | Purpose |
 |---|---|
-| `movie` | Where the line is from. Never spoken; it is what the round asks about, and what makes the log and the file readable |
-| `trigger` | The phrase that sets the line off. Matched whole and case-insensitively, however the file writes it |
-| `quote` | What gets said. `{user}` is the only placeholder, and names whoever set it off |
+| The outer key | Where the line is from. Never spoken; it is what the round asks about, and what makes the log and the file readable |
+| The inner key | The phrase that sets the line off. Matched whole and case-insensitively, however the file writes it |
+| The value | What gets said. `{user}` is the only placeholder, and names whoever set it off |
 
-**One trigger per row, and a line may be reached by more than one of them.** Two rows sharing an answer is how the file says that two phrases deserve the same reply — `awesome` and `cool` both earn `Shiny.`. There is no alternation syntax inside a trigger: a trigger is matched as written, so a row meaning to catch two phrases has to be two rows.
+**A trigger appears once in the whole file.** Nesting under the title makes it a key, so writing it twice under one title is not something the format can express — and writing it under two titles is refused for the same reason, rather than being allowed to mean something a repeat under one title could not. The first is kept and the rest are reported, so the line you have to go and delete is the later one.
 
-**A trigger may also appear on more than one row, and one of its answers is drawn at random each time it fires.** The draw happens when the trigger fires rather than at startup, so a restart is not what decides which line a channel hears for the next week. Case is not what tells two triggers apart. The backoff is unchanged and still keyed on the trigger, so a trigger with four answers still fires once per window, not four times.
+**Two triggers may share an answer**, which is how the file says that two phrases deserve the same reply — `awesome` and `cool` both earn `Shiny.`. There is no alternation syntax inside a trigger: a trigger is matched as written, so a key meaning to catch two phrases has to be two keys.
 
-Rows are read at startup and the file **reports rather than raises**. A row with no trigger or no line, a line carrying a placeholder nothing fills, or a row with more fields than columns — an unquoted comma in a line — is logged with its line number and dropped. What *does* stop the tool from starting is a file that is missing, unreadable, has no `movie,trigger,quote` header, or holds no usable row at all.
+**A phrase worth answering several ways lists its lines, and one of them is drawn each time it fires:**
 
-The unquoted comma is dropped rather than kept because what survives it is the line **cut at the comma** — `Boy` for `Boy, that escalated quickly.` — and a film line delivered with its second half missing is worse out loud than not being said.
+```yaml
+Firefly:
+  cool:
+    - Shiny.
+    - Gorram it.
+```
 
-**A dropped row is a line in a log nobody reads**, which is why the file is also checked before it can be merged. `scripts/validate_quotes.py` applies the loader's rules where a broken row fails a pull request instead, plus the ones the loader has no opinion about:
+The draw happens when the trigger fires rather than at startup, so a restart is not what decides which line a channel hears for the next week. The backoff is unchanged and still keyed on the trigger, so a trigger with four answers still fires once per window, not four times.
+
+Two things are worth knowing about the format itself, because both look entirely correct in the file:
+
+- **A line starting with `{user}` has to be quoted.** Unquoted, a `{` opens a mapping and the file will not parse.
+- **A trigger like `no` or a title like `1917` has to be quoted too.** Unquoted, YAML reads them as a boolean and an integer, and neither is text the matcher can ever compare against.
+
+The file is read at startup and **reports rather than raises**. An entry with no trigger or no line, a line carrying a placeholder nothing fills, a trigger already answering elsewhere, and anything YAML did not read as text are each logged with their line number and dropped. What *does* stop the tool from starting is a file that is missing, unreadable, not valid YAML, not a mapping of titles, or holding no usable entry at all.
+
+**A dropped entry is a line in a log nobody reads**, which is why the file is also checked before it can be merged. `scripts/validate_quotes.py` applies the loader's rules where a broken entry fails a pull request instead, plus the ones the loader has no opinion about:
 
 | Checked | Why |
 |---|---|
-| Exactly three fields per row | An unquoted comma is the one mistake that loads cleanly and truncates the quote |
-| Every column populated, and unpadded | The loader strips surrounding whitespace, so the file and what it produces disagree quietly |
+| Every key and value is text | An unquoted `no` is a boolean and an unquoted `1917` is an integer; both look right and neither can ever match |
+| A trigger answers under one title only | It is a key, so a repeat is either impossible or a disagreement about which line a phrase earns |
+| Every part populated, and unpadded | The loader strips surrounding whitespace, so the file and what it produces disagree quietly |
 | `trigger` ≤ 30 characters, `quote` ≤ 150 | A trigger has to be said in passing and a line has to land before the channel moves on |
 | A trigger that could actually fire | No placeholders, no repeated whitespace, at least one letter or digit |
-| `{user}` is the only placeholder | Anything else drops the row at startup, so the symptom is a line that is never said |
-| No trigger answering twice with the same line | A repeated trigger is deliberate; a repeated *answer* is a row pasted and half-edited |
-| `movie` non-decreasing, LF endings, trailing newline | So the file stays reviewable and two branches adding a row do not collide |
+| `{user}` is the only placeholder | Anything else drops the entry at startup, so the symptom is a line that is never said |
+| No trigger listing the same line twice | A second way of answering is the point; the same way twice is a line pasted and half-edited |
+| Titles non-decreasing, LF endings, trailing newline | So the file stays reviewable and two branches adding a line do not collide |
+
+It needs PyYAML and nothing else, which is what keeps it a few seconds on every pull request rather than an image build.
 
 #### Matching and backoff
 
@@ -205,7 +226,7 @@ Correct! Erik, you are awarded 1 credit for quoting along at home.
 - `being the sort of person who knows that.`
 - `spending your formative years exactly as you did.`
 
-`remarks` **adds** to those rather than replacing them. None of the shipped endings says "film" — the CSV column is called `movie` because it started that way, but a trigger answers for a series, a game, or a book as often as a picture, and an announcement that guesses wrong guesses wrong out loud. Write your own the same way.
+`remarks` **adds** to those rather than replacing them. None of the shipped endings says "film" — the key is called `movie` because it started that way, but a trigger answers for a series, a game, or a book as often as a picture, and an announcement that guesses wrong guesses wrong out loud. Write your own the same way.
 
 Somebody paid on a **tie** gets the second wording — `Eli, you are also awarded 1 credit, for getting there at the same time.` — because the whole sentence again reads as though the bot had lost track of what it just said.
 
@@ -496,7 +517,7 @@ Only used by `verbal-morality`. What a fine is *worth* is the scoreboard's; thes
 
 ### settings.quotes {#settings-quotes}
 
-Only used by `quotes`. The triggers and the lines themselves are a CSV at `QUOTES_FILE`.
+Only used by `quotes`. The triggers and the lines themselves are a YAML file at `QUOTES_FILE`.
 
 | Setting | Default | Purpose |
 |---|---|---|
@@ -619,7 +640,7 @@ Volumes multiply as knobs, so a tool asking for half of a deployment set to half
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `QUOTES_FILE` | `/app/src/miss_quote/resources/quotes.csv` | The triggers and the lines they answer with, as a CSV of `movie,trigger,quote`. One list per deployment; the image ships the one in `resources/`, and mounting a file over that path replaces it |
+| `QUOTES_FILE` | `/app/src/miss_quote/resources/quotes.yaml` | The triggers and the lines they answer with, as a YAML mapping of title to trigger to line. One list per deployment; the image ships the one in `resources/`, and mounting a file over that path replaces it |
 
 ### Credits {#env-credits}
 
