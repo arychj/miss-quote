@@ -5,7 +5,7 @@
 # miss-quote
 
 <p align="center">
-  <strong>A Discord bot that sits in a voice channel, writes down what everybody said, and then makes something of it.</strong>
+  <strong>Writes down what happened in the voice channel, and then tells you about it.</strong>
 </p>
 
 <p align="center">
@@ -17,11 +17,9 @@
 ![Wyoming](https://img.shields.io/badge/Wyoming-ASR-success?style=for-the-badge)
 ![Silero VAD](https://img.shields.io/badge/Silero%20VAD-ONNX-orange?style=for-the-badge)
 
-**Every visit to a voice channel is transcribed to its own file, one line per utterance, labelled with who said it.** The evening ends up on the record instead of in everybody's half-memory of it.
+**miss-quote** is a Discord bot that sits in on your D&D session and listens to the adventures, so the evening ends up with a record instead of in everyone's half-memory of it. When the bot leaves it summarizes what happened, and next time you can ask: "what happened last session" and a bard recounts the night. It gets up to other shenanigans too.
 
-**Then it will tell you what happened.** Ask the bot the next day and it reads the last session back out loud, by default as a bard recounting the room its own evening. That is the part it was built for: nobody wants to take notes during a D&D session, and nobody remembers the innkeeper's name a week later.
-
-**The rest is shenanigans.** Walk into a film line and it says the line out loud, then asks the room where it came from and pays whoever gets it first. Swear and it fines you, out loud, *Demolition Man* style. It keeps a running tally of who owes what and publishes the standings under the voice channel's name.
+Walk into a film line and it says the line out loud, then asks the room where it came from and pays whoever gets it first. Swear and it fines you, out loud, *Demolition Man* style. It keeps a running tally of who owes what and publishes the standings under the voice channel's name.
 
 Transcription is delegated to a [Wyoming](https://github.com/rhasspy/wyoming) ASR server rather than run in-process, so **this container** is a CPU-only workload with no model weights and no cache volume for them. That moves the GPU rather than removing it: the bot does nothing at all without a reachable ASR server, and in practice that server wants one. What it buys is a bot that schedules anywhere and a GPU that several things can share.
 

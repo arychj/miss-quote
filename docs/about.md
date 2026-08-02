@@ -6,7 +6,9 @@ lede: A Discord bot that writes down what was said in a voice channel, hands the
 description: How miss-quote is put together — the split between local audio handling and remote transcription, the transcript format on disk, the speech path, and the tool contract.
 ---
 
-miss-quote transcribes Discord voice channels to a per-session, per-speaker JSONL transcript and hands that result to tools. Transcription is delegated to a [Wyoming](https://github.com/rhasspy/wyoming) ASR server rather than run in-process, so **this container** is a CPU-only workload with no model weights and no cache volume for them.
+miss-quote is a Discord bot that sits in on your D&D session and listens to the adventures, so the evening ends up with a record instead of in everyone's half-memory of it. When the bot leaves it summarizes what happened, and next time you can ask: "what happened last session" and a bard recounts the night. It gets up to other shenanigans too.
+
+Underneath that, it transcribes Discord voice channels to a per-session, per-speaker JSONL transcript and hands that result to tools. Transcription is delegated to a [Wyoming](https://github.com/rhasspy/wyoming) ASR server rather than run in-process, so **this container** is a CPU-only workload with no model weights and no cache volume for them.
 
 **That moves the GPU rather than removing it.** The bot does nothing at all without a reachable ASR server, and a Wyoming ASR worth pointing it at wants a GPU; the same goes for the synthesizer behind anything said out loud, and for the endpoint behind a summary. Nothing here is a local-first, run-it-on-a-laptop design — the useful claim is narrower and still worth making: **the process that has to sit in a voice channel all evening is cheap and schedules anywhere, and the expensive hardware sits behind a socket where several things can share it.**
 
