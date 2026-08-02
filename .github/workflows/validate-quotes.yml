@@ -9,25 +9,33 @@ on:
     branches: [main]
     paths:
       - 'src/miss_quote/resources/quotes.yaml'
+      - 'config.yaml'
       - 'scripts/validate_quotes.py'
       - '.github/workflows/validate-quotes.yml'
   pull_request:
     branches: [main]
     paths:
       - 'src/miss_quote/resources/quotes.yaml'
+      - 'config.yaml'
       - 'scripts/validate_quotes.py'
       - '.github/workflows/validate-quotes.yml'
-  # A file mounted over the shipped one is the supported way to change the list,
-  # and it never touches this repository. This is how its author checks it.
+  # Neither list a deployment actually runs on is in this repository: the quote
+  # file is mounted over the shipped one and the config comes from a ConfigMap.
+  # This is how their author checks them.
   workflow_dispatch:
     inputs:
       path:
         description: 'Quote file to check, relative to the repository root'
         required: false
         default: 'src/miss_quote/resources/quotes.yaml'
+      config:
+        description: "Config file whose servers' additional_quotes to check, relative to the repository root"
+        required: false
+        default: 'config.yaml'
 
 env:
   QUOTES_FILE: ${{ inputs.path || 'src/miss_quote/resources/quotes.yaml' }}
+  CONFIG_FILE: ${{ inputs.config || 'config.yaml' }}
 
 jobs:
   validate:
@@ -48,6 +56,6 @@ jobs:
       - name: Install the parser
         run: python -m pip install --disable-pip-version-check pyyaml
 
-      # QUOTES_FILE reaches the Makefile through the environment.
-      - name: Check the quote file
+      # QUOTES_FILE and CONFIG_FILE reach the Makefile through the environment.
+      - name: Check the quote lists
         run: make validate-quotes PYTHON=python

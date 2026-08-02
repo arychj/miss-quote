@@ -4,14 +4,22 @@ import pytest
 import yaml
 
 import validate_quotes
+from miss_quote import config
 from miss_quote.config import BUNDLED_QUOTES
 from miss_quote.tools import quotes as tool
 from validate_quotes import (
+    ADDITIONAL_QUOTES_KEY,
+    DEFAULT_CONFIG_PATH,
     FAILED,
     MAXIMUM_MOVIE_LENGTH,
     MAXIMUM_QUOTE_LENGTH,
     MAXIMUM_TRIGGER_LENGTH,
     OK,
+    QUOTES_TOOL,
+    SERVERS_KEY,
+    TOOL_CONFIG_KEY,
+    TOOLS_KEY,
+    config_problems,
     main,
     problems,
 )
@@ -68,6 +76,69 @@ def _details(path) -> list[str]:
     return [problem.detail for problem in problems(path)]
 
 
+# ── a config file, and the quotes a server wrote into it ──
+
+# The config the repository ships as its documented placeholder, which CI checks
+# alongside the quote file.
+REPOSITORY_CONFIG = BUNDLED_QUOTES.parents[3] / DEFAULT_CONFIG_PATH
+
+SERVER_ID = 123456789012345678
+OTHER_SERVER_ID = 234567890123456789
+ALIAS = "first-server"
+OTHER_ALIAS = "second-server"
+
+# A title and a trigger the shipped list already holds, for the one case a
+# server's block is allowed to say what the deployment's file says.
+SHIPPED_MOVIE = "Firefly"
+SHIPPED_TRIGGER = "cool"
+
+
+def _server(additions, alias: str = ALIAS):
+    """One server's block, with quotes of its own under its `quotes` tool."""
+    return {
+        "alias": alias,
+        TOOLS_KEY: {
+            QUOTES_TOOL: {"enabled": True, TOOL_CONFIG_KEY: {ADDITIONAL_QUOTES_KEY: additions}}
+        },
+    }
+
+
+def _config(tmp_path, additions):
+    """A config file whose one server added the quotes it was given."""
+    return _written(tmp_path, {SERVERS_KEY: {SERVER_ID: _server(additions)}})
+
+
+def _written(tmp_path, config):
+    """A config file holding whatever a mapping can express."""
+    return _raw_config(
+        tmp_path, yaml.safe_dump(config, allow_unicode=True, sort_keys=False, width=NO_FOLDING)
+    )
+
+
+def _raw_config(tmp_path, text: str):
+    """The same, for a block a mapping cannot express — a key left empty, a scalar."""
+    path = tmp_path / "config.yaml"
+    path.write_text(text, encoding="utf-8")
+
+    return path
+
+
+# Everything above a server's additions, so a test about the block itself can
+# write the block and nothing else.
+PREAMBLE = (
+    f"{SERVERS_KEY}:\n"
+    f"  {SERVER_ID}:\n"
+    f"    alias: {ALIAS}\n"
+    f"    {TOOLS_KEY}:\n"
+    f"      {QUOTES_TOOL}:\n"
+    f"        {TOOL_CONFIG_KEY}:\n"
+)
+
+
+def _config_details(path) -> list[str]:
+    return [problem.detail for problem in config_problems(path)]
+
+
 # ── the file the image ships ──────────────────────
 
 
@@ -86,6 +157,21 @@ def test_the_validator_and_the_loader_agree_about_the_file():
     assert validate_quotes.STRING_TAG == tool.STRING_TAG
     assert validate_quotes.EDITOR_OFFSET == tool.EDITOR_OFFSET
     assert validate_quotes.FILE_ENCODING == tool.FILE_ENCODING
+
+
+def test_the_validator_and_the_config_agree_about_the_way_down_to_a_server():
+    """
+    The same, for the keys the additions are written under.
+
+    A validator looking under a key nothing reads finds nothing to complain
+    about, which is the worst way for this to break: the job goes green having
+    checked an empty set.
+    """
+    assert validate_quotes.SERVERS_KEY == config.SERVERS_KEY
+    assert validate_quotes.TOOLS_KEY == config.TOOLS_KEY
+    assert validate_quotes.TOOL_CONFIG_KEY == config.TOOL_CONFIG_KEY
+    assert validate_quotes.QUOTES_TOOL == tool.Quotes.name
+    assert validate_quotes.ADDITIONAL_QUOTES_KEY == tool.ADDITIONAL_QUOTES_KEY
 
 
 # ── the shape of the file ─────────────────────────
@@ -423,3 +509,140 @@ def test_every_named_file_is_checked(tmp_path):
 
 def test_the_shipped_file_is_what_it_checks_by_default():
     assert main([]) == OK
+
+
+# ── what a server adds for itself ─────────────────
+
+
+def test_the_repository_config_is_valid():
+    """The placeholder the documentation is written against, checked like any other."""
+    assert config_problems(REPOSITORY_CONFIG) == []
+
+
+def test_a_good_addition_has_nothing_wrong_with_it(tmp_path):
+    assert config_problems(_config(tmp_path, _one())) == []
+
+
+@pytest.mark.parametrize(
+    "config",
+    (
+        pytest.param({}, id="nothing at all"),
+        pytest.param({SERVERS_KEY: {}}, id="no servers"),
+        pytest.param({SERVERS_KEY: {SERVER_ID: {"alias": ALIAS}}}, id="no tools"),
+        pytest.param(
+            {SERVERS_KEY: {SERVER_ID: {"alias": ALIAS, TOOLS_KEY: {"tts": {"enabled": True}}}}},
+            id="no quotes tool",
+        ),
+        pytest.param(
+            {
+                SERVERS_KEY: {
+                    SERVER_ID: {"alias": ALIAS, TOOLS_KEY: {QUOTES_TOOL: {"enabled": True}}}
+                }
+            },
+            id="no config",
+        ),
+    ),
+)
+def test_a_config_that_adds_nothing_is_clean(tmp_path, config):
+    """An optional block, and saying nothing about it is the ordinary case."""
+    assert config_problems(_written(tmp_path, config)) == []
+
+
+def test_a_block_written_and_left_empty_is_clean(tmp_path):
+    """Which adds nothing, exactly as the loader reads it: there is no entry to be wrong."""
+    path = _raw_config(tmp_path, f"{PREAMBLE}          {ADDITIONAL_QUOTES_KEY}:\n")
+
+    assert config_problems(path) == []
+
+
+@pytest.mark.parametrize("written", ("nonsense", f"[{MOVIE}]"))
+def test_additions_that_are_not_a_mapping_of_titles_are_reported(tmp_path, written):
+    path = _raw_config(
+        tmp_path, f"{PREAMBLE}          {ADDITIONAL_QUOTES_KEY}: {written}\n"
+    )
+
+    assert "must be a mapping of titles" in _config_details(path)[0]
+
+
+@pytest.mark.parametrize(
+    ("addition", "detail"),
+    (
+        pytest.param(_one(quote=""), "has an empty quote", id="no line"),
+        pytest.param(_one(trigger=""), "has an empty trigger", id="no trigger"),
+        pytest.param(
+            _one(quote="Hello {tally}."), "which nothing fills", id="unfillable placeholder"
+        ),
+        pytest.param(
+            _one(trigger=TRIGGER * MAXIMUM_TRIGGER_LENGTH), "the limit is", id="long trigger"
+        ),
+        pytest.param(
+            {MOVIE: {TRIGGER: [QUOTE, QUOTE]}},
+            "more than once",
+            id="one trigger answering the same way twice",
+        ),
+        pytest.param(
+            {LATER_MOVIE: {LATER_TRIGGER: LATER_QUOTE}, MOVIE: {TRIGGER: QUOTE}},
+            "keep the file grouped by title",
+            id="titles out of order",
+        ),
+    ),
+)
+def test_an_addition_is_held_to_the_files_rules(tmp_path, addition, detail):
+    assert any(detail in reported for reported in _config_details(_config(tmp_path, addition)))
+
+
+def test_an_addition_repeating_a_trigger_is_reported(tmp_path):
+    path = _config(tmp_path, {MOVIE: {TRIGGER: QUOTE}, LATER_MOVIE: {TRIGGER: LATER_QUOTE}})
+
+    assert any("already answers under" in detail for detail in _config_details(path))
+
+
+def test_an_addition_answering_for_the_shipped_list_is_not_reported(tmp_path):
+    """
+    Which is the override the field exists for.
+
+    What a server wrote is checked against itself and never against the
+    deployment's file, so a trigger both of them hold is a decision rather than a
+    collision.
+    """
+    path = _config(tmp_path, {SHIPPED_MOVIE: {SHIPPED_TRIGGER: QUOTE}})
+
+    assert config_problems(path) == []
+
+
+def test_two_servers_may_add_the_same_trigger(tmp_path):
+    """Each block is checked on its own; the two servers never hear each other."""
+    path = _written(
+        tmp_path,
+        {
+            SERVERS_KEY: {
+                SERVER_ID: _server(_one()),
+                OTHER_SERVER_ID: _server(
+                    _one(movie=LATER_MOVIE, quote=LATER_QUOTE), alias=OTHER_ALIAS
+                ),
+            }
+        },
+    )
+
+    assert config_problems(path) == []
+
+
+def test_a_problem_in_an_addition_names_the_line(tmp_path):
+    """A line number nobody can go and look at is not worth reporting, here either."""
+    path = _config(tmp_path, _one(quote=""))
+    written = [line.strip() for line in path.read_text(encoding="utf-8").splitlines()]
+
+    assert config_problems(path)[0].line == written.index(f"{TRIGGER}: ''") + 1
+
+
+def test_a_bad_addition_exits_non_zero(tmp_path):
+    assert main(["--config", str(_config(tmp_path, _one(quote="")))]) == FAILED
+
+
+def test_a_good_addition_exits_zero(tmp_path):
+    assert main(["--config", str(_config(tmp_path, _one()))]) == OK
+
+
+def test_no_config_is_checked_unless_one_is_named(tmp_path):
+    """Opted into: a deployment's config lives wherever it is mounted."""
+    assert main([str(_file(tmp_path, _one()))]) == OK

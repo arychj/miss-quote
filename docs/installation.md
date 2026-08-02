@@ -226,12 +226,15 @@ Working on the code with an editor that wants the imports resolved still wants a
 
 Changing the quote list needs none of it. `make validate-quotes` is standard library only, runs against the host Python rather than the image, and is what CI runs on a quote-file change — the point being an answer in seconds instead of after an image build.
 
+There are two lists to change and both reach a channel: the deployment's file, and whatever a server added for itself under [`additional_quotes`]({{ '/configuration/#what-a-server-adds-for-itself' | relative_url }}) in `config.yaml`. The validator checks either.
+
 ```bash
-make validate-quotes                                   # the shipped file
-python scripts/validate_quotes.py /path/to/yours.yaml  # one you mount over it
+make validate-quotes                                          # the shipped file and this repository's config
+python scripts/validate_quotes.py /path/to/yours.yaml         # a file you mount over the shipped one
+python scripts/validate_quotes.py --config /path/to/config.yaml  # a config whose servers added quotes
 ```
 
-The `Validate Quotes` workflow runs it on every push and pull request that touches the file, and takes a path as a `workflow_dispatch` input for checking a list that lives outside this repository. What it checks, and why each rule exists, is under [quotes]({{ '/configuration/#the-quote-file' | relative_url }}).
+The `Validate Quotes` workflow runs it on every push and pull request that touches either file, and takes both paths as `workflow_dispatch` inputs for checking lists that live outside this repository. What it checks, and why each rule exists, is under [quotes]({{ '/configuration/#the-quote-file' | relative_url }}).
 
 ## Deployment
 

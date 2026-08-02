@@ -848,9 +848,11 @@ class QuotesConfig:
     """
     Where the `quotes` tool reads its triggers and lines from.
 
-    Per deployment rather than per server, unlike the words a server objects to:
-    a film everybody in one channel has seen is one everybody in the next has
-    too, and a list per server is a second file to keep current.
+    The file is per deployment rather than per server, unlike the words a server
+    objects to: a film everybody in one channel has seen is one everybody in the
+    next has too, and a list per server is a second file to keep current. A
+    server with a line the others would not get writes it under its own
+    `additional_quotes`, which is merged over this for that server alone.
     """
 
     # A mapping of titles to the triggers under them. Mount one over this path,
