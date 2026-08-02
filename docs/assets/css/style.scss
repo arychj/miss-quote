@@ -886,13 +886,16 @@ figure.highlight {
   white-space: nowrap;
   cursor: pointer;
   user-select: none;
-  transition: color 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+  transition: color 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
 }
 .source-link svg { flex: none; transition: transform 0.3s ease; }
+
+/* No lift on hover: moving the box out from under the pointer drops :hover,
+   which snaps it back, and the cursor flickers between pointer and arrow for
+   as long as you sit on it. The icon may turn, since that leaves the box alone. */
 .source-link:hover {
   color: var(--text-strong);
   border-color: var(--accent-2);
-  transform: translateY(-1px);
   box-shadow: 0 6px 20px var(--glow-b);
 }
 .source-link:hover svg { transform: rotate(-12deg) scale(1.08); }
