@@ -293,7 +293,7 @@ code, pre, kbd, samp { font-family: var(--font-mono); }
 .hero-tagline {
   font-size: clamp(1.06rem, 2.4vw, 1.3rem);
   color: var(--muted);
-  max-width: 60ch;
+  max-width: 80ch;
   margin: 14px auto 0;
   line-height: 1.6;
   text-wrap: balance;
