@@ -366,10 +366,11 @@ servers:
           #
           # Read at startup on the same terms as the file, except that nothing
           # here stops the tool. A bad entry is reported and dropped and the
-          # server keeps the rest; a block that is not a mapping of titles is
-          # reported and ignored and the server keeps the whole shipped list.
-          # `scripts/validate_quotes.py --config` checks these before a merge,
-          # which is where a dropped entry is worth finding.
+          # server keeps the rest; a block that is neither a mapping of titles
+          # nor somewhere to read one from is reported and ignored and the server
+          # keeps the whole shipped list. `scripts/validate_quotes.py --config`
+          # checks these before a merge, which is where a dropped entry is worth
+          # finding.
           #
           # additional_quotes:
           #   Firefly:
@@ -377,6 +378,24 @@ servers:
           #     behave: I aim to misbehave.
           #   "1917":
           #     over the top: "Over the top, {user}!"
+
+          # A list long enough to be worth its own file says where that file is
+          # instead of holding the quotes. Anything beginning http:// or
+          # https:// is downloaded, once, at startup, with ten seconds to
+          # arrive; anything else is a path on disk, where a leading ~ is the
+          # home directory. What it holds is what the block would have held, and
+          # it is merged the same way.
+          #
+          # A file that is missing, unreadable, or not a mapping of titles is
+          # reported and the server keeps the whole shipped list, exactly as an
+          # unusable block is. The name is not followed by the validator — a
+          # path here is a path inside the deployment, and a URL is a network
+          # call it does not make — so pass the file to it directly:
+          #
+          #     python scripts/validate_quotes.py quotes/first-server.yaml
+          #
+          # additional_quotes: /config/quotes/first-server.yaml
+          # additional_quotes: https://quotes.example.com/first-server.yaml
 
       # Keeps this server's running tally and publishes it to the voice channel
       # topic as `Eli: -9 Erik: -2`, which needs Set Voice Channel Status on the

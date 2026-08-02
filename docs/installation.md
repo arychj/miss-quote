@@ -234,6 +234,8 @@ python scripts/validate_quotes.py /path/to/yours.yaml         # a file you mount
 python scripts/validate_quotes.py --config /path/to/config.yaml  # a config whose servers added quotes
 ```
 
+Where a server [keeps its additions in a file of its own]({{ '/configuration/#keeping-that-list-somewhere-else' | relative_url }}), `--config` leaves the name alone: a path written in a config file is a path inside the deployment, and the validator makes no network calls. Name that file as a path of its own and it is checked like any other quote file.
+
 The `Validate Quotes` workflow runs it on every push and pull request that touches either file, and takes both paths as `workflow_dispatch` inputs for checking lists that live outside this repository. What it checks, and why each rule exists, is under [quotes]({{ '/configuration/#the-quote-file' | relative_url }}).
 
 ## Deployment

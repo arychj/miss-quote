@@ -15,6 +15,12 @@ trigger and carries the title on each quote — so a title written in both place
 is one title with everything either of them said under it. See `_added` and
 `_merged`.
 
+A server whose own list is long enough to be worth its own file writes, in place
+of the quotes, one string saying where to go and get them — a path on disk, or a
+URL, downloaded once on the way up. What comes back is the same list in the same
+shape, held to the same rules and merged the same way; all that has changed is
+that the config file names it rather than holding it. See `_elsewhere`.
+
 A trigger appears once within one of those. Nesting under the title makes it a
 key, so a repeat under one title is not something the format can express at all;
 a repeat across two titles is refused for the same reason rather than being
@@ -71,10 +77,12 @@ from __future__ import annotations
 import random
 import re
 import time
+import urllib.request
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypeVar
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -113,9 +121,12 @@ EDITOR_OFFSET = 1
 
 # How a dropped entry says where it was written. A file has a line to point at;
 # a server's own additions have the server and the key they sit under, the
-# config file having been parsed by something that kept no line numbers.
+# config file having been parsed by something that kept no line numbers. A file
+# a server pointed at has both, since one deployment may point several servers
+# at several files.
 FILE_LOCATION = "{path} line {line}"
 SERVER_LOCATION = "[{server}] {key}"
+SOURCED_LOCATION = "[{server}] {path}"
 
 # A line that names whoever set it off. The only field a quote can interpolate:
 # the roster is the one thing knowable about a speaker, and a quote that could
@@ -140,7 +151,22 @@ DEFAULT_TIE_SECONDS = 1.0
 # tool config is and in the shape the file uses. Merged over the deployment's
 # list rather than beside it: a trigger written here is what that server hears,
 # whatever the shipped file says the phrase answers with.
+#
+# Written as the quotes themselves, or as one string saying where to read them
+# from instead; see `_elsewhere`.
 ADDITIONAL_QUOTES_KEY = "additional_quotes"
+
+# What tells the two apart, where a server wrote a string. A URL is downloaded
+# and everything else is a path on disk, which is the whole rule: a deployment
+# is as likely to serve its quotes alongside the rest of its configuration as to
+# mount them into the container, and neither is worth a second key to say which.
+URL_SCHEMES = ("http", "https")
+
+# How long a downloaded list has to arrive before the server goes on without it.
+# Nothing is waiting on this — the tools are built before the bot connects — but
+# a deployment whose quote server has gone quiet should start late rather than
+# not at all.
+DOWNLOAD_TIMEOUT_SECONDS = 10.0
 
 # A window of this or less is off rather than instantaneous: no answer window is
 # a deployment that wants the lines and not the game, and no tie window is one
@@ -1061,7 +1087,7 @@ def _load(path: Path) -> Mapping[str, tuple[Quote, ...]]:
     because a tool listening for nothing is enabled and useless, which is worth
     a line at startup instead of silence forever.
     """
-    quotes = _quotes(_read(path))
+    quotes = _quotes(_read(str(path), _from_disk(path)))
 
     if not quotes:
         raise ValueError(f"{path} holds no usable quotes, so there is nothing to listen for.")
@@ -1082,19 +1108,24 @@ def _added(server: str, raw: Any) -> Mapping[str, tuple[Quote, ...]]:
 
     The same shape as the file and the same rules, read from the server's own
     tool config rather than from `QUOTES_FILE` — a title, and under it the
-    phrases that set its lines off.
+    phrases that set its lines off. A server that would rather keep its list
+    somewhere else writes one string instead of the quotes, and it is read from
+    there; see `_elsewhere`.
 
     Nothing here raises, which is the one place it parts company with `_load`. A
     deployment whose quote file is unusable has a tool listening for nothing and
     should be told so on the way up; a server whose additions are unusable still
     has the whole shipped list, and taking its `quotes` tool down over a block it
     did not have to write is a worse answer than dropping the block and saying
-    so.
+    so. A file it pointed at and cannot read is the same thing said one step
+    further away.
     """
     if raw is None:
         return {}
 
-    quotes = _quotes(_offered(server, raw))
+    quotes = _quotes(
+        _elsewhere(server, raw) if isinstance(raw, str) else _offered(server, raw)
+    )
 
     if quotes:
         logger.info(
@@ -1102,7 +1133,7 @@ def _added(server: str, raw: Any) -> Mapping[str, tuple[Quote, ...]]:
             server,
             _counted(quotes),
             len(quotes),
-            ADDITIONAL_QUOTES_KEY,
+            raw if isinstance(raw, str) else ADDITIONAL_QUOTES_KEY,
             TRIGGER_SEPARATOR.join(quotes),
         )
 
@@ -1189,14 +1220,16 @@ def _where(*keys: str) -> str:
     return KEY_SEPARATOR.join(keys)
 
 
-def _at(path: Path, node: yaml.Node) -> str:
+def _at(source: str, node: yaml.Node) -> str:
     """
-    Where in the file a node was written, as an editor counts lines.
+    Where in a source a node was written, as an editor counts lines.
 
     A node's mark counts from zero, and a reported line number nobody can go and
-    look at is not worth reporting.
+    look at is not worth reporting. The source is whatever names the text the
+    node was composed from — the deployment's file, or the server and the file
+    it pointed at.
     """
-    return FILE_LOCATION.format(path=path, line=node.start_mark.line + EDITOR_OFFSET)
+    return FILE_LOCATION.format(path=source, line=node.start_mark.line + EDITOR_OFFSET)
 
 
 def _text(node: yaml.Node) -> str | None:
@@ -1214,9 +1247,64 @@ def _text(node: yaml.Node) -> str | None:
     return str(node.value)
 
 
-def _read(path: Path) -> Iterator[Entry]:
+def _contents(reference: str) -> str:
     """
-    Every trigger in the file, with the title it sits under.
+    The YAML one reference holds, downloaded or read off disk.
+
+    Which of the two it is, is the scheme and nothing else; see `URL_SCHEMES`.
+    Raised on either way, so that a deployment's own file and a server's stand
+    or fall by the same read and only their callers differ about what to do
+    about it.
+    """
+    if _remote(reference):
+        return _fetched(reference)
+
+    return _from_disk(Path(reference).expanduser())
+
+
+def _from_disk(path: Path) -> str:
+    """
+    A quote list read off the filesystem, as text.
+
+    Where the deployment's own file is read, so `QUOTES_FILE` stays a path and
+    nothing else: a `Path` collapses the double slash out of a URL, and a
+    variable that quietly half-downloaded one would be worse than a variable
+    that cannot.
+    """
+    try:
+        return path.read_text(encoding=FILE_ENCODING)
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ValueError(f"Could not read the quotes at {path}: {exc}") from exc
+
+
+def _remote(reference: str) -> bool:
+    """Whether a reference is somewhere to download from rather than a path."""
+    return urlsplit(reference).scheme in URL_SCHEMES
+
+
+def _fetched(url: str) -> str:
+    """
+    A quote list served over HTTP, as text.
+
+    Downloaded here rather than by anything async, and blocking on purpose. The
+    tools are built before the bot connects and before there is a loop to hold
+    up, and a list fetched once at startup does not need a constructor shaped
+    around an event loop that is not running yet.
+
+    It is fetched once. What a server hears is what was served at the moment it
+    started, and a list that has since changed reaches the channel at the next
+    restart — which is the same promise the mounted file makes.
+    """
+    try:
+        with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
+            return response.read().decode(FILE_ENCODING)
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ValueError(f"Could not download the quotes at {url}: {exc}") from exc
+
+
+def _read(source: str, text: str) -> Iterator[Entry]:
+    """
+    Every trigger the text holds, with the title it sits under.
 
     Composed rather than loaded, for three things a parsed mapping cannot say. A
     key written twice survives composition and is dropped by `safe_load` without
@@ -1225,24 +1313,20 @@ def _read(path: Path) -> Iterator[Entry]:
     name somewhere an editor can go. And the tag survives, which is the only way
     to tell an unquoted `no` from the word.
 
-    A file that will not parse, or that is not a mapping of titles, is raised on
+    Text that will not parse, or that is not a mapping of titles, is raised on
     rather than reported: it is not a file with a bad entry in it, it is not
-    this file.
+    this file. Whether that stops the tool is the caller's to decide; `_load`
+    lets it through and `_elsewhere` does not.
     """
-    try:
-        text = path.read_text(encoding=FILE_ENCODING)
-    except OSError as exc:
-        raise ValueError(f"Could not read the quotes at {path}: {exc}") from exc
-
     try:
         document = yaml.compose(text)
     except yaml.YAMLError as exc:
-        raise ValueError(f"The quotes at {path} are not valid YAML: {exc}") from exc
+        raise ValueError(f"{source} is not valid YAML: {exc}") from exc
 
     if not isinstance(document, yaml.MappingNode):
         raise ValueError(
-            f"{path} must be a mapping of titles, each holding the triggers that "
-            f"set its lines off."
+            f"{source} must be a mapping of titles, each holding the triggers that "
+            f"set its lines off"
         )
 
     for title, entries in document.value:
@@ -1252,7 +1336,7 @@ def _read(path: Path) -> Iterator[Entry]:
             logger.warning(
                 "%s: %r is not a title in text; quote it, or YAML reads it as "
                 "something else. Skipping it.",
-                _at(path, title),
+                _at(source, title),
                 title.value,
             )
             continue
@@ -1260,7 +1344,7 @@ def _read(path: Path) -> Iterator[Entry]:
         if not isinstance(entries, yaml.MappingNode):
             logger.warning(
                 "%s: %r does not hold a mapping of triggers to lines; skipping it.",
-                _at(path, title),
+                _at(source, title),
                 movie,
             )
             continue
@@ -1270,13 +1354,54 @@ def _read(path: Path) -> Iterator[Entry]:
 
             yield Entry(
                 movie=movie,
-                trigger=Written(where=_at(path, key), raw=key.value, text=_text(key)),
+                trigger=Written(where=_at(source, key), raw=key.value, text=_text(key)),
                 answers=tuple(
-                    Written(where=_at(path, node), raw=node.value, text=_text(node))
+                    Written(where=_at(source, node), raw=node.value, text=_text(node))
                     for node in nodes
                 ),
-                where=_at(path, value),
+                where=_at(source, value),
             )
+
+
+def _elsewhere(server: str, reference: str) -> Iterator[Entry]:
+    """
+    Every trigger a server keeps somewhere other than its config file.
+
+    A path on disk or a URL, holding exactly what the block would have held: a
+    mapping of titles, each holding the triggers that set its lines off. It is
+    read by the composer the deployment's file is read by rather than by the
+    config parser, so an entry dropped out of it names the line it was written
+    on — which is the one thing an inline block cannot say, `config.yaml` having
+    been parsed by something that kept no line numbers.
+
+    Nothing here raises, for the reason `_added` gives. A file that has gone
+    missing, a server that will not answer, and a document that is not a mapping
+    of titles are each a line in the log and a server that still hears the whole
+    shipped list.
+    """
+    where = SOURCED_LOCATION.format(server=server, path=reference)
+
+    if not reference.strip():
+        logger.warning(
+            "[%s] '%s' names nowhere to read quotes from; ignoring it.",
+            server,
+            ADDITIONAL_QUOTES_KEY,
+        )
+        return
+
+    try:
+        text = _contents(reference)
+    except ValueError as exc:
+        # The server, because nothing about a path knows which one wrote it
+        # down. What `_read` raises has already been through `where` and says
+        # so itself.
+        logger.warning("[%s] %s; keeping the shipped list.", server, exc)
+        return
+
+    try:
+        yield from _read(where, text)
+    except ValueError as exc:
+        logger.warning("%s; keeping the shipped list.", exc)
 
 
 def _offered(server: str, raw: Any) -> Iterator[Entry]:
@@ -1298,8 +1423,8 @@ def _offered(server: str, raw: Any) -> Iterator[Entry]:
 
     if not isinstance(raw, Mapping):
         logger.warning(
-            "%s: is not a mapping of titles, each holding the triggers that set its "
-            "lines off; ignoring it.",
+            "%s: is neither a mapping of titles, each holding the triggers that set "
+            "its lines off, nor a path or URL to a file holding one; ignoring it.",
             where,
         )
         return
