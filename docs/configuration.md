@@ -655,7 +655,6 @@ Only used by `summary`. An OpenAI-compatible chat-completions endpoint and nothi
 
 VAD thresholds, the pre-roll depth, and the Wyoming chunk size are deliberately **not** configurable at all, from either place — they are tied to Silero's fixed 512-sample frame and live in `config.py`.
 
-<div class="next-steps">
-  <a href="{{ '/installation/' | relative_url }}"><strong>Installation →</strong><span>Volumes, permissions, and deploying it</span></a>
-  <a href="{{ '/about/' | relative_url }}"><strong>About →</strong><span>Why it is put together this way</span></a>
-</div>
+<nav class="page-nav" aria-label="Previous and next page">
+  <a class="page-nav-prev" rel="prev" href="{{ '/installation/' | relative_url }}"><span class="page-nav-label">← Previous</span><strong>Installation</strong><span class="page-nav-blurb">Volumes, permissions, and deploying it</span></a>
+</nav>

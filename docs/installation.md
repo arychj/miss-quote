@@ -249,7 +249,7 @@ git tag v0.1.0 && git push origin v0.1.0
 
 > **To the `tts` tool.** Playing audio used to be something every tool could do; it is now one tool, and **a server that does not enable `tts` says nothing.** Add `tts: {enabled: true}` beside whatever already speaks. Fines are still counted and rounds are still paid without it, and the log says so once at startup, so a server that goes quiet after an upgrade has a line explaining why. **A `chime:` setting also loses its extension** — `chime.wav` becomes `chime` — and one left as it was is called out by name rather than reported as a file that is not there. Clips written by a version older still are `.wav` and cannot be read at all; anything left in the new cache directory ages out on the retention clock whatever it is named.
 
-<div class="next-steps">
-  <a href="{{ '/configuration/' | relative_url }}"><strong>Configuration →</strong><span>The file it reads, every tool, and every setting</span></a>
-  <a href="{{ '/about/' | relative_url }}"><strong>About →</strong><span>How the pipeline is put together</span></a>
-</div>
+<nav class="page-nav" aria-label="Previous and next page">
+  <a class="page-nav-prev" rel="prev" href="{{ '/about/' | relative_url }}"><span class="page-nav-label">← Previous</span><strong>About</strong><span class="page-nav-blurb">How the pipeline is put together</span></a>
+  <a class="page-nav-next" rel="next" href="{{ '/configuration/' | relative_url }}"><span class="page-nav-label">Next →</span><strong>Configuration</strong><span class="page-nav-blurb">The file it reads, every tool, and every setting</span></a>
+</nav>

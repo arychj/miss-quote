@@ -385,7 +385,6 @@ The package directory is `miss_quote` where everything else is `miss-quote`, a h
 
 Dependencies stay in `requirements.txt` rather than `setup.cfg`, because one of them is pinned to a VCS revision and the image installs it verbatim. Nothing installs the package: `PYTHONPATH` points at `src/`, in the container and in `pytest.ini` both. The Silero model is vendored rather than installed, because the `silero-vad` package declares `torch` even in ONNX mode.
 
-<div class="next-steps">
-  <a href="{{ '/installation/' | relative_url }}"><strong>Installation →</strong><span>What to run it against, and how to deploy it</span></a>
-  <a href="{{ '/configuration/' | relative_url }}"><strong>Configuration →</strong><span>Every tool, setting, and variable</span></a>
-</div>
+<nav class="page-nav" aria-label="Previous and next page">
+  <a class="page-nav-next" rel="next" href="{{ '/installation/' | relative_url }}"><span class="page-nav-label">Next →</span><strong>Installation</strong><span class="page-nav-blurb">What to run it against, and how to deploy it</span></a>
+</nav>
