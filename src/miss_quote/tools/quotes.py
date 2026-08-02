@@ -6,7 +6,16 @@ loud where it was said. The pairs come from a YAML file — a film, and under it
 the phrases that set its lines off — so adding a quote is a key rather than a
 deployment.
 
-A trigger appears once in the whole file. Nesting under the title makes it a
+That file is the deployment's list, and a server may write its own on top of it
+under `additional_quotes`, in the same shape and read by the same rules. A
+trigger written there is what that server hears whatever the shipped file says
+the phrase answers with: the shared list is what a deployment agrees on rather
+than what it is held to. Titles are not what collides — the list is keyed on the
+trigger and carries the title on each quote — so a title written in both places
+is one title with everything either of them said under it. See `_added` and
+`_merged`.
+
+A trigger appears once within one of those. Nesting under the title makes it a
 key, so a repeat under one title is not something the format can express at all;
 a repeat across two titles is refused for the same reason rather than being
 allowed to mean something a repeat under one title could not. A phrase worth
@@ -102,6 +111,12 @@ STRING_TAG = "tag:yaml.org,2002:str"
 # can go and look at is not worth reporting.
 EDITOR_OFFSET = 1
 
+# How a dropped entry says where it was written. A file has a line to point at;
+# a server's own additions have the server and the key they sit under, the
+# config file having been parsed by something that kept no line numbers.
+FILE_LOCATION = "{path} line {line}"
+SERVER_LOCATION = "[{server}] {key}"
+
 # A line that names whoever set it off. The only field a quote can interpolate:
 # the roster is the one thing knowable about a speaker, and a quote that could
 # reach anything else would be a template rather than a line from a film.
@@ -120,6 +135,12 @@ ANSWER_SECONDS_KEY = "answer_seconds"
 TIE_SECONDS_KEY = "tie_seconds"
 DEFAULT_ANSWER_SECONDS = 5.0
 DEFAULT_TIE_SECONDS = 1.0
+
+# Quotes one server hears and the others do not, written where the rest of its
+# tool config is and in the shape the file uses. Merged over the deployment's
+# list rather than beside it: a trigger written here is what that server hears,
+# whatever the shipped file says the phrase answers with.
+ADDITIONAL_QUOTES_KEY = "additional_quotes"
 
 # A window of this or less is off rather than instantaneous: no answer window is
 # a deployment that wants the lines and not the game, and no tie window is one
@@ -227,8 +248,42 @@ WORD_SEPARATOR = r"\s+"
 
 
 @dataclass(frozen=True)
+class Written:
+    """
+    One thing a source wrote down, and somewhere whoever has to fix it can go.
+
+    `text` is what it says where what it says is text, and None where it is
+    not — an unquoted `no` YAML read as a boolean, a mapping where a line
+    belonged. Deciding that here is what lets everything after it be one piece
+    of code for the shipped file and for a server's own additions, which are
+    read by two parsers that agree about very little else.
+
+    `raw` is what was written whether or not it was text, so that a report about
+    something the parser turned into a boolean can quote it back the way it was
+    typed rather than the way it was read.
+    """
+
+    where: str
+    raw: Any
+    text: str | None
+
+
+@dataclass(frozen=True)
+class Entry:
+    """One trigger and every line it answers with, as some source wrote them."""
+
+    movie: str
+    trigger: Written
+    answers: tuple[Written, ...]
+
+    # Where the answers were written, which is the only place left to point at
+    # for a trigger that lists none.
+    where: str
+
+
+@dataclass(frozen=True)
 class Quote:
-    """One entry in the file: what sets a line off, and the line."""
+    """One entry in a list: what sets a line off, and the line."""
 
     movie: str
     trigger: str
@@ -429,7 +484,11 @@ class Quotes(Tool):
         super().__init__(context)
 
         config = self.config
-        self._quotes = _load(quotes_cfg.file)
+        self._quotes = _merged(
+            self.server,
+            _load(quotes_cfg.file),
+            _added(self.server, config.get(ADDITIONAL_QUOTES_KEY)),
+        )
         self._triggers = pattern(self._quotes)
         self._recent = RecentQuotes()
         self._window = _seconds(
@@ -1002,31 +1061,7 @@ def _load(path: Path) -> Mapping[str, tuple[Quote, ...]]:
     because a tool listening for nothing is enabled and useless, which is worth
     a line at startup instead of silence forever.
     """
-    quotes: dict[str, tuple[Quote, ...]] = {}
-    titles: dict[str, str] = {}
-
-    for movie, key, value in _entries(path):
-        trigger = _trigger(path, movie, key)
-        if trigger is None:
-            continue
-
-        if trigger in quotes:
-            logger.warning(
-                "%s line %d: %s already answers under %r; a trigger answers for one "
-                "title. Skipping it.",
-                path,
-                _at(key),
-                _where(movie, str(key.value)),
-                titles[trigger],
-            )
-            continue
-
-        answers = _answers(path, movie, trigger, value)
-        if not answers:
-            continue
-
-        quotes[trigger] = answers
-        titles[trigger] = movie
+    quotes = _quotes(_read(path))
 
     if not quotes:
         raise ValueError(f"{path} holds no usable quotes, so there is nothing to listen for.")
@@ -1041,19 +1076,127 @@ def _load(path: Path) -> Mapping[str, tuple[Quote, ...]]:
     return quotes
 
 
+def _added(server: str, raw: Any) -> Mapping[str, tuple[Quote, ...]]:
+    """
+    Every quote one server wrote for itself, by the trigger that sets it off.
+
+    The same shape as the file and the same rules, read from the server's own
+    tool config rather than from `QUOTES_FILE` — a title, and under it the
+    phrases that set its lines off.
+
+    Nothing here raises, which is the one place it parts company with `_load`. A
+    deployment whose quote file is unusable has a tool listening for nothing and
+    should be told so on the way up; a server whose additions are unusable still
+    has the whole shipped list, and taking its `quotes` tool down over a block it
+    did not have to write is a worse answer than dropping the block and saying
+    so.
+    """
+    if raw is None:
+        return {}
+
+    quotes = _quotes(_offered(server, raw))
+
+    if quotes:
+        logger.info(
+            "[%s] Added %d quotes across %d triggers from '%s': %s",
+            server,
+            _counted(quotes),
+            len(quotes),
+            ADDITIONAL_QUOTES_KEY,
+            TRIGGER_SEPARATOR.join(quotes),
+        )
+
+    return quotes
+
+
+def _merged(
+    server: str,
+    shared: Mapping[str, tuple[Quote, ...]],
+    added: Mapping[str, tuple[Quote, ...]],
+) -> Mapping[str, tuple[Quote, ...]]:
+    """
+    One server's list: the deployment's, with its own additions over the top.
+
+    A trigger the shipped file already answers is answered by the server's line
+    instead, for that server alone. The shared list is what a deployment agrees
+    on rather than what it is held to, and a server that wants its own line for
+    a phrase everybody has should not have to pick a different phrase.
+
+    Titles are not what collides here and never were: the list is keyed on the
+    trigger and carries the title on each quote, so a title written in both
+    places is one title with everything either of them said under it.
+    """
+    overridden = [trigger for trigger in added if trigger in shared]
+
+    if overridden:
+        logger.info(
+            "[%s] %d trigger(s) answer with this server's line rather than the "
+            "shipped one: %s",
+            server,
+            len(overridden),
+            TRIGGER_SEPARATOR.join(overridden),
+        )
+
+    return {**shared, **added}
+
+
+def _quotes(entries: Iterator[Entry]) -> dict[str, tuple[Quote, ...]]:
+    """
+    Every usable entry a source offered, by the trigger that sets it off.
+
+    A trigger appears once within one source. It is a key under its title, so
+    writing it twice under one title is not something either source can say, and
+    writing it under two titles is refused here rather than allowed to mean
+    something the first form could not express. The first is kept, because a
+    source is read top to bottom and the line somebody has to delete should be
+    the later one.
+    """
+    quotes: dict[str, tuple[Quote, ...]] = {}
+    titles: dict[str, str] = {}
+
+    for entry in entries:
+        trigger = _trigger(entry)
+        if trigger is None:
+            continue
+
+        if trigger in quotes:
+            logger.warning(
+                "%s: %s already answers under %r; a trigger answers for one title. "
+                "Skipping it.",
+                entry.trigger.where,
+                _where(entry.movie, str(entry.trigger.text)),
+                titles[trigger],
+            )
+            continue
+
+        answers = _answers(entry, trigger)
+        if not answers:
+            continue
+
+        quotes[trigger] = answers
+        titles[trigger] = entry.movie
+
+    return quotes
+
+
 def _counted(quotes: Mapping[str, tuple[Quote, ...]]) -> int:
-    """How many lines the file gave, where `len` gives how many triggers they set off."""
+    """How many lines a list holds, where `len` gives how many triggers they set off."""
     return sum(len(answers) for answers in quotes.values())
 
 
 def _where(*keys: str) -> str:
-    """Where in the file something is, in the file's own keys."""
+    """Where in the source something is, in the source's own keys."""
     return KEY_SEPARATOR.join(keys)
 
 
-def _at(node: yaml.Node) -> int:
-    """The line a node starts on, as an editor counts it."""
-    return node.start_mark.line + EDITOR_OFFSET
+def _at(path: Path, node: yaml.Node) -> str:
+    """
+    Where in the file a node was written, as an editor counts lines.
+
+    A node's mark counts from zero, and a reported line number nobody can go and
+    look at is not worth reporting.
+    """
+    return FILE_LOCATION.format(path=path, line=node.start_mark.line + EDITOR_OFFSET)
 
 
 def _text(node: yaml.Node) -> str | None:
@@ -1071,7 +1214,7 @@ def _text(node: yaml.Node) -> str | None:
     return str(node.value)
 
 
-def _entries(path: Path) -> Iterator[tuple[str, yaml.Node, yaml.Node]]:
+def _read(path: Path) -> Iterator[Entry]:
     """
     Every trigger in the file, with the title it sits under.
 
@@ -1107,56 +1250,124 @@ def _entries(path: Path) -> Iterator[tuple[str, yaml.Node, yaml.Node]]:
 
         if movie is None:
             logger.warning(
-                "%s line %d: %r is not a title in text; quote it, or YAML reads it "
-                "as something else. Skipping it.",
-                path,
-                _at(title),
+                "%s: %r is not a title in text; quote it, or YAML reads it as "
+                "something else. Skipping it.",
+                _at(path, title),
                 title.value,
             )
             continue
 
         if not isinstance(entries, yaml.MappingNode):
             logger.warning(
-                "%s line %d: %r does not hold a mapping of triggers to lines; skipping it.",
-                path,
-                _at(title),
+                "%s: %r does not hold a mapping of triggers to lines; skipping it.",
+                _at(path, title),
                 movie,
             )
             continue
 
         for key, value in entries.value:
-            yield movie, key, value
+            nodes = tuple(value.value) if isinstance(value, yaml.SequenceNode) else (value,)
+
+            yield Entry(
+                movie=movie,
+                trigger=Written(where=_at(path, key), raw=key.value, text=_text(key)),
+                answers=tuple(
+                    Written(where=_at(path, node), raw=node.value, text=_text(node))
+                    for node in nodes
+                ),
+                where=_at(path, value),
+            )
 
 
-def _trigger(path: Path, movie: str, key: yaml.Node) -> str | None:
+def _offered(server: str, raw: Any) -> Iterator[Entry]:
+    """
+    Every trigger a server added for itself, with the title it sits under.
+
+    The config file is read once, whole, by `config.FileConfig`, so what arrives
+    here is what `safe_load` made of it rather than anything carrying a line
+    number. That costs the line numbers a dropped entry would otherwise name and
+    nothing else: `safe_load` has already turned an unquoted `no` into a boolean
+    and an unquoted `1917` into an integer, so asking whether a value is a string
+    refuses exactly what the file loader's tag check refuses. Somewhere to go is
+    the server and the key, which is as much as a config file can offer.
+
+    A block that is not a mapping of titles is reported and dropped rather than
+    raised on, for the reason `_added` gives.
+    """
+    where = SERVER_LOCATION.format(server=server, key=ADDITIONAL_QUOTES_KEY)
+
+    if not isinstance(raw, Mapping):
+        logger.warning(
+            "%s: is not a mapping of titles, each holding the triggers that set its "
+            "lines off; ignoring it.",
+            where,
+        )
+        return
+
+    for title, entries in raw.items():
+        movie = title if isinstance(title, str) else None
+
+        if movie is None:
+            logger.warning(
+                "%s: %r is not a title in text; quote it, or YAML reads it as "
+                "something else. Skipping it.",
+                where,
+                title,
+            )
+            continue
+
+        if not isinstance(entries, Mapping):
+            logger.warning(
+                "%s: %r does not hold a mapping of triggers to lines; skipping it.",
+                where,
+                movie,
+            )
+            continue
+
+        for key, value in entries.items():
+            values = tuple(value) if isinstance(value, list) else (value,)
+
+            yield Entry(
+                movie=movie,
+                trigger=Written(
+                    where=where, raw=key, text=key if isinstance(key, str) else None
+                ),
+                answers=tuple(
+                    Written(
+                        where=where, raw=line, text=line if isinstance(line, str) else None
+                    )
+                    for line in values
+                ),
+                where=where,
+            )
+
+
+def _trigger(entry: Entry) -> str | None:
     """
     The phrase an entry listens for, folded for matching, or None with a reason.
 
-    A trigger YAML did not read as text is dropped along with it. An unquoted
-    `no` is a boolean and an unquoted `1917` is an integer, and both look
-    entirely correct in the file while being something the matcher can never
-    compare against. `scripts/validate_quotes.py` catches it before a merge;
-    this catches it in a file mounted over the shipped one, which never goes
-    past CI.
+    A trigger the parser did not read as text is dropped along with it. An
+    unquoted `no` is a boolean and an unquoted `1917` is an integer, and both
+    look entirely correct in the file while being something the matcher can never
+    compare against. `scripts/validate_quotes.py` catches it before a merge; this
+    catches it in a file mounted over the shipped one, which never goes past CI.
     """
-    trigger = _text(key)
+    trigger = entry.trigger.text
 
     if trigger is None:
         logger.warning(
-            "%s line %d: %s is not a %s written in text; quote it, or YAML reads it "
-            "as something else. Skipping it.",
-            path,
-            _at(key),
-            _where(movie, str(key.value)),
+            "%s: %s is not a %s written in text; quote it, or YAML reads it as "
+            "something else. Skipping it.",
+            entry.trigger.where,
+            _where(entry.movie, str(entry.trigger.raw)),
             TRIGGER_LABEL,
         )
         return None
 
     if not trigger.strip():
         logger.warning(
-            "%s line %d: a quote needs a %s to listen for; skipping it.",
-            path,
-            _at(key),
+            "%s: a quote needs a %s to listen for; skipping it.",
+            entry.trigger.where,
             TRIGGER_LABEL,
         )
         return None
@@ -1164,53 +1375,50 @@ def _trigger(path: Path, movie: str, key: yaml.Node) -> str | None:
     return trigger.strip().casefold()
 
 
-def _answers(path: Path, movie: str, trigger: str, value: yaml.Node) -> tuple[Quote, ...]:
+def _answers(entry: Entry, trigger: str) -> tuple[Quote, ...]:
     """
     Every line one trigger can answer with.
 
     A trigger worth answering one way writes its line; one worth answering
-    several writes a list of them. Both arrive here as a sequence of nodes, so
-    that what the file chose is not something the rest of the tool has to know
-    about. Each answer is reported and dropped on its own, because one bad line
-    in a list of four should cost that line rather than the trigger.
+    several writes a list of them. Both arrive here as a sequence, so that what
+    the source chose is not something the rest of the tool has to know about.
+    Each answer is reported and dropped on its own, because one bad line in a
+    list of four should cost that line rather than the trigger.
     """
-    nodes = tuple(value.value) if isinstance(value, yaml.SequenceNode) else (value,)
-
-    if not nodes:
+    if not entry.answers:
         logger.warning(
-            "%s line %d: %s lists no lines to answer with; skipping it.",
-            path,
-            _at(value),
-            _where(movie, trigger),
+            "%s: %s lists no lines to answer with; skipping it.",
+            entry.where,
+            _where(entry.movie, trigger),
         )
         return ()
 
     return tuple(
         quote
-        for quote in (_quote(path, movie, trigger, node) for node in nodes)
+        for quote in (
+            _quote(entry.movie, trigger, answer) for answer in entry.answers
+        )
         if quote is not None
     )
 
 
-def _quote(path: Path, movie: str, trigger: str, node: yaml.Node) -> Quote | None:
+def _quote(movie: str, trigger: str, answer: Written) -> Quote | None:
     """
     One answer as a quote, or None with a line in the log saying why not.
 
     An answer with nothing to say is dropped, as is a line carrying a
     placeholder nothing fills — which is checked here rather than at the moment
     somebody says the trigger, by which point the tool has one job and cannot do
-    it. So is anything YAML did not read as text, for the reason `_trigger`
+    it. So is anything the parser did not read as text, for the reason `_trigger`
     gives.
     """
-    number = _at(node)
-    text = _text(node)
+    text = answer.text
 
     if text is None:
         logger.warning(
-            "%s line %d: %s does not answer with text; quote it, or YAML reads it as "
+            "%s: %s does not answer with text; quote it, or YAML reads it as "
             "something else. Skipping it.",
-            path,
-            number,
+            answer.where,
             _where(movie, trigger),
         )
         return None
@@ -1219,9 +1427,8 @@ def _quote(path: Path, movie: str, trigger: str, node: yaml.Node) -> Quote | Non
 
     if not text:
         logger.warning(
-            "%s line %d: a quote needs a %s to say; skipping it.",
-            path,
-            number,
+            "%s: a quote needs a %s to say; skipping it.",
+            answer.where,
             QUOTE_LABEL,
         )
         return None
@@ -1230,10 +1437,9 @@ def _quote(path: Path, movie: str, trigger: str, node: yaml.Node) -> Quote | Non
         text.format(**{USER_FIELD: PROBE_NAME})
     except (IndexError, KeyError, ValueError) as exc:
         logger.warning(
-            "%s line %d: %r has a placeholder nothing fills (%s); "
+            "%s: %r has a placeholder nothing fills (%s); "
             "only '%s' is available. Skipping it.",
-            path,
-            number,
+            answer.where,
             text,
             exc,
             USER_PLACEHOLDER,

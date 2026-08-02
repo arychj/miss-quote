@@ -14,12 +14,19 @@ instead, along with the ones the loader has no opinion about — a trigger too
 long to be a phrase anybody says, a line too long to be a callback, a title out
 of order.
 
+A server may also write quotes of its own, under `additional_quotes` in its
+`quotes` tool config, and those reach a channel exactly as the file's do. They
+are worth more of this rather than less: the loader reads them from a config
+file that has already been parsed, so what it reports has no line number in it
+at all. `--config` checks them here, where the file can be composed and a
+problem still names somewhere to go.
+
 PyYAML and nothing else. It imports nothing from `miss_quote`: pulling in the
 tool would mean discord.py, onnxruntime and the rest of the runtime for a job
 that reads a text file, and what keeps this a thirty-second answer on every pull
 request rather than a build is that the gap between them is one pure wheel.
 
-    python scripts/validate_quotes.py [path ...]
+    python scripts/validate_quotes.py [path ...] [--config path ...]
 
 Exits non-zero having printed one line per problem, each naming the line number
 as an editor counts it.
@@ -61,6 +68,16 @@ STRING_TAG = "tag:yaml.org,2002:str"
 TAG_SEPARATOR = ":"
 
 DEFAULT_PATH = Path("src/miss_quote/resources/quotes.yaml")
+DEFAULT_CONFIG_PATH = Path("config.yaml")
+
+# The way down to a server's own quotes, key by key. Named here rather than
+# imported from `config.py` for the reason the header gives, and asserted
+# against it in `tests/test_validate_quotes.py`.
+SERVERS_KEY = "servers"
+TOOLS_KEY = "tools"
+TOOL_CONFIG_KEY = "config"
+QUOTES_TOOL = "quotes"
+ADDITIONAL_QUOTES_KEY = "additional_quotes"
 
 FILE_ENCODING = "utf-8"
 
@@ -126,30 +143,12 @@ class Problem:
 
 
 def problems(path: Path) -> list[Problem]:
-    """Everything wrong with one file, in the order an editor would meet it."""
-    try:
-        # newline="" rather than the default, which would translate CRLF to LF
-        # on the way in and hide exactly what `_whole_file` is looking for.
-        with path.open(encoding=FILE_ENCODING, newline="") as handle:
-            text = handle.read()
-    except FileNotFoundError:
-        return [Problem(path, FIRST_LINE, "no such file")]
-    except OSError as exc:
-        return [Problem(path, FIRST_LINE, f"could not be read: {exc}")]
-    except UnicodeDecodeError as exc:
-        return [Problem(path, FIRST_LINE, f"is not valid {FILE_ENCODING}: {exc}")]
+    """Everything wrong with one quote file, in the order an editor would meet it."""
+    text, document, found = _document(path)
+    found = list(_whole_file(path, text)) + found
 
-    found = list(_whole_file(path, text))
-
-    if not text.strip():
-        return found + [Problem(path, FIRST_LINE, "is empty")]
-
-    try:
-        document = yaml.compose(text)
-    except yaml.MarkedYAMLError as exc:
-        return found + [Problem(path, _marked(exc), f"is not valid YAML: {exc.problem}")]
-    except yaml.YAMLError as exc:
-        return found + [Problem(path, FIRST_LINE, f"is not valid YAML: {exc}")]
+    if document is None:
+        return found
 
     if not isinstance(document, yaml.MappingNode):
         return found + [
@@ -162,6 +161,130 @@ def problems(path: Path) -> list[Problem]:
     found.extend(_movies(path, document))
 
     return sorted(found, key=lambda problem: problem.line)
+
+
+def config_problems(path: Path) -> list[Problem]:
+    """
+    Everything wrong with the quotes a config file's servers wrote for themselves.
+
+    Only those. What else the file says is `config.py`'s business, and a
+    validator that grew an opinion about the rest of it would be a second config
+    parser to keep in step with the first. A file with no servers, no `quotes`
+    tool, or nothing added is clean rather than empty: this is an optional block
+    and saying nothing is the ordinary case.
+
+    Composed rather than loaded for the same reason the quote file is, and for
+    one more: the loader cannot do this. It is handed what `config.FileConfig`
+    already parsed, so it has no line to point at and no way to tell an unquoted
+    `no` from the word. Here the file is still a file.
+
+    Each block is checked on its own. A trigger the shipped list already answers
+    is not a problem — that is the override the field exists for — so what a
+    server wrote is never compared against the deployment's file, only against
+    itself.
+    """
+    _, document, found = _document(path)
+
+    if document is None:
+        return found
+
+    for additions in _additions(document):
+        if not isinstance(additions, yaml.MappingNode):
+            found.append(
+                Problem(
+                    path,
+                    _at(additions),
+                    f"{ADDITIONAL_QUOTES_KEY} must be a mapping of titles, each "
+                    f"holding its triggers",
+                )
+            )
+            continue
+
+        found.extend(_movies(path, additions))
+
+    return sorted(found, key=lambda problem: problem.line)
+
+
+def _document(path: Path) -> tuple[str, yaml.Node | None, list[Problem]]:
+    """
+    A file's text and what YAML made of it, or why neither is available.
+
+    Read with `newline=""` rather than the default, which would translate CRLF
+    to LF on the way in and hide exactly what `_whole_file` is looking for.
+    """
+    try:
+        with path.open(encoding=FILE_ENCODING, newline="") as handle:
+            text = handle.read()
+    except FileNotFoundError:
+        return NOTHING, None, [Problem(path, FIRST_LINE, "no such file")]
+    except OSError as exc:
+        return NOTHING, None, [Problem(path, FIRST_LINE, f"could not be read: {exc}")]
+    except UnicodeDecodeError as exc:
+        return NOTHING, None, [
+            Problem(path, FIRST_LINE, f"is not valid {FILE_ENCODING}: {exc}")
+        ]
+
+    if not text.strip():
+        return text, None, [Problem(path, FIRST_LINE, "is empty")]
+
+    try:
+        return text, yaml.compose(text), []
+    except yaml.MarkedYAMLError as exc:
+        return text, None, [
+            Problem(path, _marked(exc), f"is not valid YAML: {exc.problem}")
+        ]
+    except yaml.YAMLError as exc:
+        return text, None, [Problem(path, FIRST_LINE, f"is not valid YAML: {exc}")]
+
+
+def _additions(document: yaml.Node) -> Iterator[yaml.Node]:
+    """
+    Every `additional_quotes` block a config file holds, one per server.
+
+    Walked leniently. A key missing, or holding something other than a mapping,
+    is somebody else's complaint or nothing at all, and every one of them is a
+    shape this validator has no business having an opinion about.
+
+    A block written and left empty is skipped rather than reported, which is what
+    the loader does with it: `additional_quotes:` and nothing under it adds
+    nothing, and there is no entry to be wrong.
+    """
+    for server in _values(_under(document, SERVERS_KEY)):
+        tools = _under(server, TOOLS_KEY)
+        quotes = _under(tools, QUOTES_TOOL)
+        config = _under(quotes, TOOL_CONFIG_KEY)
+        additions = _under(config, ADDITIONAL_QUOTES_KEY)
+
+        if additions is None or _is_empty(additions):
+            continue
+
+        yield additions
+
+
+def _under(node: yaml.Node | None, key: str) -> yaml.Node | None:
+    """What one key holds, where the node is a mapping that writes that key."""
+    if not isinstance(node, yaml.MappingNode):
+        return None
+
+    for written, value in node.value:
+        if isinstance(written, yaml.ScalarNode) and written.value == key:
+            return value
+
+    return None
+
+
+def _values(node: yaml.Node | None) -> Iterator[yaml.Node]:
+    """What a mapping holds, whatever it keys them under."""
+    if not isinstance(node, yaml.MappingNode):
+        return
+
+    for _, value in node.value:
+        yield value
+
+
+def _is_empty(node: yaml.Node) -> bool:
+    """Whether a key was written with nothing under it."""
+    return not node.value
 
 
 def _at(node: yaml.Node) -> int:
@@ -458,11 +581,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=[DEFAULT_PATH],
         help=f"quote files to check (default: {DEFAULT_PATH})",
     )
+    # Opted into rather than defaulted, unlike the quote file. A deployment's
+    # config lives wherever it is mounted, and a run from anywhere but the
+    # repository would otherwise open by complaining about a file nobody meant
+    # to check.
+    parser.add_argument(
+        "--config",
+        action="append",
+        type=Path,
+        default=[],
+        metavar="PATH",
+        help=f"config files whose servers' '{ADDITIONAL_QUOTES_KEY}' to check "
+        f"(repeatable; e.g. {DEFAULT_CONFIG_PATH})",
+    )
     arguments = parser.parse_args(argv)
 
+    checks = [(path, problems) for path in arguments.paths or [DEFAULT_PATH]]
+    checks += [(path, config_problems) for path in arguments.config]
+
     found: list[Problem] = []
-    for path in arguments.paths or [DEFAULT_PATH]:
-        against = problems(path)
+    for path, check in checks:
+        against = check(path)
         found += against
 
         if not against:

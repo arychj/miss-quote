@@ -23,6 +23,7 @@ PYTEST_ARGS ?= -q
 
 VALIDATOR := scripts/validate_quotes.py
 QUOTES_FILE ?= src/miss_quote/resources/quotes.yaml
+CONFIG_FILE ?= config.yaml
 
 .DEFAULT_GOAL := help
 
@@ -48,8 +49,11 @@ shell: test-image ## Open a shell in the test image
 # Not containerized, on purpose. The validator needs PyYAML and nothing else, so
 # there is no image to build, and the workflow that calls it exists to answer a
 # quote-list change in seconds rather than after one.
-validate-quotes: ## Check the quote file against the validator
-	$(PYTHON) $(VALIDATOR) "$(QUOTES_FILE)"
+#
+# Both lists, because both reach a channel: the deployment's file, and whatever
+# a server added for itself under `additional_quotes` in the config.
+validate-quotes: ## Check the quote file and the config's additions against the validator
+	$(PYTHON) $(VALIDATOR) "$(QUOTES_FILE)" --config "$(CONFIG_FILE)"
 
 clean: ## Remove the images this Makefile builds
 	-$(DOCKER) image rm $(TEST_IMAGE) $(RUNTIME_IMAGE)

@@ -255,12 +255,13 @@ servers:
       # Answers out loud with a film line when someone says the phrase that sets
       # it off, and then asks the channel where the line came from.
       #
-      # The triggers and the lines are one list per deployment, read from
-      # QUOTES_FILE, because a film everybody in one channel has seen is one
-      # everybody in the next has too. A trigger that has just fired goes quiet
-      # for a while, so a channel that keeps saying the same word only hears the
-      # joke once; how long is settings.quotes.backoff_seconds, which is not per
-      # server either.
+      # Most of the triggers and the lines are one list per deployment, read
+      # from QUOTES_FILE, because a film everybody in one channel has seen is
+      # one everybody in the next has too. What this server hears and the others
+      # do not is `additional_quotes` below. A trigger that has just fired goes
+      # quiet for a while, so a channel that keeps saying the same word only
+      # hears the joke once; how long is settings.quotes.backoff_seconds, which
+      # is not per server either.
       #
       # Once the line has been said, naming what it came from — "what is
       # Firefly" — earns a credit through `scoreboard` below, announced out
@@ -343,6 +344,39 @@ servers:
           # said at all where `penalize_self_answers` is false.
           #
           # self_answer_announcement: "Nuh uh uh. {user}, you set it off, so you don't get to name it. You are fined {credits} for being a dick."
+
+          # Quotes this server hears and the others do not, in the shape
+          # QUOTES_FILE uses: a title, and under it the phrases that set its
+          # lines off. For the in-joke everybody here has and nobody in the next
+          # channel does, which is the one thing a list per deployment cannot
+          # hold.
+          #
+          # Everything the file can say, this can say. A trigger worth answering
+          # several ways lists its lines and one is drawn each time; a line
+          # naming whoever set it off writes `{user}`; and the two quoting rules
+          # bite here as well — a title like "1917" is an integer unquoted, and
+          # a line starting with `{user}` opens a mapping.
+          #
+          # A trigger the shipped list already answers is answered by the line
+          # written here instead, for this server and no other. The deployment's
+          # file is what everybody agrees on rather than what they are held to.
+          # Titles are not what collides: the list is keyed on the trigger, so a
+          # film named in both places is one film with both sets of lines under
+          # it.
+          #
+          # Read at startup on the same terms as the file, except that nothing
+          # here stops the tool. A bad entry is reported and dropped and the
+          # server keeps the rest; a block that is not a mapping of titles is
+          # reported and ignored and the server keeps the whole shipped list.
+          # `scripts/validate_quotes.py --config` checks these before a merge,
+          # which is where a dropped entry is worth finding.
+          #
+          # additional_quotes:
+          #   Firefly:
+          #     cool: Shiny.
+          #     behave: I aim to misbehave.
+          #   "1917":
+          #     over the top: "Over the top, {user}!"
 
       # Keeps this server's running tally and publishes it to the voice channel
       # topic as `Eli: -9 Erik: -2`, which needs Set Voice Channel Status on the

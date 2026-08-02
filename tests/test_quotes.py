@@ -21,6 +21,7 @@ from miss_quote.config import (
 from miss_quote.ledger.credits import CreditLedger
 from miss_quote.tools.base import ToolContext, Toolbox
 from miss_quote.tools.quotes import (
+    ADDITIONAL_QUOTES_KEY,
     ANNOUNCEMENT_KEY,
     ANSWER_SECONDS_KEY,
     DEFAULT_ANNOUNCEMENT,
@@ -38,8 +39,10 @@ from miss_quote.tools.quotes import (
     Quotes,
     RecentQuotes,
     Round,
+    _added,
     _denominated,
     _load,
+    _merged,
 )
 from miss_quote.tools.runner import ToolRunner
 from miss_quote.tools.scoreboard import Scoreboard
@@ -90,6 +93,18 @@ QUOTES = {
     MOVIE: {TRIGGER: QUOTE},
     OTHER_MOVIE: {OTHER_TRIGGER: OTHER_QUOTE},
 }
+
+# A film the file does not hold, for a server saying something of its own, and a
+# second line for one it does, for a server saying it differently.
+ADDED_MOVIE = "Aliens"
+ADDED_TRIGGER = "game over"
+ADDED_QUOTE = "Game over man, game over!"
+OVERRIDE_QUOTE = "Gorram it."
+
+
+def _adding(block: Mapping | None = None) -> dict:
+    """One server's tool config, with quotes of its own in it."""
+    return {ADDITIONAL_QUOTES_KEY: block or {ADDED_MOVIE: {ADDED_TRIGGER: ADDED_QUOTE}}}
 
 
 def _besides(trigger: str, quote: str) -> dict[str, dict[str, str]]:
@@ -632,6 +647,200 @@ def test_the_shipped_file_loads(speech, speaker):
     for trigger, answers in _load(BUNDLED).items():
         assert trigger == trigger.casefold()
         assert all(quote.text and quote.movie for quote in answers)
+
+
+# ── what a server adds for itself ─────────────────
+
+
+def test_an_addition_is_read_the_way_the_file_is():
+    assert _added(SERVER_ALIAS, {ADDED_MOVIE: {ADDED_TRIGGER: ADDED_QUOTE}}) == {
+        ADDED_TRIGGER: (
+            Quote(movie=ADDED_MOVIE, trigger=ADDED_TRIGGER, text=ADDED_QUOTE),
+        )
+    }
+
+
+def test_saying_nothing_adds_nothing():
+    assert _added(SERVER_ALIAS, None) == {}
+
+
+async def test_an_added_trigger_is_answered(quotes_file, speech, speaker):
+    await _hear(_tool(speaker, config=_adding()), f"well that is {ADDED_TRIGGER}")
+
+    assert speech.asked == [ADDED_QUOTE]
+
+
+async def test_the_shipped_list_is_still_heard_beside_it(quotes_file, speech, speaker):
+    """Additions rather than a replacement; a server saying one more thing keeps the rest."""
+    await _hear(_tool(speaker, config=_adding()), TRIGGER)
+
+    assert speech.asked == [QUOTE]
+
+
+async def test_an_added_trigger_the_file_answers_says_this_server_s_line(
+    quotes_file, speech, speaker
+):
+    """The shared list is what a deployment agrees on rather than what it is held to."""
+    await _hear(_tool(speaker, config=_adding({MOVIE: {TRIGGER: OVERRIDE_QUOTE}})), TRIGGER)
+
+    assert speech.asked == [OVERRIDE_QUOTE]
+
+
+def test_a_title_written_in_both_places_is_one_title(quotes_file):
+    """
+    Titles are not what collides and never were.
+
+    The list is keyed on the trigger and carries the title on each quote, so a
+    server adding a line to a film the file already holds has one film with both
+    lines under it — and a round asking where either came from asks about the
+    same title.
+    """
+    added = _merged(
+        SERVER_ALIAS,
+        _load(quotes_file),
+        _added(SERVER_ALIAS, {MOVIE: {ADDED_TRIGGER: ADDED_QUOTE}}),
+    )
+
+    assert added[TRIGGER][0].movie == added[ADDED_TRIGGER][0].movie == MOVIE
+
+
+async def test_naming_the_film_an_addition_came_from_earns_a_credit(
+    quotes_file, speech, speaker, board
+):
+    tool = _tool(speaker, config=_adding(), board=board)
+    await _quoted(tool, trigger=ADDED_TRIGGER)
+
+    await _hear(tool, f"What is {ADDED_MOVIE}")
+
+    assert board.balance(SPEAKER_ID) == ONE_CREDIT
+
+
+async def test_an_added_trigger_goes_quiet_like_any_other(quotes_file, speech, speaker):
+    tool = _tool(speaker, config=_adding())
+    await _hear(tool, ADDED_TRIGGER)
+
+    await _hear(tool, ADDED_TRIGGER)
+
+    assert speech.asked == [ADDED_QUOTE]
+
+
+async def test_an_added_line_is_warmed(quotes_file, speech, speaker):
+    await _render(_tool(speaker, config=_adding()))
+
+    assert speech.warmed == [QUOTE, OTHER_QUOTE, ADDED_QUOTE]
+
+
+async def test_an_added_line_naming_the_speaker_is_warmed_per_name(
+    quotes_file, speech, speaker
+):
+    await _render(
+        _tool(
+            speaker,
+            users=ROSTER,
+            config=_adding({ADDED_MOVIE: {PERSONAL_TRIGGER: PERSONAL_QUOTE}}),
+        )
+    )
+
+    assert speech.warmed[:4] == [
+        QUOTE,
+        OTHER_QUOTE,
+        PERSONAL_QUOTE.format(user=SPEAKER),
+        PERSONAL_QUOTE.format(user=OTHER_SPEAKER),
+    ]
+
+
+async def test_an_addition_may_answer_several_ways(monkeypatch, quotes_file, speech, speaker):
+    """The list a trigger may hold, which the config file writes the same way."""
+    _drawn(monkeypatch, last=True)
+
+    await _hear(
+        _tool(speaker, config=_adding({ADDED_MOVIE: {ADDED_TRIGGER: [QUOTE, ADDED_QUOTE]}})),
+        ADDED_TRIGGER,
+    )
+
+    assert speech.asked == [ADDED_QUOTE]
+
+
+@pytest.mark.parametrize(
+    "block",
+    (
+        pytest.param({ADDED_MOVIE: {ADDED_TRIGGER: ADDED_QUOTE, "": QUOTE}}, id="no trigger"),
+        pytest.param({ADDED_MOVIE: {ADDED_TRIGGER: ADDED_QUOTE, TRIGGER: ""}}, id="no line"),
+        pytest.param(
+            {ADDED_MOVIE: {ADDED_TRIGGER: ADDED_QUOTE, TRIGGER: "it is {tally}"}},
+            id="unfillable placeholder",
+        ),
+        pytest.param(
+            {ADDED_MOVIE: {ADDED_TRIGGER: ADDED_QUOTE}, MOVIE: "just a line"},
+            id="title holding no mapping",
+        ),
+        pytest.param(
+            {ADDED_MOVIE: {ADDED_TRIGGER: ADDED_QUOTE}, 1917: {TRIGGER: QUOTE}},
+            id="title yaml read as a number",
+        ),
+        pytest.param(
+            {ADDED_MOVIE: {ADDED_TRIGGER: ADDED_QUOTE, False: QUOTE}},
+            id="trigger yaml read as a boolean",
+        ),
+        pytest.param(
+            {ADDED_MOVIE: {ADDED_TRIGGER: ADDED_QUOTE, TRIGGER: 1917}},
+            id="line yaml read as a number",
+        ),
+        pytest.param(
+            {ADDED_MOVIE: {ADDED_TRIGGER: ADDED_QUOTE, TRIGGER: []}},
+            id="trigger listing no lines",
+        ),
+    ),
+)
+def test_one_unusable_addition_costs_that_addition(block):
+    """
+    A typo in one of five lines should cost that line, as it does in the file.
+
+    An unquoted `no` is a boolean and an unquoted `1917` is an integer by the
+    time this sees them, `config.yaml` having already been parsed — which is
+    what makes asking whether a value is text the same refusal the file loader's
+    tag check makes.
+    """
+    assert set(_added(SERVER_ALIAS, block)) == {ADDED_TRIGGER}
+
+
+def test_an_addition_repeating_a_trigger_keeps_the_first():
+    """One trigger answers for one title here too, whatever the block says twice."""
+    added = _added(
+        SERVER_ALIAS, {ADDED_MOVIE: {ADDED_TRIGGER: ADDED_QUOTE}, MOVIE: {ADDED_TRIGGER: QUOTE}}
+    )
+
+    assert added[ADDED_TRIGGER][0].movie == ADDED_MOVIE
+
+
+def test_an_added_trigger_is_folded_for_matching():
+    assert set(_added(SERVER_ALIAS, {ADDED_MOVIE: {ADDED_TRIGGER.upper(): ADDED_QUOTE}})) == {
+        ADDED_TRIGGER
+    }
+
+
+@pytest.mark.parametrize("block", ("nonsense", [ADDED_MOVIE], 1917))
+def test_additions_that_are_not_a_mapping_of_titles_are_ignored(block):
+    """Reported and dropped rather than raised on: the server still has the whole file."""
+    assert _added(SERVER_ALIAS, block) == {}
+
+
+async def test_unusable_additions_leave_the_shipped_list_alone(
+    quotes_file, speech, speaker
+):
+    """A block a server did not have to write should not cost it the ones it did not."""
+    await _hear(_tool(speaker, config={ADDITIONAL_QUOTES_KEY: "nonsense"}), TRIGGER)
+
+    assert speech.asked == [QUOTE]
+
+
+def test_a_dropped_addition_says_which_server_and_where(caplog):
+    with caplog.at_level("WARNING"):
+        _added(SERVER_ALIAS, {ADDED_MOVIE: {ADDED_TRIGGER: "it is {tally}"}})
+
+    assert SERVER_ALIAS in caplog.text
+    assert ADDITIONAL_QUOTES_KEY in caplog.text
+    assert "placeholder" in caplog.text
 
 
 # ── detection ─────────────────────────────────────

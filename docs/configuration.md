@@ -116,10 +116,11 @@ quotes:
 | `announcement` | no | What the winner is told. `{user}`, `{credits}`, and `{remark}` |
 | `tie_announcement` | no | What anyone paid on a tie is told. The same placeholders |
 | `self_answer_announcement` | no | What somebody naming their own line is told. The same placeholders, where `{credits}` is what it cost |
+| `additional_quotes` | no | Quotes this server hears and the others do not, in the [quote file's](#the-quote-file) own shape. Merged over the deployment's list; see [what a server adds for itself](#what-a-server-adds-for-itself) |
 
 #### The quote file
 
-Everything else is per deployment. The lines come from a YAML file at `QUOTES_FILE` — a film, and under it the phrases that set its lines off — so adding a quote is a key rather than a deployment. The image ships the list in `resources/quotes.yaml`; mount your own over that path to say something it does not.
+Most of the list is per deployment. The lines come from a YAML file at `QUOTES_FILE` — a film, and under it the phrases that set its lines off — so adding a quote is a key rather than a deployment. The image ships the list in `resources/quotes.yaml`; mount your own over that path to say something it does not.
 
 ```yaml
 Firefly:
@@ -175,6 +176,33 @@ The file is read at startup and **reports rather than raises**. An entry with no
 | Titles non-decreasing, LF endings, trailing newline | So the file stays reviewable and two branches adding a line do not collide |
 
 It needs PyYAML and nothing else, which is what keeps it a few seconds on every pull request rather than an image build.
+
+#### What a server adds for itself {#what-a-server-adds-for-itself}
+
+A film everybody in one channel has seen is usually one everybody in the next has too, which is why the list is one file. An in-joke is not, and a server with one writes it under `additional_quotes`, in its own `config` block and in the file's own shape:
+
+```yaml
+quotes:
+  enabled: true
+  config:
+    answer_seconds: 5
+    additional_quotes:
+      Firefly:
+        cool: Shiny.
+        behave: I aim to misbehave.
+      "1917":
+        over the top: "Over the top, {user}!"
+```
+
+Everything the file can say, this can say: a trigger answering several ways lists its lines, a line naming whoever set it off writes `{user}`, and the two quoting rules above still bite — a title like `1917` and a line starting with `{user}` both need their quotes.
+
+**These are the same rules, applied per server.** A trigger appears once in one server's block, its lines are checked the same way, and an entry that fails is logged and dropped. What it does *not* do is stop the tool: the block is optional, and a server that gets it wrong still has the whole shipped list rather than nothing.
+
+**A trigger the shipped list already answers is answered by this server's line instead.** The deployment's file is what everybody agrees on rather than what they are held to, and a server that would rather `cool` earned something else should not have to pick a different phrase to say so. It is one server's decision and one server's alone; the next server on the same deployment hears the shipped line.
+
+**Titles merge.** The list is keyed on the trigger and carries the title beside each line, so `Firefly` written in both places is one film with everything either of them said under it — and a round asking where either line came from asks about the same title.
+
+**They are checked in CI like the file is.** `scripts/validate_quotes.py --config config.yaml` walks every server's block and applies the table above, so a broken addition fails a pull request rather than becoming a log line. Each block is checked on its own: a trigger a server shares with the shipped list is the override, not a collision.
 
 #### Matching and backoff
 
@@ -517,7 +545,7 @@ Only used by `verbal-morality`. What a fine is *worth* is the scoreboard's; thes
 
 ### settings.quotes {#settings-quotes}
 
-Only used by `quotes`. The triggers and the lines themselves are a YAML file at `QUOTES_FILE`.
+Only used by `quotes`. The triggers and the lines themselves are a YAML file at `QUOTES_FILE`, plus whatever a server [added for itself](#what-a-server-adds-for-itself).
 
 | Setting | Default | Purpose |
 |---|---|---|
@@ -640,7 +668,7 @@ Volumes multiply as knobs, so a tool asking for half of a deployment set to half
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `QUOTES_FILE` | `/app/src/miss_quote/resources/quotes.yaml` | The triggers and the lines they answer with, as a YAML mapping of title to trigger to line. One list per deployment; the image ships the one in `resources/`, and mounting a file over that path replaces it |
+| `QUOTES_FILE` | `/app/src/miss_quote/resources/quotes.yaml` | The triggers and the lines they answer with, as a YAML mapping of title to trigger to line. The deployment's list; the image ships the one in `resources/`, and mounting a file over that path replaces it. A server may add to it under [`additional_quotes`](#what-a-server-adds-for-itself) |
 
 ### Credits {#env-credits}
 
