@@ -70,6 +70,17 @@ class FinishedOnly(Tool):
         self.calls += 1
 
 
+class JoinOnly(Tool):
+    name = "join-only"
+
+    def __init__(self, context):
+        super().__init__(context)
+        self.joined = []
+
+    async def handle_joined(self, source) -> None:
+        self.joined.append(source)
+
+
 class Warming(Recorder):
     """A tool with something to prepare before it is asked for anything."""
 
@@ -168,6 +179,9 @@ class Exploding(Tool):
 
     async def handle_finished(self, transcript) -> None:
         raise RuntimeError("still no")
+
+    async def handle_joined(self, source) -> None:
+        raise RuntimeError("nor that")
 
     async def prewarm(self) -> None:
         raise RuntimeError("not even that")
@@ -277,15 +291,36 @@ def test_a_tool_handling_neither_moment_is_reported():
 
 
 def test_tools_are_sorted_by_the_moments_they_handle():
-    registry = {"utterance-only": UtteranceOnly, "finished-only": FinishedOnly}
+    registry = {
+        "utterance-only": UtteranceOnly,
+        "finished-only": FinishedOnly,
+        "join-only": JoinOnly,
+    }
     runner = ToolRunner(
-        _servers(first={"utterance-only": _enabled(), "finished-only": _enabled()}),
+        _servers(
+            first={
+                "utterance-only": _enabled(),
+                "finished-only": _enabled(),
+                "join-only": _enabled(),
+            }
+        ),
         registry,
     )
 
     assert [type(tool) for tool in runner._on_utterance[FIRST_SERVER]] == [UtteranceOnly]
     assert [type(tool) for tool in runner._on_finished[FIRST_SERVER]] == [FinishedOnly]
-    assert runner.describe() == {FIRST_ALIAS: ("finished-only", "utterance-only")}
+    assert [type(tool) for tool in runner._on_joined[FIRST_SERVER]] == [JoinOnly]
+    assert runner.describe() == {
+        FIRST_ALIAS: ("finished-only", "join-only", "utterance-only")
+    }
+
+
+def test_a_tool_that_only_hears_a_join_is_not_inert():
+    """Nothing is said and no transcript is read, and it is still a tool."""
+    runner = ToolRunner(_servers(first={"join-only": _enabled()}), {"join-only": JoinOnly})
+
+    assert runner.describe() == {FIRST_ALIAS: ("join-only",)}
+    assert runner.problems == []
 
 
 def test_a_tool_is_built_with_its_servers_roster():
@@ -341,6 +376,29 @@ async def test_a_finished_transcript_reaches_its_servers_tool(tmp_path):
     assert tool.transcripts == [transcript]
 
 
+async def test_a_join_reaches_its_servers_tool():
+    runner = ToolRunner(_servers(first={"join-only": _enabled()}), {"join-only": JoinOnly})
+    tool = _only_tool(runner, FIRST_SERVER, "_on_joined")
+
+    await runner.dispatch_joined(FIRST_SOURCE)
+
+    assert tool.joined == [FIRST_SOURCE]
+
+
+async def test_one_servers_tool_never_hears_anothers_join():
+    runner = ToolRunner(
+        _servers(first={"join-only": _enabled()}, second={"join-only": _enabled()}),
+        {"join-only": JoinOnly},
+    )
+    first = _only_tool(runner, FIRST_SERVER, "_on_joined")
+    second = _only_tool(runner, SECOND_SERVER, "_on_joined")
+
+    await runner.dispatch_joined(SECOND_SOURCE)
+
+    assert first.joined == []
+    assert second.joined == [SECOND_SOURCE]
+
+
 async def test_one_servers_tool_never_sees_anothers_transcript(tmp_path):
     runner = ToolRunner(
         _servers(first={TOOL_NAME: _enabled()}, second={TOOL_NAME: _enabled()}),
@@ -362,6 +420,7 @@ async def test_a_server_with_no_tools_dispatches_nothing(tmp_path):
 
     await runner.dispatch_utterance(FakeSession(FIRST_SOURCE), _utterance())
     await runner.dispatch_finished(_transcript(FIRST_SOURCE, tmp_path / "s.jsonl"))
+    await runner.dispatch_joined(FIRST_SOURCE)
 
 
 # ── pre-warming ───────────────────────────────────
@@ -468,6 +527,23 @@ async def test_a_raising_tool_does_not_stop_the_others(tmp_path, caplog):
 
     assert [utterance.text for utterance in recorder.utterances] == ["survives"]
     assert len(recorder.transcripts) == 1
+
+
+async def test_a_raising_join_handler_does_not_stop_the_others(caplog):
+    """A join reaches a channel; one tool failing to write on it is its own affair."""
+    registry = {"join-only": JoinOnly, OTHER_TOOL_NAME: Exploding}
+    runner = ToolRunner(
+        _servers(first={OTHER_TOOL_NAME: _enabled(), "join-only": _enabled()}), registry
+    )
+    joiner = next(
+        tool for tool in runner._on_joined[FIRST_SERVER] if isinstance(tool, JoinOnly)
+    )
+
+    with caplog.at_level("ERROR"):
+        await runner.dispatch_joined(FIRST_SOURCE)
+
+    assert joiner.joined == [FIRST_SOURCE]
+    assert any("exploding" in record.message.lower() for record in caplog.records)
 
 
 async def test_a_raising_tool_is_logged(caplog):

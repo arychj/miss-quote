@@ -32,6 +32,12 @@ changed four times between two ticks costs one write and one edit. Somebody
 swearing four times in a sentence is one revision bump per utterance and a topic
 that is only ever set when it would say something new.
 
+The exception is joining a channel, which publishes whether or not the tally
+moved. A revision says whether the board has changed; it says nothing about
+whether the channel now reading it has ever been shown one. Without that, a bot
+that walks into a fresh channel sits there under a blank line until somebody
+happens to swear.
+
 Saving happens first on every tick regardless. An edit that lands in a rate-limit
 bucket can hold this task while discord.py sleeps it out, and what that must not
 delay is the persistence: a pod terminated while an edit is waiting should still
@@ -46,6 +52,7 @@ import time
 from miss_quote.config import scoreboard_cfg
 from miss_quote.ledger.credits import UNWRITTEN, shared_ledger
 from miss_quote.tools.base import Tool, ToolContext
+from miss_quote.transcript.writer import Source
 from miss_quote.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -103,6 +110,26 @@ class Scoreboard(Tool):
     def standings(self) -> str:
         """The board as it would be published, for anything that wants to say it."""
         return self._ledger.topic(self.server)
+
+    # ── the moment ────────────────────────────────
+
+    async def handle_joined(self, source: Source) -> None:
+        """
+        Put the board up under whatever channel the bot has just taken up.
+
+        Forgetting what was last published rather than publishing around the
+        check, so `publish` stays the one gate every write goes through and keeps
+        the two refusals it already makes — an empty board is still not published
+        over somebody's own status, and a line the channel would not take is
+        still left owed rather than marked done.
+
+        The interval is not disturbed. The publish this causes brings the
+        watermark up to the current revision, so the next tick finds nothing new
+        and the cadence carries on from wherever it was.
+        """
+        self._published = UNWRITTEN
+
+        await self.publish()
 
     # ── the loop ──────────────────────────────────
 

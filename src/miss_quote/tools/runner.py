@@ -28,6 +28,7 @@ from miss_quote.tools.base import (
     Announcer,
     Closer,
     FinishedHandler,
+    JoinHandler,
     Service,
     SilentAnnouncer,
     SilentSpeaker,
@@ -42,13 +43,14 @@ from miss_quote.tools.base import (
     cycles,
 )
 from miss_quote.tools.registry import TOOLS
-from miss_quote.transcript.writer import Transcript, TranscriptSession, Utterance
+from miss_quote.transcript.writer import Source, Transcript, TranscriptSession, Utterance
 from miss_quote.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 UTTERANCE_MOMENT = "an utterance"
 FINISHED_MOMENT = "a finished transcript"
+JOINED_MOMENT = "a channel joined"
 PREWARM_MOMENT = "a pre-warm"
 SERVICE_MOMENT = "a run of its own"
 CLOSE_MOMENT = "a shutdown"
@@ -75,6 +77,7 @@ class ToolRunner:
         self._announcer = SilentAnnouncer() if announcer is None else announcer
         self._on_utterance: dict[int, list[Tool]] = {}
         self._on_finished: dict[int, list[Tool]] = {}
+        self._on_joined: dict[int, list[Tool]] = {}
         self._warming: list[Tool] = []
         self._serving: list[Tool] = []
         self._closing: list[Tool] = []
@@ -202,6 +205,10 @@ class ToolRunner:
 
         if isinstance(tool, FinishedHandler):
             self._on_finished.setdefault(server_id, []).append(tool)
+            handled = True
+
+        if isinstance(tool, JoinHandler):
+            self._on_joined.setdefault(server_id, []).append(tool)
             handled = True
 
         if isinstance(tool, Service):
@@ -363,6 +370,13 @@ class ToolRunner:
             self._on_finished.get(transcript.source.guild_id),
             lambda tool: tool.handle_finished(transcript),
             FINISHED_MOMENT,
+        )
+
+    async def dispatch_joined(self, source: Source) -> None:
+        await self._run(
+            self._on_joined.get(source.guild_id),
+            lambda tool: tool.handle_joined(source),
+            JOINED_MOMENT,
         )
 
     @staticmethod
