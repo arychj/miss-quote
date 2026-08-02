@@ -1,0 +1,9 @@
+# Only for previewing the site locally. GitHub Pages builds it from docs/ with
+# its own pinned dependency set, so nothing here is what production runs.
+#
+#   cd docs && bundle install && bundle exec jekyll serve
+
+source "https://rubygems.org"
+
+gem "github-pages", group: :jekyll_plugins
+gem "webrick", "~> 1.8"

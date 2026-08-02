@@ -1,0 +1,175 @@
+---
+layout: home
+title: miss-quote
+description: A Discord bot that transcribes voice channels to per-session, per-speaker transcripts, summarizes them, and answers the room out loud.
+---
+
+<section class="hero wrap">
+  <img class="hero-logo" src="{{ '/assets/img/miss-quote.png' | relative_url }}" alt="miss-quote" width="168" height="168">
+
+  <h1>miss<span class="dash">-</span><span class="gradient">quote</span></h1>
+
+  <p class="hero-tagline">
+    Transcribes Discord voice channels to a per-session, per-speaker transcript,
+    hands the result to tools, and answers the room out loud.
+  </p>
+
+  <div class="hero-actions">
+    <a class="btn btn-primary" href="{{ '/installation/' | relative_url }}">Get started →</a>
+    <a class="btn" href="{{ '/about/' | relative_url }}">How it works</a>
+    <a class="btn" href="{{ site.github_url }}">GitHub</a>
+  </div>
+
+  <div class="hero-badges">
+    <span class="pill">Python 3.12</span>
+    <span class="pill p2">discord.py 2.4+</span>
+    <span class="pill p3">Wyoming ASR + TTS</span>
+    <span class="pill">Silero VAD</span>
+    <span class="pill p2">CPU-only container</span>
+  </div>
+</section>
+
+<section class="section section-alt">
+  <div class="wrap">
+    <div class="section-head">
+      <p class="eyebrow">The shape of it</p>
+      <h2>Four things, in order</h2>
+      <p>Audio handling is local and serial. Transcription is remote and parallel. Everything downstream is a tool that reads the stream.</p>
+    </div>
+
+    <div class="flow">
+      <div class="flow-step">
+        <h3>Listen</h3>
+        <p>Discord voice arrives as 48&nbsp;kHz frames. <code>soxr</code> resamples and Silero VAD decides which of them are speech.</p>
+      </div>
+      <div class="flow-step">
+        <h3>Transcribe</h3>
+        <p>Each utterance is one connection to a Wyoming ASR server, dispatched at the speech-to-silence edge and bounded by a semaphore.</p>
+      </div>
+      <div class="flow-step">
+        <h3>Write down</h3>
+        <p>One JSONL file per session, per speaker, per channel — appended and flushed as produced, on a schedule you set.</p>
+      </div>
+      <div class="flow-step">
+        <h3>Answer</h3>
+        <p>Tools read the stream and reply through a Wyoming synthesizer, in the channel it was said in.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="wrap">
+    <div class="section-head">
+      <p class="eyebrow">Tools</p>
+      <h2>What it does with what it heard</h2>
+      <p>A tool reads a server's transcripts and does something with them. Each is opted into per server, and each one absent is reported at startup rather than left to be noticed.</p>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h3><span class="card-icon">🎬</span> quotes</h3>
+        <p>Answers the channel with the film line it just walked into — and then asks where it came from. Name the title in time and you are paid a credit.</p>
+        <a class="card-link" href="{{ '/configuration/#quotes' | relative_url }}">Configure quotes →</a>
+      </div>
+
+      <div class="card">
+        <h3><span class="card-icon">📝</span> summary</h3>
+        <p>Turns a sealed session into an account of it, posts it to a text channel, and reads it back out loud when somebody asks what happened last time.</p>
+        <a class="card-link" href="{{ '/configuration/#summary' | relative_url }}">Configure summary →</a>
+      </div>
+
+      <div class="card">
+        <h3><span class="card-icon">📊</span> scoreboard</h3>
+        <p>Keeps a running balance per person, writes it to disk, and publishes the standings under the name of whatever voice channel the bot is in.</p>
+        <a class="card-link" href="{{ '/configuration/#scoreboard' | relative_url }}">Configure scoreboard →</a>
+      </div>
+
+      <div class="card">
+        <h3><span class="card-icon">🔊</span> tts</h3>
+        <p>The only thing that plays anything. Owns the rendered-speech cache, the chime library, the volume, and the voice connection.</p>
+        <a class="card-link" href="{{ '/configuration/#tts-tool' | relative_url }}">Configure tts →</a>
+      </div>
+
+      <div class="card">
+        <h3><span class="card-icon">🚨</span> verbal-morality</h3>
+        <p>The Verbal Morality Bot, after <em>Demolition Man</em>. Fines a speaker out loud for the wrong word, and hands the fine to the scoreboard.</p>
+        <a class="card-link" href="{{ '/configuration/#verbal-morality' | relative_url }}">Configure verbal-morality →</a>
+      </div>
+
+      <div class="card">
+        <h3><span class="card-icon">🧩</span> Write your own</h3>
+        <p>Three moments — an utterance, a sealed session, and a loop of its own. Declare what you need, reach your neighbours by class, and register the name.</p>
+        <a class="card-link" href="{{ '/about/#writing-a-tool' | relative_url }}">The tool contract →</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section section-alt">
+  <div class="wrap">
+    <div class="section-head">
+      <p class="eyebrow">Cost</p>
+      <h2>The GPU is somebody else's</h2>
+      <p>Transcription and synthesis are network calls, so this container carries no model weights and needs no GPU of its own. That moves the requirement rather than removing it — nothing works without a reachable ASR server — but the process that sits in a voice channel all evening is cheap, schedules anywhere, and shares the expensive hardware with whatever else wants it.</p>
+    </div>
+
+    <div class="stats">
+      <div class="stat">
+        <span class="stat-value">~4.9 ms</span>
+        <span class="stat-label">CPU per speaker per second of audio — about 0.5% of one core</span>
+      </div>
+      <div class="stat">
+        <span class="stat-value">~70 ms</span>
+        <span class="stat-label">Round trip for a single utterance against a GPU-backed ASR</span>
+      </div>
+      <div class="stat">
+        <span class="stat-value">0.85 ms</span>
+        <span class="stat-label">To play a cached three-second phrase, against a 20 ms Discord frame</span>
+      </div>
+      <div class="stat">
+        <span class="stat-value">1 process</span>
+        <span class="stat-label">One event loop, one replica, no multiprocessing layer</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="wrap">
+    <div class="section-head">
+      <p class="eyebrow">Quick start</p>
+      <h2>Point it at a token and two servers</h2>
+      <p>Everything a deployment <em>points at</em> is an environment variable. Everything about how it <em>behaves</em> is <code>config.yaml</code>.</p>
+    </div>
+
+    <div class="terminal">
+      <div class="terminal-bar"><i></i><i></i><i></i><span>docker run</span></div>
+<pre><span class="c"># The token, the ASR, and the file that says which servers to join.</span>
+docker run <span class="k">-d</span> <span class="k">--name</span> miss-quote \
+  <span class="k">-e</span> <span class="s">DISCORD_TOKEN=...</span> \
+  <span class="k">-e</span> <span class="s">WYOMING_HOST=asr.internal</span> \
+  <span class="k">-e</span> <span class="s">TTS_HOST=tts.internal</span> \
+  <span class="k">-v</span> <span class="s">./config.yaml:/config/config.yaml:ro</span> \
+  <span class="k">-v</span> <span class="s">miss-quote-transcripts:/transcripts</span> \
+  <span class="k">-v</span> <span class="s">miss-quote-speech:/speech</span> \
+  ghcr.io/beer-wars/miss-quote:latest</pre>
+    </div>
+
+    <p style="text-align:center;margin-top:26px;">
+      <a class="btn" href="{{ '/installation/' | relative_url }}">Full installation guide →</a>
+    </p>
+  </div>
+</section>
+
+<section class="cta wrap">
+  <p class="eyebrow">Read on</p>
+  <h2>Everything else is documented</h2>
+  <p>How the pipeline is split, what a transcript looks like on disk, every setting in the file, and every variable a deployment points at.</p>
+
+  <div class="hero-actions">
+    <a class="btn btn-primary" href="{{ '/configuration/' | relative_url }}">Configuration reference</a>
+    <a class="btn" href="{{ '/about/' | relative_url }}">About</a>
+    <a class="btn" href="{{ '/installation/' | relative_url }}">Installation</a>
+  </div>
+</section>

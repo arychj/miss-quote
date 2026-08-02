@@ -13,4 +13,11 @@ venv/
 
 design/
 
+# The docs site is built by GitHub Pages from docs/; the Gemfile there is for a
+# local preview only, so its lock is nobody else's business.
+docs/_site/
+docs/.jekyll-cache/
+docs/.jekyll-metadata
+docs/Gemfile.lock
+
 *.log

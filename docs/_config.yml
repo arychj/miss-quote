@@ -1,0 +1,55 @@
+title: miss-quote
+tagline: Discord voice, written down and answered back
+description: >-
+  A Discord bot that transcribes voice channels to per-session, per-speaker
+  transcripts, summarizes them, and answers the room out loud.
+
+url: https://miss-quote.wars.beer
+baseurl: ""
+
+repository: beer-wars/miss-quote
+github_url: https://github.com/beer-wars/miss-quote
+
+# Pages land as about/index.html rather than about.html, so every link in the
+# site is a directory URL and the nav's page.url comparison matches.
+permalink: pretty
+
+markdown: kramdown
+highlighter: rouge
+
+kramdown:
+  input: GFM
+  syntax_highlighter: rouge
+  syntax_highlighter_opts:
+    block:
+      line_numbers: false
+
+plugins:
+  - jekyll-seo-tag
+  - jekyll-sitemap
+
+# The order pages appear in the header and in the footer.
+nav:
+  - title: Home
+    url: /
+  - title: About
+    url: /about/
+  - title: Installation
+    url: /installation/
+  - title: Configuration
+    url: /configuration/
+
+defaults:
+  - scope:
+      path: ""
+    values:
+      layout: page
+
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - vendor
+  - README.md
+
+sass:
+  style: compressed

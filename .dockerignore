@@ -14,6 +14,7 @@ venv/
 
 assets/
 design/
+docs/
 pyproject.toml
 setup.cfg
 
