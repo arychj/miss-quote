@@ -5,7 +5,11 @@
 # miss-quote
 
 <p align="center">
-  <strong>📖 Full documentation: <a href="https://miss-quote.wars.beer">miss-quote.wars.beer</a></strong>
+  <strong>A Discord bot that sits in a voice channel, writes down what everybody said, and then makes something of it.</strong>
+</p>
+
+<p align="center">
+  📖 Full documentation: <a href="https://miss-quote.wars.beer">miss-quote.wars.beer</a>
 </p>
 
 ![Python](https://img.shields.io/badge/Python-3.12-blue?style=for-the-badge&logo=python&logoColor=white)
@@ -13,7 +17,11 @@
 ![Wyoming](https://img.shields.io/badge/Wyoming-ASR-success?style=for-the-badge)
 ![Silero VAD](https://img.shields.io/badge/Silero%20VAD-ONNX-orange?style=for-the-badge)
 
-> Transcribes Discord voice channels to a per-session, per-speaker JSONL transcript, and hands the result to tools.
+**Every visit to a voice channel is transcribed to its own file, one line per utterance, labelled with who said it.** The evening ends up on the record instead of in everybody's half-memory of it.
+
+**Then it will tell you what happened.** Ask the bot the next day and it reads the last session back out loud, by default as a bard recounting the room its own evening. That is the part it was built for: nobody wants to take notes during a D&D session, and nobody remembers the innkeeper's name a week later.
+
+**The rest is shenanigans.** Walk into a film line and it says the line out loud, then asks the room where it came from and pays whoever gets it first. Swear and it fines you, out loud, *Demolition Man* style. It keeps a running tally of who owes what and publishes the standings under the voice channel's name.
 
 Transcription is delegated to a [Wyoming](https://github.com/rhasspy/wyoming) ASR server rather than run in-process, so **this container** is a CPU-only workload with no model weights and no cache volume for them. That moves the GPU rather than removing it: the bot does nothing at all without a reachable ASR server, and in practice that server wants one. What it buys is a bot that schedules anywhere and a GPU that several things can share.
 
