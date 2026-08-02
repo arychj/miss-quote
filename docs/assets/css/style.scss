@@ -801,16 +801,18 @@ figure.highlight {
 .prose .warn > :last-child,
 .prose .tip  > :last-child { margin-bottom: 0; }
 
-/* A pair of adjacent links at the bottom of a doc page. */
-.next-steps {
+/* Previous/next pager at the bottom of a doc page. The columns are fixed rather
+   than auto-fit so a page with only one neighbour leaves the other side empty
+   and the card stays on the side its arrow points to. */
+.page-nav {
   display: grid;
   gap: 14px;
-  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   margin-top: 56px;
   padding-top: 32px;
   border-top: 1px solid var(--line);
 }
-.next-steps a {
+.page-nav a {
   display: block;
   padding: 18px 20px;
   border-radius: var(--radius);
@@ -818,9 +820,23 @@ figure.highlight {
   background: var(--surface);
   transition: border-color 0.15s ease, transform 0.15s ease;
 }
-.next-steps a:hover { border-color: var(--accent); transform: translateY(-2px); }
-.next-steps strong { display: block; color: var(--text-strong); margin-bottom: 3px; }
-.next-steps span { color: var(--muted); font-size: 0.88rem; }
+.page-nav a:hover { border-color: var(--accent); transform: translateY(-2px); }
+.page-nav strong { display: block; color: var(--text-strong); margin-bottom: 3px; }
+.page-nav-blurb { color: var(--muted); font-size: 0.88rem; }
+.page-nav-label {
+  display: block;
+  margin-bottom: 8px;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+.page-nav-next {
+  grid-column: 2;
+  text-align: right;
+}
 
 /* Mermaid, rendered client-side. */
 .mermaid-wrap {
@@ -916,6 +932,9 @@ figure.highlight {
   /* Three footer children spread by space-between read as debris once they
      wrap; stack them instead. */
   .footer-inner { flex-direction: column; align-items: flex-start; gap: 20px; }
+
+  .page-nav { grid-template-columns: minmax(0, 1fr); }
+  .page-nav-next { grid-column: 1; text-align: left; }
 }
 
 @media (prefers-reduced-motion: reduce) {
