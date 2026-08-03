@@ -26,6 +26,7 @@ from miss_quote.tools.scoreboard import Scoreboard
 from miss_quote.tools.tts import Tts
 from miss_quote.tools.verbal_morality import (
     DEFAULT_ANNOUNCEMENT,
+    DEFAULT_RECALL_ANNOUNCEMENT,
     DEFAULT_REPEAT_ANNOUNCEMENT,
     REPEATED_FINE,
     RecentViolations,
@@ -54,6 +55,10 @@ QUIETEST = 0.25
 BACKOFF_STEP = morality_cfg.backoff_step
 BACKOFF_WINDOW = morality_cfg.backoff_seconds
 REPEAT_WINDOW = morality_cfg.repeat_seconds
+RECALL_WINDOW = morality_cfg.recall_seconds
+
+# How somebody asks what they were just fined for.
+ASKING = "What did I say?"
 
 # Announcements the pre-warm renders per speaker: one violation, two, and three,
 # each in both the first-fine and the repeat wording.
@@ -896,6 +901,247 @@ def test_a_repeat_window_of_zero_turns_the_second_wording_off():
     recent.record(SPEAKER_ID, 1, now=now)
 
     assert not recent.repeating(SPEAKER_ID, 0.0, now=now)
+
+
+# ── what was that ─────────────────────────────────
+
+
+def _aged(tool: VerbalMorality, seconds: float, user_id: int = SPEAKER_ID) -> None:
+    """
+    Push a speaker's fine back in time, so a window can be walked past without
+    waiting for one.
+
+    The stored moment is monotonic, so this moves it rather than the clock:
+    a test that slept for the real window would be a test of `asyncio.sleep`.
+    """
+    word, when = tool._fined[user_id]
+    tool._fined[user_id] = (word, when - seconds)
+
+
+def _recalling(monkeypatch, seconds: float) -> None:
+    """How long the deployment gives somebody to ask what they said."""
+    monkeypatch.setattr(
+        verbal_morality, "morality_cfg", replace(morality_cfg, recall_seconds=seconds)
+    )
+
+
+async def test_asking_what_they_said_is_answered_with_the_word(speech, speaker):
+    """The announcement names the fine and never the word, which is the gap."""
+    tool = _tool(speaker)
+
+    await _hear(tool, FORBIDDEN)
+    await _hear(tool, ASKING)
+
+    assert speech.asked[1] == f"{SPEAKER}, you said {FORBIDDEN}."
+
+
+async def test_the_answer_is_the_last_word_of_several(speech, speaker):
+    tool = _tool(speaker)
+
+    await _hear(tool, f"{FORBIDDEN} and {ALSO_FORBIDDEN}")
+    await _hear(tool, ASKING)
+
+    assert f"you said {ALSO_FORBIDDEN}." in speech.asked[1]
+
+
+async def test_asking_outside_the_window_says_nothing(speech, speaker):
+    """Past it the question is somebody talking to the room."""
+    tool = _tool(speaker)
+    await _hear(tool, FORBIDDEN)
+    _aged(tool, RECALL_WINDOW + 1)
+
+    await _hear(tool, ASKING)
+
+    assert len(speaker.played) == 1
+
+
+async def test_asking_inside_the_window_is_still_answered(speech, speaker):
+    tool = _tool(speaker)
+    await _hear(tool, FORBIDDEN)
+    _aged(tool, RECALL_WINDOW - 1)
+
+    await _hear(tool, ASKING)
+
+    assert len(speaker.played) == 2
+
+
+async def test_asking_without_ever_being_fined_says_nothing(speech, speaker):
+    await _hear(_tool(speaker), ASKING)
+
+    assert speaker.played == []
+
+
+async def test_the_answer_is_the_askers_own_fine(speech, speaker):
+    """Somebody else's word is not an answer to what *you* said."""
+    tool = _tool(speaker)
+    await _hear(tool, FORBIDDEN)
+
+    await _hear(tool, ASKING, user=OTHER_SPEAKER, user_id=OTHER_SPEAKER_ID)
+
+    assert len(speaker.played) == 1
+
+
+async def test_each_speaker_is_answered_with_their_own_word(speech, speaker):
+    tool = _tool(speaker)
+    await _hear(tool, FORBIDDEN)
+    await _hear(tool, ALSO_FORBIDDEN, user=OTHER_SPEAKER, user_id=OTHER_SPEAKER_ID)
+
+    await _hear(tool, ASKING, user=OTHER_SPEAKER, user_id=OTHER_SPEAKER_ID)
+
+    assert speech.asked[-1] == f"{OTHER_SPEAKER}, you said {ALSO_FORBIDDEN}."
+
+
+async def test_a_fine_that_went_unannounced_can_still_be_asked_about(speech):
+    """Which is the case the question exists for: nobody heard the fine."""
+    tool, blocking, playing = await _mid_announcement(speech)
+    await _hear(tool, ALSO_FORBIDDEN, user=OTHER_SPEAKER, user_id=OTHER_SPEAKER_ID)
+    blocking.finish.set()
+    await playing
+
+    await _hear(tool, ASKING, user=OTHER_SPEAKER, user_id=OTHER_SPEAKER_ID)
+
+    assert speech.asked[-1] == f"{OTHER_SPEAKER}, you said {ALSO_FORBIDDEN}."
+
+
+async def test_asking_during_an_announcement_is_not_answered(speech):
+    """Queued behind a fine, the answer arrives after the channel has moved on."""
+    tool, blocking, playing = await _mid_announcement(speech)
+    await _hear(tool, ALSO_FORBIDDEN, user=OTHER_SPEAKER, user_id=OTHER_SPEAKER_ID)
+
+    await _hear(tool, ASKING, user=OTHER_SPEAKER, user_id=OTHER_SPEAKER_ID)
+
+    blocking.finish.set()
+    await playing
+    assert len(blocking.played) == 1
+
+
+async def test_an_utterance_that_asks_and_offends_is_fined_and_not_answered(
+    speech, speaker
+):
+    """Two clips over each other for one sentence, and the fine is the one to hear."""
+    tool = _tool(speaker)
+    await _hear(tool, FORBIDDEN)
+
+    await _hear(tool, f"{ASKING} {ALSO_FORBIDDEN}")
+
+    assert "you are also fined" in speech.asked[1]
+    assert len(speaker.played) == 2
+
+
+async def test_the_answer_carries_no_chime(speech, speaker, chime):
+    """A chime is for an interruption; this answers a question just asked."""
+    tool = _tool(speaker, {"words": WORDS, "chime": chime})
+    await _hear(tool, FORBIDDEN)
+
+    await _hear(tool, ASKING)
+
+    _, spoken = speaker.played[1]
+    assert spoken == speech.asked[1]
+
+
+async def test_the_answer_is_not_quietened_by_the_backoff(speech, speaker):
+    """The speaker most likely to need it is the one who has earned the most."""
+    tool = _tool(speaker)
+    await _hear(tool, FORBIDDEN)
+    await _hear(tool, FORBIDDEN)
+
+    await _hear(tool, ASKING)
+
+    assert speaker.scales[-1] == UNITY_VOLUME
+
+
+async def test_the_question_can_be_asked_the_other_way_round(speech, speaker):
+    tool = _tool(speaker)
+    await _hear(tool, FORBIDDEN)
+
+    await _hear(tool, "Hang on, what did I just say?")
+
+    assert f"you said {FORBIDDEN}." in speech.asked[1]
+
+
+async def test_punctuation_does_not_hide_the_question(speech, speaker):
+    tool = _tool(speaker)
+    await _hear(tool, FORBIDDEN)
+
+    await _hear(tool, "What did I say?!")
+
+    assert len(speaker.played) == 2
+
+
+async def test_the_triggers_can_be_replaced(speech, speaker):
+    """A vocabulary rather than a list to add to: the old wording stops working."""
+    tool = _tool(speaker, {"words": WORDS, "recall_triggers": "come again"})
+    await _hear(tool, FORBIDDEN)
+
+    await _hear(tool, ASKING)
+    await _hear(tool, "Come again?")
+
+    assert len(speaker.played) == 2
+
+
+async def test_a_lone_trigger_need_not_be_a_list(speech, speaker):
+    tool = _tool(speaker, {"words": WORDS, "recall_triggers": "come again"})
+
+    assert tool._recall_triggers.search("come again")
+
+
+def test_triggers_with_nothing_in_them_will_not_start(speech, speaker):
+    with pytest.raises(ValueError, match="recall_triggers"):
+        _tool(speaker, {"words": WORDS, "recall_triggers": ["  "]})
+
+
+async def test_the_answer_can_be_overridden(speech, speaker):
+    tool = _tool(
+        speaker,
+        {"words": WORDS, "recall_announcement": "{user} said {word}, obviously."},
+    )
+    await _hear(tool, FORBIDDEN)
+
+    await _hear(tool, ASKING)
+
+    assert speech.asked[1] == f"{SPEAKER} said {FORBIDDEN}, obviously."
+
+
+def test_an_answer_with_an_unfillable_placeholder_will_not_start(speech, speaker):
+    with pytest.raises(ValueError, match="recall_announcement"):
+        _tool(speaker, {"words": WORDS, "recall_announcement": "{user} said {credits}"})
+
+
+def test_the_answer_is_optional(speech, speaker):
+    assert _tool(speaker)._recall_announcement == DEFAULT_RECALL_ANNOUNCEMENT
+
+
+async def test_a_recall_window_of_zero_never_answers(speech, speaker, monkeypatch):
+    _recalling(monkeypatch, 0.0)
+    tool = _tool(speaker)
+    await _hear(tool, FORBIDDEN)
+
+    await _hear(tool, ASKING)
+
+    assert len(speaker.played) == 1
+
+
+async def test_a_longer_window_answers_for_longer(speech, speaker, monkeypatch):
+    _recalling(monkeypatch, RECALL_WINDOW * 2)
+    tool = _tool(speaker)
+    await _hear(tool, FORBIDDEN)
+    _aged(tool, RECALL_WINDOW + 1)
+
+    await _hear(tool, ASKING)
+
+    assert len(speaker.played) == 2
+
+
+async def test_the_answer_is_not_rendered_in_advance(speech, speaker):
+    """
+    The roster against every form of every word is a start-up nobody wants.
+
+    The pre-warm covers the fines and stops there, so what is queued is what it
+    always was.
+    """
+    await _render(_tool(speaker, {"words": WORDS}, users=ROSTER))
+
+    assert len(speech.warmed) == len(ROSTER) * WARMED_PER_SPEAKER
 
 
 # ── the busy channel ──────────────────────────────

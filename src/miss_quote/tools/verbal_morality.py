@@ -30,6 +30,12 @@ A speaker fined again within `settings.fines.repeat_seconds` gets the second
 wording — "you are also fined" — because reading the whole sentence out again
 sounds like a bot that has lost track of what it just said.
 
+The announcement names the fine and never the word, so somebody who missed it
+can ask: "what did I say" inside `settings.fines.recall_seconds` is answered with
+whatever they were last fined for. The window is the whole gate, which is what
+keeps a phrase that common from being one the tool is always answering — outside
+it the question is somebody talking to the room. See `_recall`.
+
 What the server writes down are stems. Each is expanded at startup into the
 endings it is said with, so a list stays a list of words rather than a list of
 conjugations; `utils.stems` does the growing.
@@ -47,7 +53,7 @@ from __future__ import annotations
 
 import re
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from miss_quote.config import (
@@ -61,6 +67,7 @@ from miss_quote.tools.scoreboard import Scoreboard
 from miss_quote.tools.tts import Tts
 from miss_quote.transcript.writer import TranscriptSession, Utterance
 from miss_quote.utils.logging import get_logger
+from miss_quote.utils.phrases import normalized, pattern, spoken
 from miss_quote.utils.stems import expand, plural
 
 logger = get_logger(__name__)
@@ -68,6 +75,8 @@ logger = get_logger(__name__)
 WORDS_KEY = "words"
 ANNOUNCEMENT_KEY = "announcement"
 REPEAT_ANNOUNCEMENT_KEY = "repeat_announcement"
+RECALL_TRIGGERS_KEY = "recall_triggers"
+RECALL_ANNOUNCEMENT_KEY = "recall_announcement"
 CHIME_KEY = "chime"
 
 # The defaults live here rather than in the config file so a server electing
@@ -84,6 +93,19 @@ DEFAULT_REPEAT_ANNOUNCEMENT = (
     "verbal morality statute."
 )
 
+# How somebody asks what they were just fined for. Several spellings because a
+# transcriber writes down what it heard rather than what was meant, and because
+# the question is asked both ways round.
+DEFAULT_RECALL_TRIGGERS = (
+    "what did i say",
+    "what did i just say",
+    "what was that",
+)
+
+# What they are told. Just the word: they heard the fine, and what they are
+# missing is the one part of it the announcement never says.
+DEFAULT_RECALL_ANNOUNCEMENT = "{user}, you said {word}."
+
 # Which of the two wordings a fine gets, named so neither the pre-warm nor a
 # call reads as a bare boolean.
 FIRST_FINE = False
@@ -92,9 +114,13 @@ REPEATED_FINE = True
 # A repeat window of this or less turns the second wording off entirely.
 NEVER_REPEATS = 0.0
 
+# A recall window of this or less never answers the question.
+NEVER_RECALLS = 0.0
+
 USER_FIELD = "user"
 CREDITS_FIELD = "credits"
 VIOLATIONS_FIELD = "violations"
+WORD_FIELD = "word"
 
 FIELD_SEPARATOR = ", "
 
@@ -122,6 +148,9 @@ OFFENCE_SEPARATOR = ", "
 # Stands in for a speaker while the announcement is checked at startup; the fine
 # and the violation it probes with are the real wording for a single offence.
 PROBE_NAME = "someone"
+
+# And for the word, where the real one is whatever the server objects to.
+PROBE_WORD = "something"
 
 
 class RecentViolations:
@@ -236,14 +265,30 @@ class VerbalMorality(Tool):
         self._vocabulary = _vocabulary(config.get(WORDS_KEY))
         self._forbidden = _pattern(self._vocabulary)
         self._announcement = _checked(
-            ANNOUNCEMENT_KEY, config.get(ANNOUNCEMENT_KEY) or DEFAULT_ANNOUNCEMENT
+            ANNOUNCEMENT_KEY,
+            config.get(ANNOUNCEMENT_KEY) or DEFAULT_ANNOUNCEMENT,
+            _fine_fields(),
         )
         self._repeat_announcement = _checked(
             REPEAT_ANNOUNCEMENT_KEY,
             config.get(REPEAT_ANNOUNCEMENT_KEY) or DEFAULT_REPEAT_ANNOUNCEMENT,
+            _fine_fields(),
+        )
+        self._recall_announcement = _checked(
+            RECALL_ANNOUNCEMENT_KEY,
+            config.get(RECALL_ANNOUNCEMENT_KEY) or DEFAULT_RECALL_ANNOUNCEMENT,
+            _recall_fields(),
+        )
+        self._recall_triggers = pattern(
+            spoken(
+                RECALL_TRIGGERS_KEY,
+                config.get(RECALL_TRIGGERS_KEY),
+                DEFAULT_RECALL_TRIGGERS,
+            )
         )
         self._chime = _named(config.get(CHIME_KEY))
         self._recent = RecentViolations()
+        self._fined: dict[int, tuple[str, float]] = {}
         self._announcing = False
 
         logger.debug(
@@ -343,14 +388,25 @@ class VerbalMorality(Tool):
         full volume and in the first wording. The tally is charged whether or not
         anything is said: what somebody owes is not a function of how loudly, or
         whether, they were told about it.
+
+        An utterance with nothing to fine in it is where the recall is looked
+        for, so a sentence that both asks and offends is fined and nothing else.
+        Answering it as well would mean two clips over the top of each other for
+        one thing somebody said, and the fine is the one they have to be told.
         """
         offences = self._forbidden.findall(utterance.text)
         if not offences:
+            await self._recall(utterance, session)
             return
 
         scale = self._recent.scale(utterance.user_id)
         repeat = self._recent.repeating(utterance.user_id, morality_cfg.repeat_seconds)
         self._recent.record(utterance.user_id, len(offences))
+
+        # The last of them, and recorded whether or not the fine is announced.
+        # A fine that went unsaid because something else was playing is exactly
+        # the one somebody has to ask about.
+        self._fined[utterance.user_id] = (offences[-1], time.monotonic())
 
         fine = _fine(len(offences))
         standing = self._charge(utterance.user_id, utterance.user, len(offences))
@@ -400,6 +456,90 @@ class VerbalMorality(Tool):
             )
         finally:
             self._announcing = False
+
+    # ── what was that ─────────────────────────────
+
+    async def _recall(self, utterance: Utterance, session: TranscriptSession) -> None:
+        """
+        Tell a speaker what they were just fined for, if that is what they asked.
+
+        The announcement names the fine and never the word, which is the one
+        thing somebody who missed it wants. The window is the whole gate:
+        "what did I say" is a thing people say to each other, and what makes it
+        a question for the bot is that the asker was fined seconds ago.
+
+        Monotonic, and the record dropped once it has aged out, so a clock
+        correction cannot park a fine in the future and leave it answerable
+        until the clock arrives. Read rather than swept, and there are only ever
+        as many entries as the channel has speakers.
+
+        No chime, and at whatever loudness the channel asked for. A fine opens
+        with a flourish and backs off because it interrupts a conversation that
+        was about something else; this answers a question somebody has just
+        asked out loud, and the backoff would quieten the answer for the speaker
+        most likely to need it.
+
+        Dropped rather than queued while an announcement is playing, on the same
+        terms as a fine — what is queued behind a fine is an answer to a
+        question the channel has moved on from.
+        """
+        word = self._said(utterance.user_id)
+        if word is None:
+            return
+
+        if not self._recall_triggers.search(normalized(utterance.text)):
+            return
+
+        if self._announcing:
+            logger.debug(
+                "[%s] %s asked what they said while an announcement was already "
+                "playing; letting it lie.",
+                self.server,
+                utterance.user,
+            )
+            return
+
+        speech = self._tts()
+        if speech is None:
+            return
+
+        logger.info(
+            "🔁 [%s] %s asked what they said; it was '%s'.",
+            self.server,
+            utterance.user,
+            word,
+        )
+
+        self._announcing = True
+        try:
+            await speech.play(
+                session.source, self._recall_wording(utterance.user, word)
+            )
+        finally:
+            self._announcing = False
+
+    def _said(self, user_id: int) -> str | None:
+        """
+        The word a speaker was last fined for, if it was recent enough to ask about.
+
+        Read before the trigger is matched, because it is a dictionary lookup
+        and the trigger is an expression against a whole utterance: almost
+        nothing anybody says is inside the window, and nothing outside it is
+        worth matching against.
+        """
+        if morality_cfg.recall_seconds <= NEVER_RECALLS:
+            return None
+
+        fined = self._fined.get(user_id)
+        if fined is None:
+            return None
+
+        word, when = fined
+        if time.monotonic() - when > morality_cfg.recall_seconds:
+            self._fined.pop(user_id, None)
+            return None
+
+        return word
 
     def _tts(self) -> Tts | None:
         """
@@ -456,6 +596,20 @@ class VerbalMorality(Tool):
                 VIOLATIONS_FIELD: _violations(offences),
             }
         )
+
+    def _recall_wording(self, user: str, word: str) -> str:
+        """
+        The answer as it will be said, for one speaker and one word.
+
+        Not rendered in advance, unlike everything else this tool says. What a
+        fine can be is the roster against three counts; what an answer can be is
+        the roster against every form of every word the server objects to, which
+        for a list worth having is several hundred phrases a deployment would
+        pay a synthesizer for on every start-up. The first answer naming a given
+        word waits for it, and nobody waits again.
+        """
+        return self._recall_announcement.format(**{USER_FIELD: user, WORD_FIELD: word})
+
 
 def _named(chime: Any) -> str | None:
     """
@@ -540,29 +694,40 @@ def _violations(offences: int) -> str:
     return SINGLE_VIOLATION if offences == SINGLE_OFFENCE else MULTIPLE_VIOLATIONS
 
 
-def _checked(key: str, announcement: str) -> str:
+def _fine_fields() -> Mapping[str, str]:
+    """What a fine's templates may reach, filled with a single offence."""
+    return {
+        USER_FIELD: PROBE_NAME,
+        CREDITS_FIELD: _fine(SINGLE_OFFENCE),
+        VIOLATIONS_FIELD: _violations(SINGLE_OFFENCE),
+    }
+
+
+def _recall_fields() -> Mapping[str, str]:
+    """What the recall's template may reach. Not the fine: it is not announcing one."""
+    return {USER_FIELD: PROBE_NAME, WORD_FIELD: PROBE_WORD}
+
+
+def _checked(key: str, announcement: str, fields: Mapping[str, str]) -> str:
     """
     An announcement template that will interpolate.
 
     Checked at construction because the alternative is discovering a stray brace
     at the moment someone swears, by which point the tool has one job and cannot
     do it. The key is carried in so a server told which setting is wrong does not
-    have to work out which of the two it was.
+    have to work out which of its settings it was.
+
+    `fields` is what the template may reach, which is not the same set for all of
+    them: a fine names what it cost, and a recall names the word. The complaint
+    lists whatever was passed, so a server is told the placeholders that setting
+    actually has rather than every placeholder the tool knows about.
     """
     announcement = str(announcement)
 
     try:
-        announcement.format(
-            **{
-                USER_FIELD: PROBE_NAME,
-                CREDITS_FIELD: _fine(SINGLE_OFFENCE),
-                VIOLATIONS_FIELD: _violations(SINGLE_OFFENCE),
-            }
-        )
+        announcement.format(**fields)
     except (IndexError, KeyError, ValueError) as exc:
-        available = FIELD_SEPARATOR.join(
-            f"'{{{field}}}'" for field in (USER_FIELD, CREDITS_FIELD, VIOLATIONS_FIELD)
-        )
+        available = FIELD_SEPARATOR.join(f"'{{{field}}}'" for field in fields)
         raise ValueError(
             f"'{key}' has a placeholder nothing fills: {exc}. "
             f"Only {available} are available."
