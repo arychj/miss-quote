@@ -1,7 +1,7 @@
 from datetime import date
 
 from miss_quote.summary import when as clauses
-from miss_quote.summary.when import LATEST
+from miss_quote.summary.when import LATEST, UNSAID
 
 # The last day of a long month, so "the thirty first" has somewhere to land, and
 # a day early enough in it that most ordinals fall in the month before.
@@ -22,7 +22,17 @@ def _after(stem: str, said: str, today: date = TODAY):
 
 def test_a_stem_on_its_own_is_the_last_one():
     """Somebody who says "Miss Quote, what happened" means last time."""
-    assert _after("what happened", "") is LATEST
+    assert _after("what happened", "").latest
+
+
+def test_a_stem_on_its_own_is_assumed_rather_than_said():
+    """It is the one answer here the next utterance could still change."""
+    assert _after("what happened", "") is UNSAID
+
+
+def test_a_clause_that_was_said_is_not_assumed():
+    """"Last session" is finished, and nothing arriving after it is the rest."""
+    assert not _after("what happened", " last session").assumed
 
 
 def test_the_wordings_for_last_time_all_mean_the_same():

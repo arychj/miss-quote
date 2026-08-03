@@ -16,7 +16,7 @@ from miss_quote.audio.hold import DEFAULT_HOLD_VOLUME
 from miss_quote.config import SummaryConfig, TranscriptConfig, transcript_cfg
 from miss_quote.llm.client import CompletionError
 from miss_quote.tools.base import Tool, ToolContext, Toolbox
-from miss_quote.tools.summary import Summary
+from miss_quote.tools.summary import DEFAULT_ADDRESS_WINDOW_SECONDS, Summary
 from miss_quote.tools.tts import Tts
 from miss_quote.transcript.writer import Source, Transcript, Utterance
 
@@ -45,9 +45,29 @@ HOLD_MUSIC = "on-hold"
 QUIETER = 0.4
 
 ASKER = "Erik"
+ASKER_ID = 1
+
+# Somebody else in the room, for the half of a question that is not theirs.
+OTHER_ASKER = "Someone Else"
+OTHER_ASKER_ID = 2
 ENOUGH_UTTERANCES = 12
 
 PATIENCE_SECONDS = 2.0
+
+# How long a question that named no evening waits for one, in here. Short, so
+# the tests that never send a clause spend no real time timing out — and real,
+# rather than zero, so they still go through the waiting. A test that does send
+# one asks for a long window instead: the wait ends when the clause lands, so
+# the number only ever costs anything when nothing arrives.
+CLAUSE_WINDOW = 0.05
+PATIENT_CLAUSE_WINDOW = 5.0
+
+# Turns of the loop a test gives an ask to reach the point of waiting. Generous,
+# because what it is waiting on is a lookup and a task start rather than a clock.
+PARKING_ATTEMPTS = 100
+
+# What the model is asked for over one sealed session and one retelling of it.
+SUMMARIZED_AND_RETOLD = 2
 
 # The day every question in here is asked on. Late enough in a long month that
 # an ordinal has somewhere to land in it, and a Friday, so counting back weeks
@@ -220,7 +240,7 @@ def _config(**channel) -> dict:
     return {
         "monitored_channels": {
             WATCHED: {"channel": POSTING_CHANNEL, "preamble": PREAMBLE, "empty": EMPTY,
-             "closing": CLOSING}
+             "closing": CLOSING, "clause_window_seconds": CLAUSE_WINDOW}
             | channel
         }
     }
@@ -260,8 +280,8 @@ def _transcript(root: Path, source: Source, lines: int = ENOUGH_UTTERANCES) -> T
     )
 
 
-def _said(text: str) -> Utterance:
-    return Utterance(timestamp=OPENED, user_id=1, user=ASKER, text=text)
+def _said(text: str, user: str = ASKER, user_id: int = ASKER_ID) -> Utterance:
+    return Utterance(timestamp=OPENED, user_id=user_id, user=user, text=text)
 
 
 def _filed(
@@ -453,6 +473,11 @@ async def test_with_no_notes_it_says_so_and_asks_nothing(summaries, model):
         "Ms. Quote — recap the last session",
         "mizquote what happened last session",
         "hey miss quote, what did we do last session, out of interest",
+        # The name on its own gives the transcriber nothing either side to weigh
+        # it against, so it reaches for the nearest real word.
+        "Mrs. Quote, what happened last session",
+        "misquotes what happened last session",
+        "Misquoted. What happened last session?",
     ],
 )
 async def test_the_spellings_an_asr_might_return_all_ask(summaries, model, said):
@@ -495,6 +520,325 @@ async def test_a_stem_on_its_own_asks_for_the_last_one(summaries, model):
     )
 
     assert speech.played == [PREAMBLE, RETELLING, CLOSING]
+
+
+# ── a question in two utterances ──────────────
+
+
+def _aged(tool: Summary, seconds: float, user_id: int = ASKER_ID) -> None:
+    """
+    Push a held name back in time, so a window can be walked past without waiting.
+
+    The stored moment is monotonic, so this moves it rather than the clock: a
+    test that slept out the real window would be a test of `asyncio.sleep`.
+    """
+    held = (WATCHED_KEY, user_id)
+    tool._addressed[held] = tool._addressed[held] - seconds
+
+
+async def test_the_name_and_the_question_in_two_utterances_still_ask(summaries, model):
+    """What an ASR returns is utterances, and it splits wherever somebody paused."""
+    tool, speech = _tool()
+
+    await tool.handle_utterance(_said("Miss Quote."), Session(WATCHED_SOURCE))
+    await tool.handle_utterance(
+        _said("What happened on the twenty ninth?"), Session(WATCHED_SOURCE)
+    )
+
+    assert speech.played == [MISSING]
+
+
+async def test_a_bare_stem_after_the_name_asks_for_the_last_one(summaries, model):
+    tool, speech = _tool()
+
+    await tool.handle_utterance(_said("Miss Quote?"), Session(WATCHED_SOURCE))
+    await tool.handle_utterance(_said("What happened?"), Session(WATCHED_SOURCE))
+
+    assert speech.played == [EMPTY]
+
+
+async def test_the_two_halves_have_to_come_from_one_speaker(summaries, model):
+    """Somebody else's question is a different question, and was not addressed."""
+    tool, speech = _tool()
+
+    await tool.handle_utterance(_said("Miss Quote."), Session(WATCHED_SOURCE))
+    await tool.handle_utterance(
+        _said("What happened?", OTHER_ASKER, OTHER_ASKER_ID), Session(WATCHED_SOURCE)
+    )
+
+    assert speech.played == []
+
+
+async def test_something_in_between_does_not_break_the_pair(summaries, model):
+    """A held name is spent by a question rather than by the next thing said."""
+    tool, speech = _tool()
+
+    await tool.handle_utterance(_said("Miss Quote."), Session(WATCHED_SOURCE))
+    await tool.handle_utterance(_said("Uh."), Session(WATCHED_SOURCE))
+    await tool.handle_utterance(_said("What happened?"), Session(WATCHED_SOURCE))
+
+    assert speech.played == [EMPTY]
+
+
+async def test_the_name_is_forgotten_once_the_window_has_passed(summaries, model):
+    tool, speech = _tool()
+    await tool.handle_utterance(_said("Miss Quote."), Session(WATCHED_SOURCE))
+    _aged(tool, DEFAULT_ADDRESS_WINDOW_SECONDS + 1)
+
+    await tool.handle_utterance(_said("What happened?"), Session(WATCHED_SOURCE))
+
+    assert speech.played == []
+
+
+async def test_the_name_is_still_held_inside_the_window(summaries, model):
+    tool, speech = _tool()
+    await tool.handle_utterance(_said("Miss Quote."), Session(WATCHED_SOURCE))
+    _aged(tool, DEFAULT_ADDRESS_WINDOW_SECONDS - 1)
+
+    await tool.handle_utterance(_said("What happened?"), Session(WATCHED_SOURCE))
+
+    assert speech.played == [EMPTY]
+
+
+async def test_a_held_name_is_spent_by_the_question_it_asks(summaries, model):
+    """Otherwise one "Miss Quote" makes every "what happened" after it a question."""
+    tool, speech = _tool()
+    await tool.handle_utterance(_said("Miss Quote."), Session(WATCHED_SOURCE))
+    await tool.handle_utterance(_said("What happened?"), Session(WATCHED_SOURCE))
+
+    await tool.handle_utterance(_said("What happened?"), Session(WATCHED_SOURCE))
+
+    assert speech.played == [EMPTY]
+
+
+async def test_a_continuation_that_is_not_a_question_asks_nothing(summaries, model):
+    """The clause after the stem still has to be one `summary.when` can read."""
+    tool, speech = _tool()
+
+    await tool.handle_utterance(_said("Miss Quote."), Session(WATCHED_SOURCE))
+    await tool.handle_utterance(
+        _said("What happened to my beer?"), Session(WATCHED_SOURCE)
+    )
+
+    assert speech.played == []
+
+
+async def test_a_channel_can_set_how_long_the_name_is_held(summaries, model):
+    tool, speech = _tool(address_window_seconds=DEFAULT_ADDRESS_WINDOW_SECONDS * 2)
+    await tool.handle_utterance(_said("Miss Quote."), Session(WATCHED_SOURCE))
+    _aged(tool, DEFAULT_ADDRESS_WINDOW_SECONDS + 1)
+
+    await tool.handle_utterance(_said("What happened?"), Session(WATCHED_SOURCE))
+
+    assert speech.played == [EMPTY]
+
+
+async def test_a_window_of_zero_wants_the_whole_question_in_one_breath(
+    summaries, model
+):
+    tool, speech = _tool(address_window_seconds=0)
+
+    await tool.handle_utterance(_said("Miss Quote."), Session(WATCHED_SOURCE))
+    await tool.handle_utterance(_said("What happened?"), Session(WATCHED_SOURCE))
+
+    assert speech.played == []
+
+
+async def test_the_whole_question_in_one_breath_never_holds_a_name(summaries, model):
+    """The ordinary ask does not go through the memory at all."""
+    tool, speech = _tool()
+
+    await tool.handle_utterance(
+        _said("Miss Quote, what happened?"), Session(WATCHED_SOURCE)
+    )
+
+    assert speech.played == [EMPTY]
+    assert tool._addressed == {}
+
+
+def test_a_window_that_is_not_a_number_will_not_start(summaries):
+    with pytest.raises(ValueError, match="address_window_seconds"):
+        _tool(address_window_seconds="fifteen")
+
+
+# ── a clause in its own breath ────────────────
+
+
+async def _asking(tool: Summary, said: str) -> asyncio.Task:
+    """
+    Put a question to the tool and hand back the ask still in flight.
+
+    A question that named no evening parks until a clause arrives or the window
+    runs out, so a test that wants to send the clause has to let go of the first
+    one first.
+    """
+    asking = asyncio.create_task(
+        tool.handle_utterance(_said(said), Session(WATCHED_SOURCE))
+    )
+    await _parked(tool)
+
+    return asking
+
+
+async def _parked(tool: Summary) -> None:
+    """Wait until the ask is actually waiting, rather than about to."""
+    for _ in range(PARKING_ATTEMPTS):
+        if tool._awaiting:
+            return
+        await asyncio.sleep(0)
+
+    raise AssertionError("the question never waited for a clause")
+
+
+async def test_a_clause_in_a_second_breath_names_the_evening(summaries, model):
+    """
+    The failure this exists for: "Miss Quote, what happened" is a whole question
+    on its own, so answering it as it lands retells the wrong night.
+    """
+    tool, speech = _tool(clause_window_seconds=PATIENT_CLAUSE_WINDOW)
+    model.answers = [SUMMARY, RETELLING]
+    await tool.handle_finished(_transcript(summaries, WATCHED_SOURCE))
+    asking = await _asking(tool, "Miss Quote, what happened")
+
+    await tool.handle_utterance(
+        _said("On the twenty ninth?"), Session(WATCHED_SOURCE)
+    )
+    await asking
+
+    # The evening on disk is the 26th, so the 29th has no notes — which is the
+    # answer that proves the date was heard at all.
+    assert speech.played == [PREAMBLE, MISSING]
+
+
+async def test_the_clause_is_waited_for_beside_the_preamble(summaries, model):
+    """Not in front of it: the wait is free precisely because it is covered."""
+    tool, speech = _tool(clause_window_seconds=PATIENT_CLAUSE_WINDOW)
+    model.answers = [SUMMARY, RETELLING]
+    await tool.handle_finished(_transcript(summaries, WATCHED_SOURCE))
+
+    asking = await _asking(tool, "Miss Quote, what happened")
+
+    assert speech.played == [PREAMBLE]
+    await tool.handle_utterance(_said("Last session."), Session(WATCHED_SOURCE))
+    await asking
+
+
+async def test_a_clause_naming_the_same_evening_changes_nothing(summaries, model):
+    """"Last session" is what was already assumed, not a second thing to look up."""
+    tool, speech = _tool(clause_window_seconds=PATIENT_CLAUSE_WINDOW)
+    model.answers = [SUMMARY, RETELLING]
+    await tool.handle_finished(_transcript(summaries, WATCHED_SOURCE))
+    asking = await _asking(tool, "Miss Quote, what happened")
+
+    await tool.handle_utterance(_said("Last session."), Session(WATCHED_SOURCE))
+    await asking
+
+    # Once to summarize the session and once to retell it. A third would be the
+    # completion having been thrown away and started again for the same evening.
+    assert speech.played == [PREAMBLE, RETELLING, CLOSING]
+    assert len(model.asked) == SUMMARIZED_AND_RETOLD
+
+
+async def test_nothing_more_said_answers_the_evening_it_assumed(summaries, model):
+    tool, speech = _tool()
+    model.answers = [SUMMARY, RETELLING]
+    await tool.handle_finished(_transcript(summaries, WATCHED_SOURCE))
+
+    await tool.handle_utterance(
+        _said("Miss Quote, what happened"), Session(WATCHED_SOURCE)
+    )
+
+    assert speech.played == [PREAMBLE, RETELLING, CLOSING]
+
+
+async def test_a_question_that_named_its_evening_never_waits(summaries, model):
+    """Anything spelled out is finished, and is answered as fast as it always was."""
+    tool, speech = _tool(clause_window_seconds=PATIENT_CLAUSE_WINDOW)
+    model.answers = [SUMMARY, RETELLING]
+    await tool.handle_finished(_transcript(summaries, WATCHED_SOURCE))
+
+    await tool.handle_utterance(
+        _said("Miss Quote, what happened last session"), Session(WATCHED_SOURCE)
+    )
+
+    assert speech.played == [PREAMBLE, RETELLING, CLOSING]
+    assert tool._awaiting == {}
+
+
+async def test_only_the_asker_can_name_the_evening(summaries, model):
+    """Somebody else saying "last week" is talking to the room."""
+    tool, speech = _tool()
+    model.answers = [SUMMARY, RETELLING]
+    await tool.handle_finished(_transcript(summaries, WATCHED_SOURCE))
+    asking = await _asking(tool, "Miss Quote, what happened")
+
+    await tool.handle_utterance(
+        _said("On the twenty ninth?", OTHER_ASKER, OTHER_ASKER_ID),
+        Session(WATCHED_SOURCE),
+    )
+    await asking
+
+    assert speech.played == [PREAMBLE, RETELLING, CLOSING]
+
+
+async def test_something_that_is_not_a_clause_does_not_redirect_it(summaries, model):
+    tool, speech = _tool()
+    model.answers = [SUMMARY, RETELLING]
+    await tool.handle_finished(_transcript(summaries, WATCHED_SOURCE))
+    asking = await _asking(tool, "Miss Quote, what happened")
+
+    await tool.handle_utterance(_said("So anyway."), Session(WATCHED_SOURCE))
+    await asking
+
+    assert speech.played == [PREAMBLE, RETELLING, CLOSING]
+
+
+async def test_a_clause_is_not_dropped_by_the_retelling_gate(summaries, model):
+    """
+    The ask it belongs to is holding that lock while it waits, so a clause
+    checked against the gate first would be dropped by the question waiting on it.
+    """
+    tool, speech = _tool(clause_window_seconds=PATIENT_CLAUSE_WINDOW)
+    model.answers = [SUMMARY, RETELLING]
+    await tool.handle_finished(_transcript(summaries, WATCHED_SOURCE))
+    asking = await _asking(tool, "Miss Quote, what happened")
+
+    assert tool._telling.locked()
+    await tool.handle_utterance(
+        _said("On the twenty ninth?"), Session(WATCHED_SOURCE)
+    )
+    await asking
+
+    assert speech.played == [PREAMBLE, MISSING]
+
+
+async def test_a_window_of_zero_answers_the_moment_it_is_asked(summaries, model):
+    tool, speech = _tool(clause_window_seconds=0)
+    model.answers = [SUMMARY, RETELLING]
+    await tool.handle_finished(_transcript(summaries, WATCHED_SOURCE))
+
+    await tool.handle_utterance(
+        _said("Miss Quote, what happened"), Session(WATCHED_SOURCE)
+    )
+
+    assert speech.played == [PREAMBLE, RETELLING, CLOSING]
+    assert tool._awaiting == {}
+
+
+async def test_an_evening_with_nothing_in_it_never_waits(summaries, model):
+    """No clause can change a room that has never been written about."""
+    tool, speech = _tool(clause_window_seconds=PATIENT_CLAUSE_WINDOW)
+
+    await tool.handle_utterance(
+        _said("Miss Quote, what happened"), Session(WATCHED_SOURCE)
+    )
+
+    assert speech.played == [EMPTY]
+
+
+async def test_a_clause_window_that_is_not_a_number_will_not_start(summaries):
+    with pytest.raises(ValueError, match="clause_window_seconds"):
+        _tool(clause_window_seconds="a moment")
 
 
 # ── one evening, several sessions ─────────────

@@ -20,12 +20,20 @@ saying it**, so the announcement covers the wait rather than being followed by
 one. A channel that names a clip gets music over whatever is left of the wait
 after the announcement runs out. See `_recall`.
 
-Two things sit under that sentence and are not in it. One evening is not always
+Three things sit under that sentence and are not in it. One evening is not always
 one session, so what is retold is the whole run of them rather than the newest;
-`summary.store` is where that is put back together. And "last session" is not
-always what is meant — sessions get skipped, and other things happen in the
-channel in between — so a trigger is the start of a question rather than the
-whole of one, and `summary.when` reads which evening out of what follows it.
+`summary.store` is where that is put back together. "Last session" is not always
+what is meant — sessions get skipped, and other things happen in the channel in
+between — so a trigger is the start of a question rather than the whole of one,
+and `summary.when` reads which evening out of what follows it. And the sentence
+is not always one utterance: an ASR splits wherever the speaker paused, so it
+arrives in halves about as often as whole. That break lands in one of two
+places, and they are not the same problem. Before the trigger, neither half asks
+anything, so the name is held for a few seconds and the next thing its speaker
+says finishes the question — see `Summary._asked`. After it, the first half is a
+whole question already, and answering it as it lands retells the wrong evening
+rather than none, so a question that named no evening waits a moment to see
+whether one is coming — see `Summary._clause`.
 
 **Everything is per voice channel, under `monitored_channels`.** A server's rooms
 are not interchangeable: one is where a game night happens and one is where two
@@ -44,7 +52,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -61,7 +69,7 @@ from miss_quote.tools.base import Finder, Tool, ToolContext
 from miss_quote.tools.tts import Tts
 from miss_quote.transcript.writer import Source, Transcript, TranscriptSession, Utterance
 from miss_quote.utils.logging import get_logger
-from miss_quote.utils.phrases import normalized, pattern
+from miss_quote.utils.phrases import normalized, pattern, spoken
 from miss_quote.utils.slugs import slugify
 
 logger = get_logger(__name__)
@@ -83,6 +91,8 @@ HOLD_MUSIC_KEY = "hold_music"
 HOLD_VOLUME_KEY = "hold_volume"
 NAME_KEY = "name"
 TRIGGERS_KEY = "triggers"
+ADDRESS_WINDOW_SECONDS_KEY = "address_window_seconds"
+CLAUSE_WINDOW_SECONDS_KEY = "clause_window_seconds"
 
 # Everything a channel block may say. Anything else in one is a setting nothing
 # reads, on the same reasoning as a stray key in a tool block: a channel quietly
@@ -108,6 +118,8 @@ CHANNEL_KEYS = (
     HOLD_VOLUME_KEY,
     NAME_KEY,
     TRIGGERS_KEY,
+    ADDRESS_WINDOW_SECONDS_KEY,
+    CLAUSE_WINDOW_SECONDS_KEY,
 )
 
 # How long a retelling has to sound like before it is worth the tokens, and how
@@ -121,8 +133,9 @@ DEFAULT_MINIMUM_UTTERANCES = 5
 # enough that somebody who arrived late can still ask.
 DEFAULT_BACKOFF_SECONDS = 120.0
 
-# A window of this or less asks the model every time, which is a deployment's
-# own business to want.
+# What a window of nothing means, wherever one is read here: the backoff asks
+# the model every time, and the address window holds no name at all. Both are a
+# deployment's own business to want.
 NEVER = 0.0
 
 # How long a channel can sit quiet before the rest of the night counts as a
@@ -175,6 +188,15 @@ NO_HOLD_MUSIC = ""
 # together, and kept both esses. The list is the cheapest place to be generous:
 # a spelling nobody ever says costs one branch of an alternation, and a spelling
 # that is missing costs somebody asking a bot twice while it ignores them.
+#
+# The name arriving in an utterance of its own is where a transcriber is least
+# reliable, and it is now a thing the tool listens for; see `Summary._asked`. Two
+# words on their own give a model nothing either side to weigh them against, so
+# it falls back on whatever real words are nearest — which is where the past
+# tense and the plural come from, both being words where "misquote" is not.
+#
+# A spelling here still only does anything with a trigger after it, so a channel
+# that genuinely says "you misquoted me" is not asking for a recap by accident.
 DEFAULT_NAME = (
     "miss quote",
     "misquote",
@@ -182,6 +204,12 @@ DEFAULT_NAME = (
     "mis quote",
     "ms quote",
     "mizquote",
+    "mrs quote",
+    "miss quotes",
+    "misquotes",
+    "missquotes",
+    "misquoted",
+    "missquoted",
 )
 
 # How asking starts. Matched after the name and in the same breath, so an
@@ -204,6 +232,40 @@ DEFAULT_TRIGGERS = (
     "read me your notes",
     "tell me about",
 )
+
+# How long the bot goes on listening for the question after somebody has said
+# its name and nothing else.
+#
+# An ASR returns utterances, not sentences, and it splits a pause wherever the
+# speaker left one — so "Miss Quote, what happened on the twenty ninth" arrives
+# as two lines about as often as one. Neither half is a question on its own: the
+# first has no trigger and the second is not addressed to anybody. Holding the
+# name for a few seconds is what puts them back together.
+#
+# Fifteen seconds, which is a breath and a thought rather than a conversation.
+# The trigger still has to be the start of a question `summary.when` can read
+# the rest of, so the window is not the only thing standing between this and a
+# room that says "recap" about something else.
+DEFAULT_ADDRESS_WINDOW_SECONDS = 15.0
+
+# How long a question that named no evening waits to see whether one is still
+# coming.
+#
+# The same split, one word further along. "Miss Quote, what happened on the
+# twenty ninth" also breaks after the trigger, and that half is worse than a
+# half that asks nothing: "Miss Quote, what happened" is a complete question on
+# its own, so answering it the moment it lands retells the *last* session and
+# the date is never heard. A wrong answer, rather than none.
+#
+# Only an evening nobody named waits. Anything spelled out is finished, and a
+# channel that said which night it meant is answered as immediately as it always
+# was; see `When.assumed`.
+#
+# It costs nothing to listen to, because the preamble covers it — "let me go
+# look at my notes" is true whichever evening is meant, so it plays while this
+# runs rather than after it. A second and a half is a pause between two halves
+# of a sentence rather than a gap between two sentences.
+DEFAULT_CLAUSE_WINDOW_SECONDS = 1.5
 
 # What the post says above the summary, so a channel scrolling back knows which
 # evening it is looking at.
@@ -254,6 +316,8 @@ class Monitored:
     hold_volume: float
     address: re.Pattern[str]
     triggers: re.Pattern[str]
+    address_window_seconds: float
+    clause_window_seconds: float
 
     @property
     def posting(self) -> bool:
@@ -282,7 +346,35 @@ class Monitored:
         if addressed is None:
             return None
 
-        stem = self.triggers.search(said, addressed.end())
+        return self._asking(said, addressed.end(), today)
+
+    def addressed(self, text: str) -> bool:
+        """
+        Whether an utterance says the bot's name at all.
+
+        What an utterance that names the bot and asks nothing means is "I am
+        about to ask you something", which is only worth anything because the
+        transcriber splits a sentence wherever the speaker paused. See
+        `DEFAULT_ADDRESS_WINDOW_SECONDS`.
+        """
+        return self.address.search(normalized(text)) is not None
+
+    def continues(self, text: str, today: date) -> When | None:
+        """
+        Which evening an utterance asked about, given the name came before it.
+
+        The same question as `request` with the addressing already satisfied, so
+        the trigger is looked for from the start of what was said rather than
+        after a name that is not in this utterance. Only ever reached with a
+        fresh address behind it — on its own it would make an unaddressed "what
+        happened" in the middle of a conversation a question for the bot, which
+        is exactly what the addressing is there to prevent.
+        """
+        return self._asking(normalized(text), 0, today)
+
+    def _asking(self, said: str, start: int, today: date) -> When | None:
+        """The trigger and the clause after it, from somewhere in an utterance."""
+        stem = self.triggers.search(said, start)
         if stem is None:
             return None
 
@@ -308,6 +400,17 @@ class Summary(Tool):
         # a minute of narration is a minute of the same narration.
         self._telling = asyncio.Lock()
         self._told: dict[tuple[str, str], float] = {}
+
+        # Who has said the bot's name and not yet asked anything, by channel and
+        # by speaker. Per channel because one tool serves several, and per
+        # speaker because somebody else's question is a different question.
+        self._addressed: dict[tuple[str, int], float] = {}
+
+        # Who has asked a question that named no evening, and is being given a
+        # moment to name one. Keyed the same way, and holding the future the ask
+        # is parked on rather than a timestamp: what ends this wait is usually
+        # somebody speaking rather than the clock. See `_clause`.
+        self._awaiting: dict[tuple[str, int], asyncio.Future[When]] = {}
 
         logger.debug(
             "[%s] Summarizing %d channel(s): %s",
@@ -491,12 +594,20 @@ class Summary(Tool):
         The backoff is checked inside `_recall` rather than here, because what
         it holds off is one story rather than one channel, and which story was
         asked for is not known until the notes have been looked in.
+
+        The clause an earlier question is still waiting on is taken first, and
+        before the `_telling` gate: that ask is holding the lock while it waits,
+        so anything checking the gate first would drop the very thing it is
+        waiting for.
         """
         monitored = self._for(session.source)
         if monitored is None:
             return
 
-        when = monitored.request(utterance.text, _today())
+        if self._completes(monitored, utterance):
+            return
+
+        when = self._asked(monitored, utterance)
         if when is None:
             return
 
@@ -509,10 +620,157 @@ class Summary(Tool):
             return
 
         async with self._telling:
-            await self._recall(session.source, monitored, utterance.user, when)
+            await self._recall(session.source, monitored, utterance, when)
+
+    def _completes(self, monitored: Monitored, utterance: Utterance) -> bool:
+        """
+        Hand this utterance to a question still waiting for its evening, if one is.
+
+        The whole utterance has to be a clause and nothing else, read from its
+        first word by the same parser that reads the tail of a one-breath
+        question — "on the twenty ninth" is a date said on its own, and "so
+        anyway" is not. A clause that says "last session" is a clause; a trigger
+        with nothing after it is not one, which is what `assumed` rules out.
+
+        Only the speaker who asked can finish their own question. Somebody else
+        saying "last week" in the meantime is talking to the room.
+        """
+        waiting = self._awaiting.get((monitored.name, utterance.user_id))
+        if waiting is None or waiting.done():
+            return False
+
+        named = clauses.parse(normalized(utterance.text), 0, _today())
+        if named is None or named.assumed:
+            return False
+
+        logger.debug(
+            "[%s] %s named the evening in a second breath.", self.server, utterance.user
+        )
+        waiting.set_result(named)
+
+        return True
+
+    def _asked(self, monitored: Monitored, utterance: Utterance) -> When | None:
+        """
+        Which evening somebody asked about, across as many utterances as it took.
+
+        An ASR returns utterances rather than sentences, and it splits wherever
+        the speaker paused, so "Miss Quote, what happened on the twenty ninth"
+        arrives as two lines about as often as one. Neither half asks anything by
+        itself. The name is held for `address_window_seconds` so that the next
+        thing its speaker says can be the question.
+
+        The whole sentence is tried first, so nothing about an ordinary
+        single-utterance ask goes through the memory at all.
+
+        A held name is let go once it has produced a question, and otherwise left
+        to age out — so a name, a filler, and then a question is still one ask,
+        and a name followed by something that is not a question does not have to
+        be said again.
+
+        What this does not recover is the two halves arriving the other way
+        round. Transcription runs several at a time (`stt.processor`), so a short
+        second utterance can be returned before a long first one, and an
+        `Utterance` is stamped when it is written rather than when it was said —
+        there is nothing on it to sort by. The order it does recover is the one
+        an ASR actually produces.
+        """
+        today = _today()
+        held = (monitored.name, utterance.user_id)
+
+        when = monitored.request(utterance.text, today)
+        if when is not None:
+            self._addressed.pop(held, None)
+            return when
+
+        if self._holding(monitored, held):
+            when = monitored.continues(utterance.text, today)
+            if when is not None:
+                self._addressed.pop(held, None)
+                return when
+
+        if monitored.address_window_seconds > NEVER and monitored.addressed(
+            utterance.text
+        ):
+            logger.debug(
+                "[%s] %s said the name and asked nothing; listening for the rest "
+                "of it for %.0f seconds.",
+                self.server,
+                utterance.user,
+                monitored.address_window_seconds,
+            )
+            self._addressed[held] = time.monotonic()
+
+        return None
+
+    def _holding(self, monitored: Monitored, held: tuple[str, int]) -> bool:
+        """
+        Whether a speaker's name is still worth waiting on, forgetting it if not.
+
+        Monotonic rather than wall clock, so a clock correction cannot park a
+        name in the future and leave the bot listening until the clock arrives.
+        Dropped on the way past rather than swept: nothing else reads this, and
+        there are only ever as many keys as the room has had speakers.
+
+        A window of nothing holds nothing, which is a channel asking for the
+        whole question in one breath — said outright rather than left to a
+        comparison against however much of a second has elapsed.
+        """
+        if monitored.address_window_seconds <= NEVER:
+            return False
+
+        said = self._addressed.get(held)
+        if said is None:
+            return False
+
+        if time.monotonic() - said <= monitored.address_window_seconds:
+            return True
+
+        self._addressed.pop(held, None)
+
+        return False
+
+    async def _clause(
+        self, monitored: Monitored, utterance: Utterance, when: When
+    ) -> When:
+        """
+        The evening a question named a moment after asking, or the one assumed.
+
+        Only an ask that named none waits. "Miss Quote, what happened on the
+        twenty ninth" breaks after the trigger about as often as it breaks after
+        the name, and that half is worse than a half that asks nothing: it is a
+        whole question by itself, so answering it as it lands retells the wrong
+        evening rather than none.
+
+        A clause that says "last session" names what was already assumed, so it
+        comes back as the assumption rather than as a second evening to go and
+        look up.
+
+        The window is short and it is free, because the preamble runs over the
+        top of it; see `_recall`. What ends it is normally `_completes` rather
+        than the clock — a channel that was not going to say anything else pays
+        the full wait, and pays it while being told the bot is looking.
+        """
+        if not when.assumed or monitored.clause_window_seconds <= NEVER:
+            return when
+
+        held = (monitored.name, utterance.user_id)
+        waiting: asyncio.Future[When] = asyncio.get_running_loop().create_future()
+        self._awaiting[held] = waiting
+
+        try:
+            named = await asyncio.wait_for(
+                waiting, monitored.clause_window_seconds
+            )
+        except TimeoutError:
+            return when
+        finally:
+            self._awaiting.pop(held, None)
+
+        return when if named.latest else named
 
     async def _recall(
-        self, source: Source, monitored: Monitored, asker: str, when: When
+        self, source: Source, monitored: Monitored, utterance: Utterance, when: When
     ) -> None:
         """
         Go and look at the notes, out loud.
@@ -549,6 +807,25 @@ class Summary(Tool):
         during one is dropped by `_telling` rather than by this, and a window
         measured from the start of a minute of narration is most of the way
         through by the time anybody could use it.
+
+        And an ask that **named no evening waits to see whether one is coming**,
+        for as long as `_clause` says. The wait runs *beside* the preamble
+        rather than in front of it, which is what makes it free: "let me go look
+        at my notes" is true whichever night is meant, so the channel hears the
+        bot answer immediately either way.
+
+        The completion is started on the evening in hand **before** that wait
+        finishes, and thrown away in the one case where the channel names a
+        different one. A question that named its evening in one breath, and one
+        that never names it at all, both go exactly the way they always did; the
+        only ask that pays for a second lookup is the one that changed its mind
+        mid-sentence, and it pays while the preamble is still playing.
+
+        What is **not** waited for is an evening the backoff has already
+        blocked. It is dropped where it always was — the alternative is holding
+        the channel open on the chance that the clause names some other night,
+        which is a wait nobody hears the end of, and the ask was going to be
+        dropped today regardless.
         """
         speech = self._tts()
         if speech is None:
@@ -559,7 +836,7 @@ class Summary(Tool):
             logger.info(
                 "[%s] %s asked about %s, and there are no notes from it.",
                 self.server,
-                asker,
+                utterance.user,
                 "the last session" if when.latest else when.target,
             )
             await speech.play(source, monitored.empty if when.latest else monitored.missing)
@@ -569,7 +846,7 @@ class Summary(Tool):
             logger.debug(
                 "[%s] %s asked for %s again inside the backoff; not telling it twice.",
                 self.server,
-                asker,
+                utterance.user,
                 chain.name,
             )
             return
@@ -577,7 +854,35 @@ class Summary(Tool):
         telling = asyncio.create_task(self._retell(chain.read(), monitored))
 
         try:
-            await speech.play(source, monitored.preamble)
+            _, named = await asyncio.gather(
+                speech.play(source, monitored.preamble),
+                self._clause(monitored, utterance, when),
+            )
+
+            if named is not when:
+                telling.cancel()
+
+                chain = self._store.find(source, named, monitored.session_gap)
+                if chain is None:
+                    logger.info(
+                        "[%s] %s went on to name %s, and there are no notes from it.",
+                        self.server,
+                        utterance.user,
+                        named.target,
+                    )
+                    await speech.play(source, monitored.missing)
+                    return
+
+                if not self._ready(monitored, chain):
+                    logger.debug(
+                        "[%s] %s went on to name %s, which is inside the backoff.",
+                        self.server,
+                        utterance.user,
+                        chain.name,
+                    )
+                    return
+
+                telling = asyncio.create_task(self._retell(chain.read(), monitored))
 
             # Not kept: this is one evening's account, composed for this moment,
             # and nobody will ever ask for those exact words again. See
@@ -600,7 +905,7 @@ class Summary(Tool):
         logger.info(
             "📖 [%s] %s asked what happened; retold %s (%d part(s)).",
             self.server,
-            asker,
+            utterance.user,
             chain.name,
             chain.parts,
         )
@@ -740,8 +1045,20 @@ def _channel(
         hold_volume=_loudness(
             HOLD_VOLUME_KEY, raw.get(HOLD_VOLUME_KEY), DEFAULT_HOLD_VOLUME
         ),
-        address=pattern(_spoken(NAME_KEY, raw.get(NAME_KEY), DEFAULT_NAME)),
-        triggers=pattern(_spoken(TRIGGERS_KEY, raw.get(TRIGGERS_KEY), DEFAULT_TRIGGERS)),
+        address=pattern(spoken(NAME_KEY, raw.get(NAME_KEY), DEFAULT_NAME)),
+        triggers=pattern(spoken(TRIGGERS_KEY, raw.get(TRIGGERS_KEY), DEFAULT_TRIGGERS)),
+        address_window_seconds=_span(
+            ADDRESS_WINDOW_SECONDS_KEY,
+            raw.get(ADDRESS_WINDOW_SECONDS_KEY),
+            DEFAULT_ADDRESS_WINDOW_SECONDS,
+            SECONDS,
+        ),
+        clause_window_seconds=_span(
+            CLAUSE_WINDOW_SECONDS_KEY,
+            raw.get(CLAUSE_WINDOW_SECONDS_KEY),
+            DEFAULT_CLAUSE_WINDOW_SECONDS,
+            SECONDS,
+        ),
     )
 
 
@@ -784,32 +1101,6 @@ def _prompts(raw: Any) -> Mapping[str, str]:
         )
 
     return {str(name): str(text) for name, text in raw.items()}
-
-
-def _spoken(key: str, value: Any, default: Sequence[str]) -> tuple[str, ...]:
-    """
-    A list of phrases the channel can say, or the shipped one.
-
-    Replaced rather than added to, unlike the prompts: these are a matching
-    vocabulary, and a server that renamed the bot means the old name to stop
-    working. A single string is read as a list of one, since writing one name
-    should not require remembering it is a list.
-    """
-    if value is None:
-        return tuple(default)
-
-    phrases = [value] if isinstance(value, str) else value
-
-    try:
-        spoken = tuple(normalized(str(phrase)) for phrase in phrases)
-    except TypeError as exc:
-        raise ValueError(f"'{key}' must be a phrase or a list of them: {exc}") from exc
-
-    said = tuple(phrase for phrase in spoken if phrase)
-    if not said:
-        raise ValueError(f"'{key}' has nothing in it to listen for")
-
-    return said
 
 
 def _whole(key: str, value: Any, default: int) -> int:
