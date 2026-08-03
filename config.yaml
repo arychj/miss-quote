@@ -88,6 +88,13 @@ settings:
     #
     # repeat_seconds: 5
 
+    # How long after being fined a speaker can ask "what did I say" and be told
+    # the word. The announcement names the fine and never the word, so this is
+    # the only way to hear it; the window is what keeps a phrase that common
+    # from being one the bot is always answering. 0 never answers.
+    #
+    # recall_seconds: 10
+
     # How long a violation counts against how loudly the next one is announced,
     # and how much each one inside that window takes off. A sliding window, so
     # somebody is back to full volume this long after their last violation. 0%
@@ -277,7 +284,7 @@ servers:
           # been said there is nothing to answer. 0 stops the tool asking at
           # all, for a deployment that wants the lines and not the game.
           #
-          # answer_seconds: 5
+          # answer_seconds: 10
 
           # How long after the first correct answer a second one still counts.
           # The first answer takes the round; anyone inside this window is paid
@@ -621,7 +628,38 @@ servers:
               # all, which is what stops "Miss Quote, what happened to my beer"
               # from being a question about last Thursday.
               #
-              # name: [miss quote, misquote, missquote, mis quote, ms quote, mizquote]
+              # The name and the trigger do not have to be one utterance. An
+              # ASR splits wherever the speaker paused, so "Miss Quote, what
+              # happened on the twenty ninth" comes back as two lines about as
+              # often as one, and neither half is a question by itself. A name
+              # said with nothing after it is held this long so that the next
+              # thing its speaker says can finish the question. Per speaker, and
+              # let go once it has asked something. 0 wants it in one breath.
+              #
+              # address_window_seconds: 15
+
+              # The same split one word further along. "Miss Quote, what
+              # happened on the twenty ninth" also breaks after the trigger, and
+              # that half is worse: it is a whole question by itself, so
+              # answering it as it lands retells the LAST session and the date
+              # is never heard. A question that named no evening waits this long
+              # to see whether one is still coming.
+              #
+              # It costs nothing to listen to. The preamble plays over the top
+              # of the wait rather than after it, being true whichever night is
+              # meant. Only an evening nobody named waits at all; anything
+              # spelled out is answered as immediately as it ever was. 0 answers
+              # the moment the question lands.
+              #
+              # clause_window_seconds: 1.5
+              #
+              # What the bot answers to, in the spellings a transcriber returns
+              # for a name it has never been told. The plural and the past tense
+              # are in there because a name said on its own gives the model no
+              # context either side, so it reaches for the nearest real word.
+              # REPLACES the list below rather than adding to it.
+              #
+              # name: [miss quote, misquote, missquote, mis quote, ms quote, mizquote, mrs quote, miss quotes, misquotes, missquotes, misquoted, missquoted]
               # triggers:
               #   - what happened
               #   - what did we do
@@ -688,6 +726,18 @@ servers:
           # track of what it just said.
           #
           # repeat_announcement: "{user}, you are also fined {credits} for {violations} of the verbal morality statute."
+
+          # How somebody asks what they were just fined for, and what they are
+          # told. The announcement above names the fine and never the word, so
+          # this is the only way to hear it. Answered only inside
+          # settings.fines.recall_seconds, which is the whole gate: outside it
+          # the question is somebody talking to the room.
+          #
+          # The triggers REPLACE the ones below rather than adding to them, and
+          # `{user}` and `{word}` are the only placeholders the answer has.
+          #
+          # recall_triggers: [what did i say, what did i just say, what was that]
+          # recall_announcement: "{user}, you said {word}."
 
           # Optional. A 16-bit WAV played ahead of the announcement, named
           # relative to SPEECH_DIR/chimes — put the file there by hand. Mono or
