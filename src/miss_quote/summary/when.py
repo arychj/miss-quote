@@ -52,6 +52,14 @@ class When:
     target: date | None
     tolerance_days: int
 
+    # Whether the evening was worked out from silence rather than said. Only
+    # true of a trigger with nothing after it at all, which is the one answer
+    # here that the next few seconds could still change: an ASR breaks an
+    # utterance wherever the speaker paused, so "Miss Quote, what happened" is
+    # sometimes the whole question and sometimes the front of one. Anything
+    # spelled out — a date, a count of weeks, "last session" — is finished.
+    assumed: bool = False
+
     @property
     def latest(self) -> bool:
         """Whether this is "the last one" rather than a date."""
@@ -61,7 +69,13 @@ class When:
 # Asking for the most recent evening, which is also what asking for none of
 # them means. One object rather than one per phrase, so a caller can tell the
 # default apart from a date without unpacking anything.
+#
+# Two of them, because those are two situations wherever somebody is waiting:
+# `LATEST` is a channel that said "last session" and `UNSAID` is one that has
+# not said anything yet and may be about to. They look the same to a lookup and
+# different to whatever decides how long to wait; see `Summary._pending`.
 LATEST = When(target=None, tolerance_days=EXACT_DAY)
+UNSAID = When(target=None, tolerance_days=EXACT_DAY, assumed=True)
 
 
 # ── the vocabulary ────────────────────────────
@@ -224,11 +238,15 @@ def parse(said: str, start: int, today: date) -> When | None:
     question as somebody who adds "last time". Anything else has to be a clause
     this understands, and text that is neither is somebody talking about
     something else in a sentence that happened to begin like a question.
+
+    Nothing after it comes back as `UNSAID` rather than `LATEST`, which is the
+    same evening held less firmly: the two are indistinguishable to a lookup,
+    and only one of them is an answer the next utterance could still change.
     """
     tail = said[start:]
 
     if not tail.strip():
-        return LATEST
+        return UNSAID
 
     matched = _EXPRESSION.match(tail)
     if matched is None:

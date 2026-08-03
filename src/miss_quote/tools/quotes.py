@@ -144,7 +144,7 @@ TRIGGER_SEPARATOR = ", "
 # the tool is the whole decision a server has to make.
 ANSWER_SECONDS_KEY = "answer_seconds"
 TIE_SECONDS_KEY = "tie_seconds"
-DEFAULT_ANSWER_SECONDS = 5.0
+DEFAULT_ANSWER_SECONDS = 10.0
 DEFAULT_TIE_SECONDS = 1.0
 
 # Quotes one server hears and the others do not, written where the rest of its

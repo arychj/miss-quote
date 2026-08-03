@@ -150,7 +150,7 @@ SHORT_WINDOW = 30.0
 
 # The round, on the same terms: fixed here rather than read from whatever the
 # defaults happen to be.
-ANSWER_WINDOW = 5.0
+ANSWER_WINDOW = 10.0
 TIE_WINDOW = 1.0
 NO_WINDOW = 0.0
 

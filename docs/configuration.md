@@ -100,7 +100,7 @@ Answers the channel with the film line it just walked into. It listens for a tri
 quotes:
   enabled: true
   config:
-    answer_seconds: 5
+    answer_seconds: 10
     tie_seconds: 1
     remarks:
       - having watched it more recently than is respectable.
@@ -108,7 +108,7 @@ quotes:
 
 | Setting | Required | Purpose |
 |---|---|---|
-| `answer_seconds` | no, `5` | How long the channel has to name the title once the line has finished playing. `0` stops the tool asking at all |
+| `answer_seconds` | no, `10` | How long the channel has to name the title once the line has finished playing. `0` stops the tool asking at all |
 | `tie_seconds` | no, `1` | How long after the first correct answer a second one is still paid. `0` pays only whoever was first |
 | `penalize_self_answers` | no, `true` | Whether whoever set a line off is barred from naming it. `false` lets them answer like anybody else |
 | `self_answer_penalty` | no, `5` | What an attempt costs them, in credits. Floored at `0` |
@@ -185,7 +185,7 @@ A film everybody in one channel has seen is usually one everybody in the next ha
 quotes:
   enabled: true
   config:
-    answer_seconds: 5
+    answer_seconds: 10
     additional_quotes:
       Firefly:
         cool: Shiny.
@@ -354,8 +354,10 @@ Keys are matched through the same slug that names the transcript directory, so `
 | `closing` | — | A fixed line played once the story is told. Unset, and the retelling prompt's own sign-off is what says it finished |
 | `hold_music` | — | A WAV in `SPEECH_DIR/chimes`, named without its `.wav`, looped under the wait once the preamble runs out. Unset leaves the wait silent |
 | `hold_volume` | `0.15` | How loud that music is next to `PLAYBACK_VOLUME` — `0.15` is 15% as loud, not 15% of the amplitude ([how a volume is read](#volumes)). Clamped to `0`–`1` |
-| `name` | `miss quote`, `misquote`, `missquote`, `mis quote`, `ms quote`, `mizquote` | What the bot answers to, in the spellings a transcriber returns for a name it has never been told. **Replaces** the default |
+| `name` | `miss quote`, `misquote`, `missquote`, `mis quote`, `ms quote`, `mizquote`, `mrs quote`, `miss quotes`, `misquotes`, `missquotes`, `misquoted`, `missquoted` | What the bot answers to, in the spellings a transcriber returns for a name it has never been told. **Replaces** the default |
 | `triggers` | `what happened`, `what did we do`, `recap`, `read me your notes`, `tell me about` | How asking **starts**; which evening is a clause after it. **Replaces** the default |
+| `address_window_seconds` | `15` | How long the name is held when it arrives in an utterance of its own, so the speaker's next one can be the question. `0` wants the whole question in one breath |
+| `clause_window_seconds` | `1.5` | How long a question that named no evening waits to see whether one is still coming. Covered by the preamble, so it costs nothing to listen to. `0` answers the moment the question lands |
 
 #### Writing it down
 
@@ -382,7 +384,15 @@ A session under `minimum_utterances` is not summarized: a summary of four lines 
 
 It answers **for that channel**, with the whole of the evening asked about. A session still in progress has no summary yet, so this is the previous conversation even when it is asked for in the middle of one, which is exactly what "last session" means. What counts as one evening is [a run of sessions]({{ '/about/#one-evening-is-not-always-one-session' | relative_url }}), not one file.
 
-Asking takes **both** a name and a trigger, the name first, in one breath. An unaddressed "what happened last session" is somebody talking to the room, and answering it would be a minute of narration nobody asked for. Punctuation is ignored on both sides, and several spellings of the name ship by default, because an ASR guesses phonetically at a name it has never been told and "Miss Quote" comes back as one word about as often as two.
+Asking takes **both** a name and a trigger, the name first. An unaddressed "what happened last session" is somebody talking to the room, and answering it would be a minute of narration nobody asked for. Punctuation is ignored on both sides, and several spellings of the name ship by default, because an ASR guesses phonetically at a name it has never been told and "Miss Quote" comes back as one word about as often as two.
+
+**It does not have to be one breath.** An ASR returns utterances rather than sentences and splits wherever the speaker paused, so "Miss Quote, what happened on the twenty ninth" arrives as two lines about as often as one — and neither half asks anything by itself. A name said with no question after it is **held for `address_window_seconds`**, fifteen by default, so the next thing that speaker says can finish the question. It is per speaker, so somebody else's "what happened" is not answered off your name; it is let go once it has produced a question, and otherwise ages out; and the trigger still has to be followed by a clause or by nothing, so the window is not the only thing between this and a room saying "recap" about something else. Setting it to `0` wants the whole question in one breath, as before.
+
+**The same break lands after the trigger, too**, and that half is the worse one: "Miss Quote, what happened" is a complete question by itself, so answering it the moment it arrives retells the *last* session and "on the twenty ninth" is never heard — a wrong answer rather than none. So a question that named no evening **waits `clause_window_seconds`**, a second and a half by default, to see whether one is still coming.
+
+That wait is free, which is the point. The preamble — *"Sure! Let me go look at my notes."* — is true whichever night is meant, so it plays *over* the wait rather than after it, and the channel hears the bot answer as immediately as it always did. Only an evening nobody named waits at all: a question that said which night it meant is finished, and is answered without any delay. The completion is started on the evening in hand before the wait ends and thrown away only if the channel names a different one, so the single ask that pays for a second lookup is the one that changed its mind mid-sentence — and it pays while the preamble is still playing. An evening already inside `backoff_seconds` is dropped where it always was rather than held open on the chance that a clause names some other night.
+
+What none of this recovers is the two halves arriving the other way round. Transcription runs several at a time, so a short second utterance can come back before a long first one, and an utterance is stamped when it is written rather than when it was said — there is nothing to sort by. The order it does recover is the one an ASR actually produces.
 
 A trigger is the **start** of a question rather than the whole of one, and what follows it says which evening:
 
@@ -504,6 +514,7 @@ verbal-morality:
     words: [fiddlestick, poppycock]
     announcement: "{user}, you are fined {credits} for {violations} of the verbal morality statute."
     repeat_announcement: "{user}, you are also fined {credits} for {violations} of the verbal morality statute."
+    recall_announcement: "{user}, you said {word}."
     chime: chime
 ```
 
@@ -512,9 +523,11 @@ verbal-morality:
 | `words` | yes | Stems of what the server objects to. A lone one may be written unquoted rather than as a list |
 | `announcement` | no | What gets said. `{user}`, `{credits}`, and `{violations}` are the placeholders |
 | `repeat_announcement` | no | Said instead when the same speaker is fined again inside [`settings.fines.repeat_seconds`](#settings-fines). Same placeholders |
+| `recall_triggers` | no, `what did i say`, `what did i just say`, `what was that` | How somebody asks what they were just fined for. **Replaces** the default. A lone one may be written unquoted rather than as a list |
+| `recall_announcement` | no | What they are told. `{user}` and `{word}` are the placeholders — not `{credits}`, which is not what is being announced |
 | `chime` | no | A WAV in `SPEECH_DIR/chimes`, played ahead of the announcement, named without its `.wav` |
 
-Both templates default to the lines above, which the tool carries, so a server that wants the defaults can leave them out. A template with a placeholder nothing fills is rejected at startup rather than at the moment someone swears, and the error names which of the two it was.
+All three templates default to the lines above, which the tool carries, so a server that wants the defaults can leave them out. A template with a placeholder nothing fills is rejected at startup rather than at the moment someone swears, and the error names which setting it was and which placeholders that one actually has — `recall_announcement` has `{user}` and `{word}`, and reaching for `{credits}` in it is refused.
 
 #### Words are stems
 
@@ -543,6 +556,18 @@ What does not scale is the number of announcements. Three violations in one utte
 `chime` is resolved **inside** `SPEECH_DIR/chimes` — a bare name, or a path below it; anything that climbs out is refused at startup. It must be a **16-bit WAV**, at any sample rate and in mono or stereo, both of which are converted on the way in. WAV rather than MP3 because playing audio without ffmpeg is the point of this path, and nothing in the image can decode anything else.
 
 A server electing in with no `words` is enabled and listening for nothing, which is reported at startup rather than left to be discovered by swearing at it.
+
+#### Asking what it was
+
+The announcement names the fine and never the word. **Saying one of `recall_triggers` within [`settings.fines.recall_seconds`](#settings-fines) of being fined is answered with the word**, through `recall_announcement` — ten seconds by default, and it is the whole gate. "What did I say" is a thing people say to each other, and what makes it a question for the bot is that whoever asked was fined seconds ago; outside the window, and for anybody with no fine on record, nothing is said at all.
+
+The answer is **the last word of the fine that earned it**, so somebody who strung several together is told the one they finished on, and it is **the asker's own**: another speaker's word is not an answer to what you said.
+
+**A fine that went unannounced can still be asked about.** A violation earned while something else was playing is counted and not announced, which is exactly the case the question exists for, so the word is recorded whether or not anybody heard the fine.
+
+Three ways it parts company with the fine it is about. It carries **no chime** — a chime is for an interruption, and this answers a question the channel has just been asked. It is **not quietened by the backoff**, since the speaker most likely to need it is the one who has earned the most of one. And an utterance that both asks and offends is **fined and not answered**, because two clips over the top of each other for one sentence is the failure the single-announcement rule already exists to prevent. It is dropped rather than queued while something is playing, on the same terms as a fine.
+
+It is **not rendered in advance**, unlike everything else the tool says. What a fine can be is the roster against three counts; what an answer can be is the roster against every form of every word in the list, which for a list worth having is several hundred phrases a deployment would pay a synthesizer for on every start-up. The first answer naming a given word waits for it, and nobody waits again.
 
 ## Settings
 
@@ -578,6 +603,7 @@ Only used by `verbal-morality`. What a fine is *worth* is the scoreboard's; thes
 | Setting | Default | Purpose |
 |---|---|---|
 | `repeat_seconds` | `5.0` | How soon after being fined the same speaker is told they are "also fined" rather than hearing the whole sentence again. `0`, or any value below it, turns the second wording off |
+| `recall_seconds` | `10.0` | How long after being fined a speaker can ask what the word was and be told. `0`, or any value below it, never answers |
 | `backoff_seconds` | `300.0` | The sliding window a violation counts for against how loudly the next one is announced |
 | `backoff_percent` | `5` | How much of the next announcement's loudness each violation inside that window takes off, and off the knob rather than the amplitude, so 5% is 5% quieter to listen to ([how a volume is read](#volumes)). `0` takes nothing off, turning the backoff off; anything above `100` reaches the floor on the first repeat, and anything negative is treated as `0` rather than made louder |
 | `volume_floor` | `0.25` | The quietest a fine is announced once a speaker has earned the full backoff, as how loud it is next to `PLAYBACK_VOLUME` — a quarter is a quarter as loud ([how a volume is read](#volumes)). `0` silences a repeat offender entirely; `1` turns the backoff off |

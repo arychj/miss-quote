@@ -121,6 +121,7 @@ CURRENCY_KEY = "currency"
 SAVE_SECONDS_KEY = "save_seconds"
 TOPIC_SECONDS_KEY = "topic_seconds"
 REPEAT_SECONDS_KEY = "repeat_seconds"
+RECALL_SECONDS_KEY = "recall_seconds"
 BACKOFF_SECONDS_KEY = "backoff_seconds"
 BACKOFF_PERCENT_KEY = "backoff_percent"
 VOLUME_FLOOR_KEY = "volume_floor"
@@ -152,6 +153,7 @@ SETTINGS_SCHEMA: Mapping[str, Mapping[str, type]] = {
     },
     FINES_SECTION: {
         REPEAT_SECONDS_KEY: float,
+        RECALL_SECONDS_KEY: float,
         BACKOFF_SECONDS_KEY: float,
         BACKOFF_PERCENT_KEY: float,
         VOLUME_FLOOR_KEY: float,
@@ -791,6 +793,15 @@ class MoralityConfig:
     # minutes ago. 0 means nothing is ever a repeat.
     repeat_seconds: float = field(
         default_factory=lambda: file_cfg.setting(FINES_SECTION, REPEAT_SECONDS_KEY, 5.0)
+    )
+
+    # How long after being fined a speaker can ask what the word was and be
+    # told. Short, because the question is one somebody asks while the
+    # announcement is still what the channel is talking about, and a phrase that
+    # answers minutes later is a phrase that answers in the middle of something
+    # else. 0 means the question is never answered.
+    recall_seconds: float = field(
+        default_factory=lambda: file_cfg.setting(FINES_SECTION, RECALL_SECONDS_KEY, 10.0)
     )
 
     # How long a violation counts against how loudly the next one is announced.
