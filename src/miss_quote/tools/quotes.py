@@ -37,6 +37,21 @@ than per speaker: what wears out is the line, not the person who set it off, and
 a trigger with several answers spends all of them at once for the same reason.
 See `RecentQuotes`.
 
+A server may also answer only some of what it hears. `chance` is the odds a
+trigger is answered at all, and everything by default; a server that turns it
+down gets a bot the channel is never quite sure is going to say anything, which
+is a different joke from one that always does. The roll is per utterance and
+spends nothing when it loses — the trigger is not put on backoff, and the next
+time somebody says it, it is a fresh coin. See `_answering`.
+
+A line waits for whoever set it off to stop talking — a second by default. An
+ASR returns utterances rather than sentences and breaks wherever the speaker
+paused, so a trigger arrives in the middle of a thought about as often as at the
+end of one, and answering the moment it lands talks over the rest of what
+somebody was saying. Every further utterance from that speaker starts the wait
+again, so what is waited out is the speaker finishing rather than a fixed pause,
+and nobody else's talking holds their line up. See `_finished`.
+
 A line that has just been said is also a question. For a few seconds afterwards
 the channel can name the title it came from — "what is Firefly" — and whoever
 does is paid a credit through the server's `scoreboard`, which is the same board
@@ -74,6 +89,7 @@ waits for it, and so can both wordings for everybody on the roster. See `prewarm
 
 from __future__ import annotations
 
+import asyncio
 import random
 import re
 import time
@@ -147,6 +163,41 @@ TIE_SECONDS_KEY = "tie_seconds"
 DEFAULT_ANSWER_SECONDS = 10.0
 DEFAULT_TIE_SECONDS = 1.0
 
+# How long whoever set a line off has to go quiet before it is said.
+#
+# An ASR returns utterances rather than sentences and splits wherever the
+# speaker paused, so a trigger is as likely to arrive in the middle of a
+# sentence as at the end of one — and a line played the moment the trigger lands
+# is the bot talking over the rest of it. The wait is per speaker and starts
+# again every time that speaker says something else, so what it waits out is
+# them finishing rather than a fixed pause after the trigger.
+#
+# A second, which is a breath between two sentences rather than a lull in the
+# conversation. It is paid by every quote, so it is deliberately shorter than
+# anything else waited on here: the joke is the recognition, and a line that
+# arrives after the channel has moved on is not one.
+QUIET_SECONDS_KEY = "quiet_seconds"
+DEFAULT_QUIET_SECONDS = 1.0
+
+# How often a trigger the tool heard is actually answered, as a probability.
+#
+# Everything, by default, which is what it did before there was a setting. A
+# server that would rather the joke stayed rare turns it down: at a half, a
+# phrase is answered about every other time it is said, and a channel that never
+# quite knows whether the line is coming gets the recognition back that a
+# certainty wears off.
+#
+# It is rolled per utterance rather than per trigger, so a sentence carrying
+# three of them is answered as often as one carrying one. Losing the roll spends
+# nothing — the trigger is not put on backoff, and the next time somebody says
+# it, it is a fresh coin.
+CHANCE_KEY = "chance"
+
+# Both ends of it. Everything is what a server gets for saying nothing, and
+# nothing is a deployment that wants the rounds and not the lines.
+CERTAIN = 1.0
+IMPOSSIBLE = 0.0
+
 # Quotes one server hears and the others do not, written where the rest of its
 # tool config is and in the shape the file uses. Merged over the deployment's
 # list rather than beside it: a trigger written here is what that server hears,
@@ -169,8 +220,9 @@ URL_SCHEMES = ("http", "https")
 DOWNLOAD_TIMEOUT_SECONDS = 10.0
 
 # A window of this or less is off rather than instantaneous: no answer window is
-# a deployment that wants the lines and not the game, and no tie window is one
-# where being second is being late.
+# a deployment that wants the lines and not the game, no tie window is one where
+# being second is being late, and no quiet window is one that would rather
+# interrupt than wait.
 NEVER = 0.0
 
 # What naming it is worth. One, because the round is a few seconds of recall
@@ -523,6 +575,10 @@ class Quotes(Tool):
         self._tie = _seconds(
             TIE_SECONDS_KEY, config.get(TIE_SECONDS_KEY), DEFAULT_TIE_SECONDS
         )
+        self._quiet = _seconds(
+            QUIET_SECONDS_KEY, config.get(QUIET_SECONDS_KEY), DEFAULT_QUIET_SECONDS
+        )
+        self._chance = _chance(CHANCE_KEY, config.get(CHANCE_KEY), CERTAIN)
         self._announcements = {
             key: _checked(key, config.get(key) or default)
             for key, default in DEFAULT_ANNOUNCEMENTS.items()
@@ -537,6 +593,13 @@ class Quotes(Tool):
             DEFAULT_SELF_ANSWER_PENALTY,
         )
         self._rounds: dict[str, Round] = {}
+
+        # Whose line is waiting for them to stop talking, and what wakes the
+        # wait. Per speaker, because the wait is for one person to finish and
+        # somebody else talking over them is not that person; keyed on the
+        # speaker alone for the same reason the rounds are keyed on the title,
+        # the whole tool being one server's.
+        self._holding: dict[int, asyncio.Future[None]] = {}
 
         logger.debug(
             "[%s] Listening for %d triggers across %d quotes: %s",
@@ -650,8 +713,25 @@ class Quotes(Tool):
         whatever trigger it also happens to contain. Otherwise a channel naming
         a title could set off the line that asks about the next one, which is a
         loop the tool would be driving rather than following.
+
+        The line is held until whoever said the trigger has stopped talking, and
+        every utterance of theirs in the meantime starts that wait again — which
+        is why noting that they spoke comes before anything else here, including
+        the round they may have just answered. A speaker already holding a line
+        sets nothing else off: whatever else is in the rest of their sentence,
+        what they get is the one line, said once they have finished saying it.
         """
+        self._spoke(utterance.user_id)
+
         if await self._settled(utterance, session):
+            return
+
+        if utterance.user_id in self._holding:
+            logger.debug(
+                "[%s] %s is still talking over a line of theirs; not queuing another.",
+                self.server,
+                utterance.user,
+            )
             return
 
         quote = self._match(utterance.text)
@@ -670,8 +750,77 @@ class Quotes(Tool):
             wording,
         )
 
+        await self._finished(utterance)
         await self._say(session, wording)
         self._ask(quote, utterance.user_id)
+
+    # ── letting them finish ───────────────────────
+
+    def _spoke(self, user_id: int) -> None:
+        """
+        Note that somebody has said something, waking a line held for them.
+
+        Every utterance, whatever is in it: what the wait is for is the speaker
+        stopping, and a sentence that sets nothing off and answers nothing is
+        still that speaker talking. The wait restarts itself on being woken, so
+        this says "they are still going" rather than "let the line out".
+
+        A future that has already been woken is left alone. Two utterances
+        landing inside the same turn of the loop would otherwise be one of them
+        waking a wait that is already awake, and what it costs is the few
+        microseconds between the two rather than a window.
+        """
+        waiting = self._holding.get(user_id)
+
+        if waiting is not None and not waiting.done():
+            waiting.set_result(None)
+
+    async def _finished(self, utterance: Utterance) -> None:
+        """
+        Wait until whoever set a line off has stopped talking.
+
+        An ASR returns utterances rather than sentences and breaks wherever the
+        speaker paused, so "that's cool, anyway where were we" arrives as two
+        lines about as often as one — and a quote played as the trigger lands is
+        the bot talking over the second half of somebody's sentence.
+
+        What is waited out is the speaker rather than a fixed pause: the window
+        starts again every time they say something else, so a run of speech is
+        answered once it is over however long it runs. Only their own utterances
+        count, the rest of the channel being a conversation rather than an
+        unfinished sentence.
+
+        The wait ends on the clock rather than on being woken, which is the
+        other way round from everything else here that waits: somebody who has
+        finished says nothing, and silence is not an event anything can deliver.
+
+        A window of nothing says the line where it was heard, which is what the
+        tool did before there was a window at all.
+        """
+        if self._quiet <= NEVER:
+            return
+
+        loop = asyncio.get_running_loop()
+
+        try:
+            while True:
+                waiting: asyncio.Future[None] = loop.create_future()
+                self._holding[utterance.user_id] = waiting
+
+                try:
+                    await asyncio.wait_for(waiting, self._quiet)
+                except TimeoutError:
+                    return
+
+                logger.debug(
+                    "[%s] %s is still talking; holding their line for another "
+                    "%.1f seconds.",
+                    self.server,
+                    utterance.user,
+                    self._quiet,
+                )
+        finally:
+            self._holding.pop(utterance.user_id, None)
 
     # ── the round ─────────────────────────────────
 
@@ -888,6 +1037,12 @@ class Quotes(Tool):
         drawn here rather than at load: the point of listing several is that the
         channel does not get the same one twice, and a choice made once at
         startup would be the same one until the next restart.
+
+        A server that answers only some of what it hears rolls for it here, once
+        a live trigger has been found and before anything is spent on it. The
+        roll ends the utterance rather than moving on to the next trigger in it:
+        it is a decision about whether to answer, and a sentence carrying three
+        triggers should not be three times as likely to get one.
         """
         for match in self._triggers.finditer(text):
             trigger = match.group().casefold()
@@ -897,6 +1052,16 @@ class Quotes(Tool):
                 continue
 
             if self._recent.ready(trigger):
+                if not self._answering():
+                    logger.debug(
+                        "[%s] '%s' came up, and the roll against %.2f went the other "
+                        "way; letting it pass.",
+                        self.server,
+                        trigger,
+                        self._chance,
+                    )
+                    return None
+
                 return _chosen(answers)
 
             logger.debug(
@@ -907,6 +1072,18 @@ class Quotes(Tool):
             )
 
         return None
+
+    def _answering(self) -> bool:
+        """
+        Whether this one is answered, for a server that answers only some.
+
+        Certainty is settled without a roll, so the default costs nothing and a
+        server that never turned the odds down draws no randomness at all.
+        """
+        if self._chance >= CERTAIN:
+            return True
+
+        return _rolled() < self._chance
 
 
 def _seconds(key: str, value: Any, default: float) -> float:
@@ -925,6 +1102,28 @@ def _seconds(key: str, value: Any, default: float) -> float:
     except (TypeError, ValueError) as exc:
         raise ValueError(
             f"'{key}' must be a number of seconds, not {value!r}: {exc}"
+        ) from exc
+
+
+def _chance(key: str, value: Any, default: float) -> float:
+    """
+    Odds from the server's settings, or the default it did not set.
+
+    Held between never and always rather than raised on, because both ends are
+    meaningful and everything outside them is the same two answers written less
+    clearly: a probability above one is certainty and one below nothing is
+    never. What is raised on is text that is not a number at all, for the reason
+    `_seconds` gives — a server that wrote odds down meant something by them.
+    """
+    if value is None:
+        return default
+
+    try:
+        return min(CERTAIN, max(IMPOSSIBLE, float(value)))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"'{key}' must be a probability between {IMPOSSIBLE} and {CERTAIN}, "
+            f"not {value!r}: {exc}"
         ) from exc
 
 
@@ -1030,6 +1229,17 @@ def _chosen(options: Sequence[T]) -> T:
     and which answer a trigger with several of them gives.
     """
     return random.choice(options)
+
+
+def _rolled() -> float:
+    """
+    One roll against a server's odds, somewhere between never and always.
+
+    Its own function for the reason `_chosen` is: a test settling how a coin
+    came down should not have to seed the process-wide generator out from under
+    whatever else is drawing from it.
+    """
+    return random.random()
 
 
 def _naming(movie: str) -> re.Pattern[str]:

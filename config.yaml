@@ -279,6 +279,33 @@ servers:
       quotes:
         enabled: false
         config:
+          # How long whoever said the trigger has to go quiet before the line is
+          # said back to them. The transcriber returns utterances rather than
+          # sentences and breaks wherever the speaker paused, so a trigger
+          # arrives mid-sentence about as often as at the end of one, and a line
+          # played the moment it lands is the bot talking over the rest of it.
+          #
+          # The window starts again every time that speaker says something else,
+          # so what is waited out is them finishing rather than a fixed pause;
+          # the rest of the channel talking holds nothing up. 0 says the line
+          # where it was heard, interruption and all.
+          #
+          # quiet_seconds: 1
+
+          # The odds a trigger is answered at all, between 0 and 1. Everything
+          # by default; at a half a phrase comes back about every other time it
+          # is said, which is a bot the channel is never quite sure is going to
+          # say anything rather than one that always does.
+          #
+          # Rolled once per utterance, so a sentence carrying three triggers is
+          # answered as often as one carrying one. A roll that goes the other
+          # way spends nothing: the trigger keeps its backoff for a line that
+          # actually got said, and the next time somebody says it, it is a fresh
+          # coin. 0 answers nothing, for a deployment that wants the rounds and
+          # not the lines.
+          #
+          # chance: 1
+
           # How long the channel has to name the title, from the moment the line
           # has finished playing rather than from the trigger — until it has
           # been said there is nothing to answer. 0 stops the tool asking at

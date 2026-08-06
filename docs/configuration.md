@@ -100,6 +100,8 @@ Answers the channel with the film line it just walked into. It listens for a tri
 quotes:
   enabled: true
   config:
+    quiet_seconds: 1
+    chance: 1
     answer_seconds: 10
     tie_seconds: 1
     remarks:
@@ -108,6 +110,8 @@ quotes:
 
 | Setting | Required | Purpose |
 |---|---|---|
+| `quiet_seconds` | no, `1` | How long whoever said the trigger has to go quiet before the line is said. `0` says it where it was heard; see [letting the speaker finish](#letting-the-speaker-finish) |
+| `chance` | no, `1` | The odds a trigger is answered at all, between `0` and `1`. Rolled once per utterance; see [answering only some of it](#answering-only-some-of-it) |
 | `answer_seconds` | no, `10` | How long the channel has to name the title once the line has finished playing. `0` stops the tool asking at all |
 | `tie_seconds` | no, `1` | How long after the first correct answer a second one is still paid. `0` pays only whoever was first |
 | `penalize_self_answers` | no, `true` | Whether whoever set a line off is barred from naming it. `false` lets them answer like anybody else |
@@ -252,6 +256,22 @@ Matching is **whole words, case-insensitive**, so `real` does not fire inside `r
 **A trigger that has just fired goes quiet for [`settings.quotes.backoff_seconds`](#settings-quotes)**, five minutes by default. The joke is the recognition, and a channel that says "cool" four times in a minute does not want "Shiny." four times back. The window is keyed on the **trigger**, not the speaker and not the line, and is per server and held in memory only — so two channels arriving at the same line have each made the joke once, and a restart forgives every backoff.
 
 **The whole list is rendered at startup.** The triggers are a closed set and so are the answers, so on the way up the tool hands `tts` every line in the file. A callback that arrives four seconds after the line it answers is not a callback. The exception is a line naming whoever set it off, which is rendered once per name on the roster.
+
+#### Letting the speaker finish {#letting-the-speaker-finish}
+
+**A line waits for whoever set it off to stop talking**, `quiet_seconds` of it — one second by default. The ASR returns utterances rather than sentences and breaks wherever the speaker paused, so a trigger arrives in the middle of a thought about as often as at the end of one, and a line played the moment the trigger lands is the bot talking over the rest of what somebody was saying.
+
+**The window starts again every time that speaker says something else**, so what is waited out is them finishing rather than a fixed pause after the trigger. Only their own utterances count — the rest of the channel talking is a conversation, not an unfinished sentence, and holds nothing up.
+
+A speaker already holding a line **sets nothing else off** while they are still going: whatever else is in the rest of their sentence, what they get is the one line, said once they have finished saying it. What they can still do is answer a round somebody else opened, since that is a question already in front of them rather than their own sentence.
+
+The round opens when the line has finished playing, so the wait moves the question along with it. `quiet_seconds: 0` says the line where it was heard, interruption and all.
+
+#### Answering only some of it {#answering-only-some-of-it}
+
+`chance` is the odds a trigger is answered at all, between `0` and `1`, and **everything by default**. A server that turns it down gets a bot the channel is never quite sure is going to say anything, which is a different joke from one that always does — at `0.5` a phrase comes back about every other time it is said.
+
+The roll is **once per utterance**, not once per trigger, so a sentence carrying three of them is answered as often as one carrying one. A roll that goes the other way **spends nothing**: the trigger is not put on backoff, and the next time somebody says it, it is a fresh coin. Anything written outside the two ends is held at them, and `0` answers nothing at all — which is a deployment that wants the rounds and not the lines.
 
 #### Naming it
 
