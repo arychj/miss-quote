@@ -42,6 +42,12 @@ and deliberately so — a transcript on disk is a file with a retention window,
 while the same words in a text channel are permanent, searchable, and readable by
 people who were never in the room.
 
+The message is pinned while it is live, so a room that is talking can reach it
+without scrolling — and so that a feed left behind by a process that went away
+mid-session is findable by the next one, which sweeps it up rather than posting
+beside it. Deleting a message unpins it, so nothing has to be undone on the way
+out. That is all `bot.ticker`'s business; this tool says what the block reads.
+
 It comes down when the room does. A sealed session is everybody having left, and
 a feed left up from then on is the last thing said on the way out sitting in the
 channel looking current — so the message is deleted as the session seals, before

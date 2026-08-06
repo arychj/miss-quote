@@ -342,7 +342,7 @@ miss-quote/
 │       │   ├── speaker.py     # Playback into a voice channel, fed while it plays
 │       │   ├── topic.py       # A line under the name of the channel the bot is in
 │       │   ├── announcer.py   # A body of text in a text channel named by a tool
-│       │   └── ticker.py      # One message in a text channel, rewritten in place
+│       │   └── ticker.py      # One message in a text channel, pinned and rewritten in place
 │       ├── audio/
 │       │   ├── resampler.py   # soxr, both directions
 │       │   ├── opus.py        # Encode to what Discord sends, and the Ogg it is kept in

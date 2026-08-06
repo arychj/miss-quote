@@ -15,6 +15,11 @@ SECOND = "```\nErik: We open the door.\nEli: There is nothing behind it.\n```"
 
 SERVER_ERROR = 500
 REFUSED = 400
+PINS_FULL = 30003
+
+# Who posted a pinned message: the bot, or anybody else in the channel.
+BOT_ID = 1
+SOMEBODY_ELSE = 2
 
 
 class Message:
@@ -25,12 +30,17 @@ class Message:
         content: str,
         failing: Exception | None = None,
         undeletable: Exception | None = None,
+        unpinnable: Exception | None = None,
+        author: int = BOT_ID,
     ) -> None:
         self.content = content
         self.edits: list[str] = []
         self.deleted = False
+        self.pinned = False
+        self.author = Author(author)
         self._failing = failing
         self._undeletable = undeletable
+        self._unpinnable = unpinnable
 
     async def edit(self, content: str, allowed_mentions=None) -> None:
         if self._failing is not None:
@@ -44,27 +54,64 @@ class Message:
             raise self._undeletable
 
         self.deleted = True
+        self.pinned = False
+
+    async def pin(self) -> None:
+        if self._unpinnable is not None:
+            raise self._unpinnable
+
+        self.pinned = True
+
+
+class Author:
+    """Whoever posted a message, as much of them as the sweep reads."""
+
+    def __init__(self, id: int) -> None:
+        self.id = id
+
+
+class Guild:
+    """The server a channel is in, as much of it as the sweep reads."""
+
+    def __init__(self, me: int = BOT_ID) -> None:
+        self.me = Author(me)
 
 
 class Channel:
     """A text channel that hands back the messages it was asked to post."""
 
-    def __init__(self, name: str = CHANNEL, failing: Exception | None = None) -> None:
+    def __init__(
+        self,
+        name: str = CHANNEL,
+        failing: Exception | None = None,
+        pinned: tuple[Message, ...] = (),
+        unreadable: Exception | None = None,
+    ) -> None:
         self.name = name
         self.posted: list[Message] = []
+        self.guild = Guild()
         self._failing = failing
+        self._pinned = list(pinned)
+        self._unreadable = unreadable
 
         # What the next message posted here will do when it is edited or
         # deleted, so a test about a message that has gone does not have to
         # reach into one.
         self.editing: Exception | None = None
         self.deleting: Exception | None = None
+        self.pinning: Exception | None = None
+
+    async def pins(self) -> list[Message]:
+        if self._unreadable is not None:
+            raise self._unreadable
+
+        return list(self._pinned)
 
     async def send(self, content: str, allowed_mentions=None) -> Message:
         if self._failing is not None:
             raise self._failing
 
-        message = Message(content, self.editing, self.deleting)
+        message = Message(content, self.editing, self.deleting, self.pinning)
         self.posted.append(message)
 
         return message
@@ -265,3 +312,91 @@ async def test_a_delete_that_will_not_land_is_let_go_of_anyway(failure):
     await ticker.clear(ALIAS, CHANNEL)
 
     assert ticker._shown == {}
+
+
+# ── the pin, and what it makes findable ───────
+
+
+def _http_code(code: int) -> discord.HTTPException:
+    """An HTTPException carrying one of Discord's own error codes."""
+    failure = _http(REFUSED)
+    failure.code = code
+
+    return failure
+
+
+async def test_the_message_is_pinned_while_it_is_live():
+    channel = Channel()
+
+    await _ticker(channel).show(ALIAS, CHANNEL, FIRST)
+
+    assert channel.posted[0].pinned
+
+
+async def test_deleting_it_takes_it_off_the_pin_list():
+    """Which is why taking the feed down needs no unpinning."""
+    channel = Channel()
+    ticker = _ticker(channel)
+    await ticker.show(ALIAS, CHANNEL, FIRST)
+
+    await ticker.clear(ALIAS, CHANNEL)
+
+    assert not channel.posted[0].pinned
+
+
+async def test_a_feed_left_pinned_by_a_dead_process_is_swept():
+    """The pin list is where a message nothing came back for is findable."""
+    orphan = Message(FIRST)
+    orphan.pinned = True
+    channel = Channel(pinned=(orphan,))
+
+    await _ticker(channel).show(ALIAS, CHANNEL, SECOND)
+
+    assert orphan.deleted
+
+
+async def test_somebody_elses_pinned_message_is_left_alone():
+    theirs = Message("the house rules", author=SOMEBODY_ELSE)
+    theirs.pinned = True
+    channel = Channel(pinned=(theirs,))
+
+    await _ticker(channel).show(ALIAS, CHANNEL, FIRST)
+
+    assert not theirs.deleted
+
+
+async def test_the_sweep_only_runs_when_a_message_is_posted():
+    """An edit is the same message; there is nothing of an earlier run to find."""
+    orphan = Message(FIRST)
+    channel = Channel(pinned=(orphan,))
+    ticker = _ticker(channel)
+    await ticker.show(ALIAS, CHANNEL, FIRST)
+    orphan.deleted = False
+
+    await ticker.show(ALIAS, CHANNEL, SECOND)
+
+    assert not orphan.deleted
+
+
+async def test_pins_that_cannot_be_read_still_leave_a_feed():
+    channel = Channel(unreadable=_http(SERVER_ERROR))
+
+    assert await _ticker(channel).show(ALIAS, CHANNEL, FIRST)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        discord.Forbidden(_Response(403), "no"),
+        _http_code(PINS_FULL),
+        _http(SERVER_ERROR),
+        OSError("the network"),
+    ],
+)
+async def test_a_pin_that_will_not_land_still_leaves_a_feed(failure):
+    """The message is up, which is what was asked for; the pin is a convenience."""
+    channel = Channel()
+    channel.pinning = failure
+
+    assert await _ticker(channel).show(ALIAS, CHANNEL, FIRST)
+    assert channel.posted[0].content == FIRST
