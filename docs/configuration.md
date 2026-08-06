@@ -392,10 +392,12 @@ That shape is what keeps it inside Discord's limits. Editing a message is roughl
 
 The wait is measured from the **end** of a write, so an edit that spent a second sitting out a rate limit is followed by the whole interval rather than by an already-queued next one. A slow Discord slows the feed instead of building a backlog.
 
+**It comes down when the room does.** The message is deleted as the session seals — before the summary that replaces it has even been asked for, since a feed taken down at the end would spend the length of a summary showing the last thing somebody said on their way out as though it were current. The next session posts a new one. What the evening leaves behind is the summary.
+
 Two things are worth knowing before you turn it on:
 
 - **Lines are fenced and trimmed.** Each is `Name: what they said`, cut to 180 characters so one person reading a paragraph aloud cannot clear the rest off, with backticks removed and whitespace collapsed. The code fence is what stops an ASR transcript of somebody saying "at everyone" from pinging the server.
-- **A restart posts a new message.** Which message is being written to is held in memory only, so a redeploy leaves the old block where it was, stale, and starts another. The alternative is a stored ID to keep in step with a channel somebody may have cleared, for a block a reader can see has stopped moving.
+- **A restart posts a new message.** Which message is being written to is held in memory only, so a redeploy leaves the old block where it was, stale, and starts another — the one case where a feed is not taken down behind itself. The alternative is a stored ID to keep in step with a channel somebody may have cleared, for a block a reader can see has stopped moving.
 
 #### Writing it down
 

@@ -42,6 +42,12 @@ and deliberately so — a transcript on disk is a file with a retention window,
 while the same words in a text channel are permanent, searchable, and readable by
 people who were never in the room.
 
+It comes down when the room does. A sealed session is everybody having left, and
+a feed left up from then on is the last thing said on the way out sitting in the
+channel looking current — so the message is deleted as the session seals, before
+the summary that replaces it is even asked for. What the evening leaves behind is
+the summary.
+
 The writing is a service rather than part of the utterance path, which is what
 keeps it inside Discord's rate limit. Editing a message is about five requests
 every five seconds per channel, so `handle_utterance` only adds to a ring and one
@@ -631,10 +637,18 @@ class Summary(Tool):
         A failure anywhere costs the summary and nothing else. The transcript is
         untouched and can be summarized again by hand, which is why nothing here
         writes a partial result or posts one.
+
+        The live feed comes down first, before the model is asked anything. A
+        sealed session is the room having emptied, and what a feed would show
+        from then on is the last thing somebody said on their way out, sitting
+        in the channel looking current — for as long as a summary takes to
+        write, if it were taken down at the end instead.
         """
         monitored = self._for(transcript.source)
         if monitored is None:
             return
+
+        await self._cleared(monitored)
 
         utterances = transcript.read()
         if len(utterances) < monitored.minimum_utterances:
@@ -1138,6 +1152,27 @@ class Summary(Tool):
 
         if await self.ticker.show(self.server, monitored.channel, body):
             self._showing[monitored.name] = body
+
+    async def _cleared(self, monitored: Monitored) -> None:
+        """
+        Take one room's feed down, and forget what was on it.
+
+        Both, and in that order, because the loop is still running: a ring left
+        behind would be written straight back up by the next pass, and the same
+        block posted as a second message. An empty ring shows nothing, which is
+        what the room is now.
+
+        A room that was never showing anything has nothing to take down, and
+        `Ticker.clear` says so by doing nothing rather than by being asked
+        first — but the state is dropped either way, since a channel that turned
+        the feed off between one session and the next should not keep the last
+        one's lines.
+        """
+        self._lines.pop(monitored.name, None)
+        self._showing.pop(monitored.name, None)
+
+        if monitored.posting:
+            await self.ticker.clear(self.server, monitored.channel)
 
     # ── the rest ──────────────────────────────────
 

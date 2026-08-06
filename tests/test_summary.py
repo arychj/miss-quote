@@ -173,12 +173,16 @@ class FakeTicker:
 
     def __init__(self, refusing: bool = False) -> None:
         self.shown: list[tuple[str, str]] = []
+        self.cleared: list[str] = []
         self._refusing = refusing
 
     async def show(self, server: str, channel: str, text: str) -> bool:
         self.shown.append((channel, text))
 
         return not self._refusing
+
+    async def clear(self, server: str, channel: str) -> None:
+        self.cleared.append(channel)
 
 
 @dataclass
@@ -1508,3 +1512,63 @@ async def test_the_service_writes_what_the_room_says(summaries):
         running.cancel()
 
     assert _lines(_block(ticker)) == [f"{ASKER}: Live."]
+
+
+async def test_the_feed_comes_down_when_the_room_empties(summaries, model):
+    """A sealed session is everybody having left; what is left up looks current."""
+    ticker = FakeTicker()
+    tool, _ = _tool(config=_watching(), ticker=ticker)
+    await tool.handle_utterance(_said("Goodnight."), Session(WATCHED_SOURCE))
+    await _refreshed(tool)
+
+    await tool.handle_finished(_transcript(summaries, WATCHED_SOURCE))
+
+    assert ticker.cleared == [POSTING_CHANNEL]
+
+
+async def test_what_was_on_the_feed_is_forgotten(summaries, model):
+    """The loop is still running, so a ring left behind is a second message."""
+    ticker = FakeTicker()
+    tool, _ = _tool(config=_watching(), ticker=ticker)
+    await tool.handle_utterance(_said("Goodnight."), Session(WATCHED_SOURCE))
+    await _refreshed(tool)
+    shown = len(ticker.shown)
+
+    await tool.handle_finished(_transcript(summaries, WATCHED_SOURCE))
+    await _refreshed(tool)
+
+    assert len(ticker.shown) == shown
+
+
+async def test_the_next_session_starts_the_feed_again(summaries, model):
+    ticker = FakeTicker()
+    tool, _ = _tool(config=_watching(), ticker=ticker)
+    await tool.handle_utterance(_said("Last night."), Session(WATCHED_SOURCE))
+    await _refreshed(tool)
+    await tool.handle_finished(_transcript(summaries, WATCHED_SOURCE))
+
+    await tool.handle_utterance(_said("Tonight."), Session(WATCHED_SOURCE))
+    await _refreshed(tool)
+
+    assert _lines(_block(ticker)) == [f"{ASKER}: Tonight."]
+
+
+async def test_a_session_too_short_to_summarize_still_takes_the_feed_down(summaries):
+    """The feed is not the summary; it comes down because the room emptied."""
+    ticker = FakeTicker()
+    tool, _ = _tool(config=_watching(), ticker=ticker)
+    await tool.handle_utterance(_said("Hello?"), Session(WATCHED_SOURCE))
+    await _refreshed(tool)
+
+    await tool.handle_finished(_transcript(summaries, WATCHED_SOURCE, lines=1))
+
+    assert ticker.cleared == [POSTING_CHANNEL]
+
+
+async def test_an_unwatched_room_takes_nothing_down(summaries, model):
+    ticker = FakeTicker()
+    tool, _ = _tool(config=_watching(), ticker=ticker)
+
+    await tool.handle_finished(_transcript(summaries, UNWATCHED_SOURCE))
+
+    assert ticker.cleared == []

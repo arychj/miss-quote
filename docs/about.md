@@ -251,7 +251,7 @@ class Example(Tool):
         """Started once the bot has connected, and left going."""
 ```
 
-A tool is also handed a `topic`, which is somewhere to put one line where the channel can read it, an `announcer`, which is somewhere to post something longer in a text channel it names, a `ticker`, which keeps one message in such a channel and goes on rewriting it — for something worth reading while it is current and not worth a channel full of messages afterwards — its server's `users` roster, and a `tools` box holding the other tools that server has enabled. Answering out loud is not on that list: playing audio belongs to the `tts` tool, and every other tool reaches it through the box.
+A tool is also handed a `topic`, which is somewhere to put one line where the channel can read it, an `announcer`, which is somewhere to post something longer in a text channel it names, a `ticker`, which keeps one message in such a channel, goes on rewriting it, and takes it down when it stops being current — for something worth reading while it is happening and not worth a channel full of messages afterwards — its server's `users` roster, and a `tools` box holding the other tools that server has enabled. Answering out loud is not on that list: playing audio belongs to the `tts` tool, and every other tool reaches it through the box.
 
 A topic and an announcer are different things and not two spellings of one. A topic is a single line that replaces the last one under a voice channel's name — a tally worth glancing at. An announcement is a message that joins the ones before it in a channel somebody scrolls back through — a summary worth reading later. `scoreboard` uses the first and `summary` the second.
 

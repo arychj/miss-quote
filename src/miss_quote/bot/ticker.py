@@ -133,6 +133,46 @@ class DiscordTicker:
 
         return True
 
+    async def clear(self, server: str, channel: str) -> None:
+        """
+        Delete the message being rewritten, if there is one.
+
+        What the feed is for is a room watching itself, and a room that has
+        emptied is not watching anything: what would be left is the last thing
+        said before everybody went to bed, sitting in the channel looking
+        current. The summary is what the evening leaves behind.
+
+        Nothing is reported. A message somebody deleted first is the state being
+        asked for, and everything else is a channel the bot is on its way out of
+        — there is no next attempt to make it worth telling anybody about, so a
+        failure is a line in the log and a handle let go of either way.
+        """
+        held = self._shown.pop((server, channel), None)
+        if held is None:
+            return
+
+        try:
+            await held.delete()
+        except discord.NotFound:
+            logger.debug(
+                "The message showing %s's transcript in '%s' was already gone.",
+                server,
+                channel,
+            )
+        except discord.Forbidden:
+            logger.warning(
+                "Not allowed to delete in '%s'; %s's transcript will stay up. "
+                "The bot needs Manage Messages on the channel.",
+                channel,
+                server,
+            )
+        except (discord.HTTPException, OSError, asyncio.TimeoutError) as exc:
+            logger.warning(
+                "Could not take %s's transcript out of '%s': %s", server, channel, exc
+            )
+        else:
+            logger.info("Took %s's transcript out of '#%s'.", server, channel)
+
     async def _post(self, server: str, channel: str, target: Any, body: str) -> bool:
         """
         Put the first message up, and hold on to it for every one after.

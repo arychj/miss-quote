@@ -18,12 +18,19 @@ REFUSED = 400
 
 
 class Message:
-    """A message that remembers every version of itself."""
+    """A message that remembers every version of itself, and its own end."""
 
-    def __init__(self, content: str, failing: Exception | None = None) -> None:
+    def __init__(
+        self,
+        content: str,
+        failing: Exception | None = None,
+        undeletable: Exception | None = None,
+    ) -> None:
         self.content = content
         self.edits: list[str] = []
+        self.deleted = False
         self._failing = failing
+        self._undeletable = undeletable
 
     async def edit(self, content: str, allowed_mentions=None) -> None:
         if self._failing is not None:
@@ -31,6 +38,12 @@ class Message:
 
         self.content = content
         self.edits.append(content)
+
+    async def delete(self) -> None:
+        if self._undeletable is not None:
+            raise self._undeletable
+
+        self.deleted = True
 
 
 class Channel:
@@ -41,15 +54,17 @@ class Channel:
         self.posted: list[Message] = []
         self._failing = failing
 
-        # What the next message posted here will do when it is edited, so a test
-        # about a message that has gone does not have to reach into one.
+        # What the next message posted here will do when it is edited or
+        # deleted, so a test about a message that has gone does not have to
+        # reach into one.
         self.editing: Exception | None = None
+        self.deleting: Exception | None = None
 
     async def send(self, content: str, allowed_mentions=None) -> Message:
         if self._failing is not None:
             raise self._failing
 
-        message = Message(content, self.editing)
+        message = Message(content, self.editing, self.deleting)
         self.posted.append(message)
 
         return message
@@ -200,3 +215,53 @@ async def test_what_is_shown_is_cut_to_the_limit():
     await _ticker(channel).show(ALIAS, CHANNEL, "x" * (MESSAGE_LIMIT + 1))
 
     assert len(channel.posted[0].content) == MESSAGE_LIMIT
+
+
+# ── taking it down ────────────────────────────
+
+
+async def test_clearing_deletes_the_message():
+    channel = Channel()
+    ticker = _ticker(channel)
+    await ticker.show(ALIAS, CHANNEL, FIRST)
+
+    await ticker.clear(ALIAS, CHANNEL)
+
+    assert channel.posted[0].deleted
+
+
+async def test_clearing_what_was_never_shown_is_harmless():
+    await _ticker(Channel()).clear(ALIAS, CHANNEL)
+
+
+async def test_showing_again_after_clearing_posts_a_new_message():
+    """The handle is let go of, so the next session is a message of its own."""
+    channel = Channel()
+    ticker = _ticker(channel)
+    await ticker.show(ALIAS, CHANNEL, FIRST)
+    await ticker.clear(ALIAS, CHANNEL)
+
+    await ticker.show(ALIAS, CHANNEL, SECOND)
+
+    assert [message.content for message in channel.posted] == [FIRST, SECOND]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        discord.NotFound(_Response(404), "gone"),
+        discord.Forbidden(_Response(403), "no"),
+        _http(SERVER_ERROR),
+        OSError("the network"),
+    ],
+)
+async def test_a_delete_that_will_not_land_is_let_go_of_anyway(failure):
+    """There is no next attempt: the bot is on its way out of the channel."""
+    channel = Channel()
+    channel.deleting = failure
+    ticker = _ticker(channel)
+    await ticker.show(ALIAS, CHANNEL, FIRST)
+
+    await ticker.clear(ALIAS, CHANNEL)
+
+    assert ticker._shown == {}
