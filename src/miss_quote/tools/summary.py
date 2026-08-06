@@ -35,6 +35,21 @@ whole question already, and answering it as it lands retells the wrong evening
 rather than none, so a question that named no evening waits a moment to see
 whether one is coming — see `Summary._clause`.
 
+**Showing it as it is said.** A room may also watch itself: `post_transcripts`
+keeps the last ten lines in one message in the same text channel, rewritten as
+the room talks rather than posted line by line. It is off unless a channel asks,
+and deliberately so — a transcript on disk is a file with a retention window,
+while the same words in a text channel are permanent, searchable, and readable by
+people who were never in the room.
+
+The writing is a service rather than part of the utterance path, which is what
+keeps it inside Discord's rate limit. Editing a message is about five requests
+every five seconds per channel, so `handle_utterance` only adds to a ring and one
+loop per room writes what has changed and then waits out
+`transcript_refresh_seconds` — measured from the end of the write, so a slow
+Discord slows the feed instead of queueing behind it. Nothing is written unless
+something was said. See `Summary._ticking` and `bot.ticker`.
+
 **Everything is per voice channel, under `monitored_channels`.** A server's rooms
 are not interchangeable: one is where a game night happens and one is where two
 people are debugging something, and a bot that summarizes every room it was ever
@@ -52,7 +67,8 @@ from __future__ import annotations
 import asyncio
 import re
 import time
-from collections.abc import Mapping
+from collections import deque
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -69,7 +85,7 @@ from miss_quote.tools.base import Finder, Tool, ToolContext
 from miss_quote.tools.tts import Tts
 from miss_quote.transcript.writer import Source, Transcript, TranscriptSession, Utterance
 from miss_quote.utils.logging import get_logger
-from miss_quote.utils.phrases import normalized, pattern, spoken
+from miss_quote.utils.phrases import NOTHING, normalized, pattern, spoken
 from miss_quote.utils.slugs import slugify
 
 logger = get_logger(__name__)
@@ -93,6 +109,9 @@ NAME_KEY = "name"
 TRIGGERS_KEY = "triggers"
 ADDRESS_WINDOW_SECONDS_KEY = "address_window_seconds"
 CLAUSE_WINDOW_SECONDS_KEY = "clause_window_seconds"
+POST_TRANSCRIPTS_KEY = "post_transcripts"
+TRANSCRIPT_LINES_KEY = "transcript_lines"
+TRANSCRIPT_REFRESH_SECONDS_KEY = "transcript_refresh_seconds"
 
 # Everything a channel block may say. Anything else in one is a setting nothing
 # reads, on the same reasoning as a stray key in a tool block: a channel quietly
@@ -120,6 +139,9 @@ CHANNEL_KEYS = (
     TRIGGERS_KEY,
     ADDRESS_WINDOW_SECONDS_KEY,
     CLAUSE_WINDOW_SECONDS_KEY,
+    POST_TRANSCRIPTS_KEY,
+    TRANSCRIPT_LINES_KEY,
+    TRANSCRIPT_REFRESH_SECONDS_KEY,
 )
 
 # How long a retelling has to sound like before it is worth the tokens, and how
@@ -267,6 +289,62 @@ DEFAULT_ADDRESS_WINDOW_SECONDS = 15.0
 # of a sentence rather than a gap between two sentences.
 DEFAULT_CLAUSE_WINDOW_SECONDS = 1.5
 
+# Whether the room can watch itself being transcribed: the last few lines of
+# what has been said, in the channel the summary goes to, in one message that is
+# rewritten rather than a channel full of them.
+#
+# Off, and off deliberately. A transcript on disk is a file with a retention
+# window in a volume; the same words in a text channel are permanent,
+# searchable, and readable by people who were never in the room. That is a
+# decision a server makes rather than one it discovers, so it is written down
+# per channel like everything else here.
+POST_TRANSCRIPTS = False
+
+# How many lines are up at once. Ten is about what a client shows without
+# anybody scrolling, and the thing being watched is the last few seconds rather
+# than the evening — what the evening said is the transcript, and there is a
+# tool for asking about it.
+DEFAULT_TRANSCRIPT_LINES = 10
+
+# How long the feed waits after each write before it writes again.
+#
+# Editing a message is a per-channel bucket of about five requests every five
+# seconds, so two seconds is a quarter of it — enough that a fine or a summary
+# posted in the same channel is not queueing behind the transcript. It is a
+# floor rather than a tick: nothing is written unless something was said, and
+# what the wait bounds is how often a busy room can make it write.
+#
+# The gap to `Topic`, which is two writes every ten minutes, is why this feed is
+# a message rather than a channel status.
+DEFAULT_TRANSCRIPT_REFRESH_SECONDS = 2.0
+
+# The fastest a server may ask for. discord.py sleeps out a rate limit rather
+# than raising, so a file asking for a twentieth of a second does not fail — it
+# silently lags, and a feed that reads as live while running a minute behind is
+# worse than one that is plainly slow. Zero is not fast; it is off, which is
+# what zero means everywhere else here.
+MINIMUM_TRANSCRIPT_REFRESH_SECONDS = 0.25
+
+# How much of one utterance goes up. Long enough for a sentence and short enough
+# that one person reading out a paragraph cannot push the other nine lines off
+# the message.
+TRANSCRIPT_LINE_LIMIT = 180
+
+# How a line of the feed reads, and what it is wrapped in. A fence is what stops
+# a transcript of somebody saying "at everyone" from pinging the server, and
+# what stops an ASR returning an asterisk from italicising the rest of the feed.
+TRANSCRIPT_LINE = "{user}: {text}"
+TRANSCRIPT_FENCE = "```"
+TRANSCRIPT_BODY = TRANSCRIPT_FENCE + "\n{lines}\n" + TRANSCRIPT_FENCE
+
+# What a fence cannot survive inside it, how a line that ran long says so, and
+# what holds a line's words apart once whatever the ASR put between them has
+# been collapsed.
+BACKTICK = "`"
+ELLIPSIS = "…"
+LINE_BREAK = "\n"
+WORD_SEPARATOR = " "
+
 # What the post says above the summary, so a channel scrolling back knows which
 # evening it is looking at.
 HEADER = "**{channel}** — {when}"
@@ -318,10 +396,30 @@ class Monitored:
     triggers: re.Pattern[str]
     address_window_seconds: float
     clause_window_seconds: float
+    post_transcripts: bool
+    transcript_lines: int
+    transcript_refresh_seconds: float
 
     @property
     def posting(self) -> bool:
         return bool(self.channel)
+
+    @property
+    def ticking(self) -> bool:
+        """
+        Whether this room's transcript is shown as it is said.
+
+        A channel to show it in is as much a condition as asking for it: the
+        feed goes where the summary goes, and a room that named nowhere to post
+        has named nowhere to show either. An interval of nothing is off for the
+        same reason it is off everywhere else here, and not a feed written as
+        fast as the loop can go round.
+        """
+        return (
+            self.post_transcripts
+            and self.posting
+            and self.transcript_refresh_seconds > NEVER
+        )
 
     def request(self, text: str, today: date) -> When | None:
         """
@@ -411,6 +509,13 @@ class Summary(Tool):
         # is parked on rather than a timestamp: what ends this wait is usually
         # somebody speaking rather than the clock. See `_clause`.
         self._awaiting: dict[tuple[str, int], asyncio.Future[When]] = {}
+
+        # The last few lines each watched room has said, and what its message
+        # currently reads. The second is what makes this write on change rather
+        # than on a tick: a feed nobody has added to renders the same text it
+        # rendered last time, and the same text is not worth an edit.
+        self._lines: dict[str, deque[str]] = {}
+        self._showing: dict[str, str] = {}
 
         logger.debug(
             "[%s] Summarizing %d channel(s): %s",
@@ -603,6 +708,8 @@ class Summary(Tool):
         monitored = self._for(session.source)
         if monitored is None:
             return
+
+        self._noted(monitored, utterance)
 
         if self._completes(monitored, utterance):
             return
@@ -939,6 +1046,99 @@ class Summary(Tool):
 
         return last is None or time.monotonic() - last >= monitored.backoff_seconds
 
+    # ── showing it as it is said ──────────────────
+
+    def _noted(self, monitored: Monitored, utterance: Utterance) -> None:
+        """
+        Keep one line for the feed, if this room is showing one.
+
+        Every utterance, before anything decides what it meant: what a room
+        watching itself wants is what was said, and a question put to the bot is
+        as much a thing somebody said as anything else. Nothing is written here
+        — the ring is what the service reads, and writing on the utterance is
+        what would put an edit behind every line of speech.
+        """
+        if not monitored.ticking:
+            return
+
+        held = self._lines.get(monitored.name)
+
+        # Bounded by the room's own setting, so the ring is the message: what
+        # falls off the back has scrolled out of the block rather than being
+        # kept for something else to find.
+        if held is None or held.maxlen != monitored.transcript_lines:
+            held = deque(held or (), maxlen=monitored.transcript_lines)
+            self._lines[monitored.name] = held
+
+        held.append(_said(utterance))
+
+    async def run(self) -> None:
+        """
+        Keep each watched room's transcript up to date, for as long as the bot is.
+
+        One loop per room rather than one for all of them, because the interval
+        is per room and a shared loop would run every feed at whichever of them
+        asked for the least. A server showing nothing returns immediately, which
+        the runner treats as a service deciding it has nothing to do.
+        """
+        watched = [
+            monitored for monitored in self._monitored.values() if monitored.ticking
+        ]
+
+        if not watched:
+            return
+
+        logger.info(
+            "[%s] Showing the transcript of %d channel(s): %s",
+            self.server,
+            len(watched),
+            LIST_SEPARATOR.join(monitored.name for monitored in watched),
+        )
+
+        await asyncio.gather(*(self._ticking(monitored) for monitored in watched))
+
+    async def _ticking(self, monitored: Monitored) -> None:
+        """
+        One room's feed, written when it has changed and never faster than asked.
+
+        The wait is measured from the end of the write rather than on a fixed
+        tick, which is what keeps a slow Discord from building a queue: an edit
+        that spent a second sitting out a rate limit is followed by the whole
+        interval, so the cadence degrades with the API instead of racing it.
+
+        Nothing here raises past the service. `Ticker.show` reports rather than
+        throws, and a room whose message cannot be written is a warning per
+        write and a loop that goes on trying — the next thing said may be the
+        one that lands.
+        """
+        while True:
+            await self._refresh(monitored)
+            await asyncio.sleep(monitored.transcript_refresh_seconds)
+
+    async def _refresh(self, monitored: Monitored) -> None:
+        """
+        Write this room's message, if what it would say has changed.
+
+        The comparison is against what was last shown rather than a flag
+        something else sets, so nothing can mark the feed clean while it is
+        dirty: what is on the message either matches what the room has said or
+        it does not.
+
+        A room that has said nothing yet shows nothing. An empty block is not a
+        transcript, and posting one would put a message up before there was
+        anything to watch.
+        """
+        held = self._lines.get(monitored.name)
+        if not held:
+            return
+
+        body = _fenced(held)
+        if body == self._showing.get(monitored.name):
+            return
+
+        if await self.ticker.show(self.server, monitored.channel, body):
+            self._showing[monitored.name] = body
+
     # ── the rest ──────────────────────────────────
 
     def _for(self, source: Source) -> Monitored | None:
@@ -1059,7 +1259,79 @@ def _channel(
             DEFAULT_CLAUSE_WINDOW_SECONDS,
             SECONDS,
         ),
+        post_transcripts=bool(raw.get(POST_TRANSCRIPTS_KEY, POST_TRANSCRIPTS)),
+        transcript_lines=_whole(
+            TRANSCRIPT_LINES_KEY,
+            raw.get(TRANSCRIPT_LINES_KEY),
+            DEFAULT_TRANSCRIPT_LINES,
+        ),
+        transcript_refresh_seconds=_paced(
+            raw.get(TRANSCRIPT_REFRESH_SECONDS_KEY), DEFAULT_TRANSCRIPT_REFRESH_SECONDS
+        ),
     )
+
+
+def _paced(value: Any, default: float) -> float:
+    """
+    How often a feed may be written, held above the fastest that is sensible.
+
+    A file asking for a twentieth of a second is not asking for a faster feed:
+    discord.py sleeps out the rate limit it would earn rather than raising, so
+    what it gets is a message running a minute behind a room that believes it is
+    watching itself live. Held at the floor and said so, rather than refused,
+    because what was meant is plain and the nearest thing to it is a working
+    feed.
+    """
+    asked = _span(
+        TRANSCRIPT_REFRESH_SECONDS_KEY, value, default, SECONDS
+    )
+
+    if asked <= NEVER or asked >= MINIMUM_TRANSCRIPT_REFRESH_SECONDS:
+        return asked
+
+    logger.warning(
+        "'%s' of %.2f is faster than Discord will take; holding it at %.2f.",
+        TRANSCRIPT_REFRESH_SECONDS_KEY,
+        asked,
+        MINIMUM_TRANSCRIPT_REFRESH_SECONDS,
+    )
+
+    return MINIMUM_TRANSCRIPT_REFRESH_SECONDS
+
+
+def _said(utterance: Utterance) -> str:
+    """
+    One utterance as a line of the feed.
+
+    Backticks come out rather than being escaped, because what they would break
+    out of is the fence the whole block depends on and an ASR that returned one
+    was transcribing a sound rather than a character. Whitespace collapses for
+    the same reason one line further down: a line break inside an utterance
+    would be a second line of the block, and the ring counts lines rather than
+    utterances.
+
+    Cut to a length that leaves the other nine lines on the message, since one
+    person reading a paragraph out loud should not clear the room's last minute
+    off the screen.
+    """
+    said = WORD_SEPARATOR.join(utterance.text.replace(BACKTICK, NOTHING).split())
+
+    if len(said) > TRANSCRIPT_LINE_LIMIT:
+        said = said[: TRANSCRIPT_LINE_LIMIT - len(ELLIPSIS)] + ELLIPSIS
+
+    return TRANSCRIPT_LINE.format(user=utterance.user, text=said)
+
+
+def _fenced(lines: Iterable[str]) -> str:
+    """
+    The feed as it goes on the message.
+
+    Fenced, which is doing three things at once: it stops a transcript of
+    somebody saying "at everyone" from pinging the server, stops an asterisk the
+    ASR returned from italicising everything after it, and renders in the
+    monospace a column of names reads best in.
+    """
+    return TRANSCRIPT_BODY.format(lines=LINE_BREAK.join(lines))
 
 
 def _prompt(

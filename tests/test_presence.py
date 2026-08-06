@@ -236,8 +236,8 @@ def make_bot(monkeypatch, tmp_path):
         monkeypatch.setattr(
             client_module,
             "ToolRunner",
-            lambda speaker, topic, announcer: ToolRunner(
-                config.servers, {}, speaker, topic, announcer
+            lambda speaker, topic, announcer, ticker: ToolRunner(
+                config.servers, {}, speaker, topic, announcer, ticker
             ),
         )
         monkeypatch.setattr(client_module, "STTProcessor", FakeProcessor)

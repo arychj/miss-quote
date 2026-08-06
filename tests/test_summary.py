@@ -16,7 +16,14 @@ from miss_quote.audio.hold import DEFAULT_HOLD_VOLUME
 from miss_quote.config import SummaryConfig, TranscriptConfig, transcript_cfg
 from miss_quote.llm.client import CompletionError
 from miss_quote.tools.base import Tool, ToolContext, Toolbox
-from miss_quote.tools.summary import DEFAULT_ADDRESS_WINDOW_SECONDS, Summary
+from miss_quote.tools.summary import (
+    DEFAULT_ADDRESS_WINDOW_SECONDS,
+    ELLIPSIS,
+    MINIMUM_TRANSCRIPT_REFRESH_SECONDS,
+    TRANSCRIPT_FENCE,
+    TRANSCRIPT_LINE_LIMIT,
+    Summary,
+)
 from miss_quote.tools.tts import Tts
 from miss_quote.transcript.writer import Source, Transcript, Utterance
 
@@ -155,6 +162,25 @@ class FakeAnnouncer:
         return True
 
 
+class FakeTicker:
+    """
+    Somewhere to keep one message, remembering every version of it.
+
+    A list rather than the last one, because what the feed is judged on is how
+    often it wrote as much as what it wrote: a tool that rewrote an unchanged
+    block every couple of seconds would look identical from the final state.
+    """
+
+    def __init__(self, refusing: bool = False) -> None:
+        self.shown: list[tuple[str, str]] = []
+        self._refusing = refusing
+
+    async def show(self, server: str, channel: str, text: str) -> bool:
+        self.shown.append((channel, text))
+
+        return not self._refusing
+
+
 @dataclass
 class Session:
     """What the tool reads off a live session, which is where it came from."""
@@ -213,6 +239,7 @@ def _tool(
     config: dict | None = None,
     announcer: FakeAnnouncer | None = None,
     speech=None,
+    ticker: FakeTicker | None = None,
     **channel,
 ) -> tuple[Summary, FakeTts]:
     """
@@ -227,6 +254,7 @@ def _tool(
         config=config if config is not None else _config(**channel),
         tools=toolbox.view(Summary),
         announcer=announcer or FakeAnnouncer(),
+        ticker=ticker or FakeTicker(),
     )
 
     talking = (speech or FakeTts)(context)
@@ -1248,3 +1276,235 @@ async def test_music_is_clamped_to_the_channels_own_loudness(
 async def test_music_that_is_not_a_number_stops_the_tool_from_starting(summaries):
     with pytest.raises(ValueError, match="hold_volume"):
         _tool(hold_music=HOLD_MUSIC, hold_volume="loud")
+
+
+# ── showing it as it is said ──────────────────
+
+
+async def _refreshed(tool: Summary) -> None:
+    """
+    Write the watched room's feed once, if it has anything new to write.
+
+    What the service loop does between two sleeps, called directly: a test about
+    what the message says should not also be a test of `asyncio.sleep`.
+    """
+    await tool._refresh(tool._monitored[WATCHED_KEY])
+
+
+def _watching(**channel) -> dict:
+    """A watched channel that shows its transcript as it is said."""
+    return _config(post_transcripts=True, **channel)
+
+
+def _block(ticker: FakeTicker) -> str:
+    """What the message says after the most recent write."""
+    return ticker.shown[-1][1]
+
+
+def _lines(shown: str) -> list[str]:
+    """The lines of a shown block, with the fence taken off either end."""
+    return [line for line in shown.strip().splitlines() if line != TRANSCRIPT_FENCE]
+
+
+async def test_a_room_shows_nothing_unless_it_asks(summaries):
+    """Off by default: the same words in a text channel are a different artifact."""
+    ticker = FakeTicker()
+    tool, _ = _tool(ticker=ticker)
+
+    await tool.handle_utterance(_said("Anything at all."), Session(WATCHED_SOURCE))
+    await _refreshed(tool)
+
+    assert ticker.shown == []
+
+
+async def test_a_watched_room_shows_what_was_said(summaries):
+    ticker = FakeTicker()
+    tool, _ = _tool(config=_watching(), ticker=ticker)
+
+    await tool.handle_utterance(_said("We open the door."), Session(WATCHED_SOURCE))
+    await tool.handle_utterance(
+        _said("There is nothing behind it.", OTHER_ASKER, OTHER_ASKER_ID),
+        Session(WATCHED_SOURCE),
+    )
+    await _refreshed(tool)
+
+    channel, shown = ticker.shown[0]
+
+    assert channel == POSTING_CHANNEL
+    assert _lines(shown) == [
+        f"{ASKER}: We open the door.",
+        f"{OTHER_ASKER}: There is nothing behind it.",
+    ]
+
+
+async def test_a_room_that_has_said_nothing_more_is_not_written_again(summaries):
+    """On change, not on a tick — the whole reason this fits inside the limit."""
+    ticker = FakeTicker()
+    tool, _ = _tool(config=_watching(), ticker=ticker)
+    await tool.handle_utterance(_said("Once."), Session(WATCHED_SOURCE))
+
+    await _refreshed(tool)
+    await _refreshed(tool)
+
+    assert len(ticker.shown) == 1
+
+
+async def test_something_new_is_written(summaries):
+    ticker = FakeTicker()
+    tool, _ = _tool(config=_watching(), ticker=ticker)
+    await tool.handle_utterance(_said("First."), Session(WATCHED_SOURCE))
+    await _refreshed(tool)
+
+    await tool.handle_utterance(_said("Second."), Session(WATCHED_SOURCE))
+    await _refreshed(tool)
+
+    assert len(ticker.shown) == 2
+    assert _lines(_block(ticker)) == [f"{ASKER}: First.", f"{ASKER}: Second."]
+
+
+async def test_only_the_last_lines_are_shown(summaries):
+    ticker = FakeTicker()
+    tool, _ = _tool(config=_watching(transcript_lines=2), ticker=ticker)
+
+    for said in ("One.", "Two.", "Three."):
+        await tool.handle_utterance(_said(said), Session(WATCHED_SOURCE))
+
+    await _refreshed(tool)
+
+    assert _lines(_block(ticker)) == [f"{ASKER}: Two.", f"{ASKER}: Three."]
+
+
+async def test_a_question_to_the_bot_is_still_a_line(summaries, model):
+    """The room is watching what was said, not what the tool decided it meant."""
+    ticker = FakeTicker()
+    tool, _ = _tool(config=_watching(), ticker=ticker)
+
+    await tool.handle_utterance(
+        _said("Miss Quote, what happened last session?"), Session(WATCHED_SOURCE)
+    )
+    await _refreshed(tool)
+
+    assert "what happened last session" in _block(ticker)
+
+
+async def test_an_unwatched_room_is_not_shown(summaries):
+    ticker = FakeTicker()
+    tool, _ = _tool(config=_watching(), ticker=ticker)
+
+    await tool.handle_utterance(_said("Elsewhere."), Session(UNWATCHED_SOURCE))
+    await _refreshed(tool)
+
+    assert ticker.shown == []
+
+
+async def test_one_long_line_cannot_clear_the_rest_off(summaries):
+    ticker = FakeTicker()
+    tool, _ = _tool(config=_watching(), ticker=ticker)
+
+    await tool.handle_utterance(_said("word " * 200), Session(WATCHED_SOURCE))
+    await _refreshed(tool)
+
+    said = _lines(_block(ticker))[0]
+
+    assert said.endswith(ELLIPSIS)
+    assert len(said) <= TRANSCRIPT_LINE_LIMIT + len(f"{ASKER}: ")
+
+
+async def test_a_backtick_cannot_break_the_fence(summaries):
+    """A fence is what stops a transcript from formatting the channel."""
+    ticker = FakeTicker()
+    tool, _ = _tool(config=_watching(), ticker=ticker)
+
+    await tool.handle_utterance(
+        _said("```js\nnot really code"), Session(WATCHED_SOURCE)
+    )
+    await _refreshed(tool)
+
+    assert _lines(_block(ticker)) == [f"{ASKER}: js not really code"]
+
+
+async def test_a_refused_write_is_tried_again(summaries):
+    """Nothing is recorded as shown that was not shown."""
+    ticker = FakeTicker(refusing=True)
+    tool, _ = _tool(config=_watching(), ticker=ticker)
+    await tool.handle_utterance(_said("Once."), Session(WATCHED_SOURCE))
+
+    await _refreshed(tool)
+    await _refreshed(tool)
+
+    assert len(ticker.shown) == 2
+
+
+async def test_a_room_with_nowhere_to_post_shows_nothing(summaries):
+    """The feed goes where the summary goes; a room that named nowhere has neither."""
+    ticker = FakeTicker()
+    tool, _ = _tool(
+        config={
+            "monitored_channels": {
+                WATCHED: {"preamble": PREAMBLE, "post_transcripts": True}
+            }
+        },
+        ticker=ticker,
+    )
+
+    await tool.handle_utterance(_said("Anything."), Session(WATCHED_SOURCE))
+    await _refreshed(tool)
+
+    assert ticker.shown == []
+
+
+async def test_an_interval_of_nothing_is_off(summaries):
+    ticker = FakeTicker()
+    tool, _ = _tool(
+        config=_watching(transcript_refresh_seconds=0), ticker=ticker
+    )
+
+    await tool.handle_utterance(_said("Anything."), Session(WATCHED_SOURCE))
+    await _refreshed(tool)
+
+    assert ticker.shown == []
+
+
+def test_an_interval_faster_than_discord_is_held_at_the_floor(summaries):
+    """A twentieth of a second is not a faster feed, it is one running behind."""
+    tool, _ = _tool(config=_watching(transcript_refresh_seconds=0.05))
+
+    assert (
+        tool._monitored[WATCHED_KEY].transcript_refresh_seconds
+        == MINIMUM_TRANSCRIPT_REFRESH_SECONDS
+    )
+
+
+def test_an_interval_that_is_not_a_number_stops_the_tool_from_starting(summaries):
+    with pytest.raises(ValueError, match="transcript_refresh_seconds"):
+        _tool(config=_watching(transcript_refresh_seconds="often"))
+
+
+async def test_a_server_showing_nothing_has_nothing_to_run(summaries):
+    """Which the runner treats as a service deciding it has nothing to do."""
+    tool, _ = _tool()
+
+    await asyncio.wait_for(tool.run(), timeout=PATIENCE_SECONDS)
+
+
+async def test_the_service_writes_what_the_room_says(summaries):
+    ticker = FakeTicker()
+    tool, _ = _tool(
+        config=_watching(transcript_refresh_seconds=MINIMUM_TRANSCRIPT_REFRESH_SECONDS),
+        ticker=ticker,
+    )
+    running = asyncio.create_task(tool.run())
+
+    try:
+        await tool.handle_utterance(_said("Live."), Session(WATCHED_SOURCE))
+
+        for _ in range(PARKING_ATTEMPTS):
+            if ticker.shown:
+                break
+            await asyncio.sleep(0)
+        else:
+            raise AssertionError("the feed never wrote anything")
+    finally:
+        running.cancel()
+
+    assert _lines(_block(ticker)) == [f"{ASKER}: Live."]
