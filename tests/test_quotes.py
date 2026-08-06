@@ -25,12 +25,17 @@ from miss_quote.tools.quotes import (
     ADDITIONAL_QUOTES_KEY,
     ANNOUNCEMENT_KEY,
     ANSWER_SECONDS_KEY,
+    CERTAIN,
+    CHANCE_KEY,
     DEFAULT_ANNOUNCEMENT,
+    DEFAULT_QUIET_SECONDS,
     DEFAULT_REMARKS,
     DEFAULT_SELF_ANSWER_ANNOUNCEMENT,
     DEFAULT_SELF_ANSWER_PENALTY,
     DEFAULT_TIE_ANNOUNCEMENT,
+    IMPOSSIBLE,
     PENALIZE_SELF_ANSWERS_KEY,
+    QUIET_SECONDS_KEY,
     REMARKS_KEY,
     SELF_ANSWER_ANNOUNCEMENT_KEY,
     SELF_ANSWER_PENALTY_KEY,
@@ -153,6 +158,22 @@ SHORT_WINDOW = 30.0
 ANSWER_WINDOW = 10.0
 TIE_WINDOW = 1.0
 NO_WINDOW = 0.0
+
+# Letting a speaker finish, on the same terms. Short enough to be waited out by
+# a test that wants the line, and long enough elsewhere that nothing under test
+# escapes the hold while the test is still arranging itself.
+QUIET_WINDOW = 0.05
+PATIENT_QUIET_WINDOW = 5.0
+
+# How many turns of the loop a test gives the tool to reach its wait before
+# deciding it never will.
+HOLDING_ATTEMPTS = 100
+
+# Odds a server might set, and the two ways a coin tossed against them can come
+# down. A roll under the odds is answered and one at or over them is not.
+HALF_THE_TIME = 0.5
+UNDER_THE_ODDS = 0.1
+OVER_THE_ODDS = 0.9
 
 # Naming the film, the way the game show does and the several ways a channel
 # actually says it.
@@ -429,6 +450,7 @@ def _tool(
     board=None,
     spoken: bool = True,
     server: str = SERVER_ALIAS,
+    quiet: float | None = NO_WINDOW,
 ) -> Quotes:
     """
     The tool, with its server's voice — and its board, where it keeps one —
@@ -436,11 +458,22 @@ def _tool(
 
     Which is what the runner builds. `spoken=False` is the server that enabled
     nothing to say anything with.
+
+    Nothing waits for a speaker to finish unless the test says to. A line is
+    held for a second by default, and a suite that paid that for every quote it
+    sets off would be a suite about `asyncio.sleep`; `quiet=None` says nothing
+    about the window at all, for the tests that are about what a server gets for
+    not setting one.
     """
+    settings = dict(config or {})
+
+    if quiet is not None:
+        settings.setdefault(QUIET_SECONDS_KEY, quiet)
+
     box = Toolbox([board] if board is not None else [])
     context = ToolContext(
         server=server,
-        config=config or {},
+        config=settings,
         speaker=speaker,
         users=users or {},
         tools=box,
@@ -1364,6 +1397,306 @@ def test_the_window_comes_from_the_deployment(monkeypatch):
     )
 
     assert RecentQuotes().window == SHORT_WINDOW
+
+
+# ── answering only some of it ─────────────────────
+
+
+def _rolling(monkeypatch, *rolls: float) -> list[float]:
+    """
+    Settle how the coin comes down, and keep what was actually tossed.
+
+    Patched at the tool's own roll rather than at `random`, so a test that
+    settles one has not also settled which of several answers a trigger gives.
+    The last value stands for every toss after it, so a test about two utterances
+    says two numbers and one about a server that never rolls says one and asserts
+    it was never reached.
+    """
+    tossed: list[float] = []
+
+    def _roll() -> float:
+        value = rolls[min(len(tossed), len(rolls) - 1)]
+        tossed.append(value)
+
+        return value
+
+    monkeypatch.setattr("miss_quote.tools.quotes._rolled", _roll)
+
+    return tossed
+
+
+async def test_a_trigger_inside_the_odds_is_answered(
+    monkeypatch, quotes_file, speech, speaker
+):
+    _rolling(monkeypatch, UNDER_THE_ODDS)
+    tool = _tool(speaker, config={CHANCE_KEY: HALF_THE_TIME})
+
+    await _hear(tool, TRIGGER)
+
+    assert speech.asked == [QUOTE]
+
+
+async def test_a_trigger_outside_them_is_let_pass(
+    monkeypatch, quotes_file, speech, speaker
+):
+    _rolling(monkeypatch, OVER_THE_ODDS)
+    tool = _tool(speaker, config={CHANCE_KEY: HALF_THE_TIME})
+
+    await _hear(tool, TRIGGER)
+
+    assert speech.asked == []
+
+
+async def test_a_trigger_let_pass_is_a_fresh_coin_next_time(
+    monkeypatch, quotes_file, speech, speaker
+):
+    """Losing the roll spends nothing: the backoff is for a line that was said."""
+    _rolling(monkeypatch, OVER_THE_ODDS, UNDER_THE_ODDS)
+    tool = _tool(speaker, config={CHANCE_KEY: HALF_THE_TIME})
+
+    await _hear(tool, TRIGGER)
+    await _hear(tool, TRIGGER)
+
+    assert speech.asked == [QUOTE]
+
+
+async def test_a_lost_roll_ends_the_utterance(
+    monkeypatch, quotes_file, speech, speaker
+):
+    """A sentence carrying two triggers is not twice as likely to be answered."""
+    _rolling(monkeypatch, OVER_THE_ODDS)
+    tool = _tool(speaker, config={CHANCE_KEY: HALF_THE_TIME})
+
+    await _hear(tool, f"{TRIGGER}, that is {OTHER_TRIGGER}")
+
+    assert speech.asked == []
+
+
+async def test_a_server_that_answers_everything_never_rolls(
+    monkeypatch, quotes_file, speech, speaker
+):
+    """The default costs nothing, down to the coin it does not toss."""
+    tossed = _rolling(monkeypatch, OVER_THE_ODDS)
+    tool = _tool(speaker)
+
+    await _hear(tool, TRIGGER)
+
+    assert (speech.asked, tossed) == ([QUOTE], [])
+
+
+async def test_odds_of_nothing_answer_nothing(
+    monkeypatch, quotes_file, speech, speaker
+):
+    """Which is a deployment that wants the rounds and not the lines."""
+    _rolling(monkeypatch, IMPOSSIBLE)
+    tool = _tool(speaker, config={CHANCE_KEY: IMPOSSIBLE})
+
+    await _hear(tool, TRIGGER)
+
+    assert speech.asked == []
+
+
+def test_the_odds_come_from_the_server(quotes_file, speech, speaker):
+    tool = _tool(speaker, config={CHANCE_KEY: HALF_THE_TIME})
+
+    assert tool._chance == HALF_THE_TIME
+
+
+def test_a_server_that_sets_no_odds_answers_everything(quotes_file, speech, speaker):
+    tool = _tool(speaker)
+
+    assert tool._chance == CERTAIN
+
+
+@pytest.mark.parametrize(
+    ("written", "held"), [(2, CERTAIN), (-1, IMPOSSIBLE)]
+)
+def test_odds_outside_the_ends_are_held_at_them(
+    quotes_file, speech, speaker, written, held
+):
+    """Both ends mean something, and everything past them is one of the two."""
+    tool = _tool(speaker, config={CHANCE_KEY: written})
+
+    assert tool._chance == held
+
+
+def test_odds_that_are_not_a_number_will_not_start(quotes_file, speech, speaker):
+    with pytest.raises(ValueError, match=CHANCE_KEY):
+        _tool(speaker, config={CHANCE_KEY: "sometimes"})
+
+
+# ── letting the speaker finish ────────────────────
+
+
+async def _quoting(
+    tool: Quotes, text: str = TRIGGER, user: str = SPEAKER, user_id: int = SPEAKER_ID
+) -> asyncio.Task:
+    """
+    Set a line off and hand back the answer while it is still being held.
+
+    A quote waits for whoever triggered it to stop talking, so a test that wants
+    to say something else in the meantime has to let go of the first utterance
+    first.
+    """
+    saying = asyncio.create_task(
+        tool.handle_utterance(_utterance(text, user, user_id), FakeSession(SOURCE))
+    )
+    await _holding(tool, user_id)
+
+    return saying
+
+
+async def _holding(tool: Quotes, user_id: int = SPEAKER_ID) -> None:
+    """Wait until the line is actually being held, rather than about to be."""
+    for _ in range(HOLDING_ATTEMPTS):
+        if user_id in tool._holding:
+            return
+        await asyncio.sleep(0)
+
+    raise AssertionError("the line was never held")
+
+
+async def _restarted(tool: Quotes, waiting, user_id: int = SPEAKER_ID) -> None:
+    """
+    Wait until the hold is a fresh window rather than the one it was.
+
+    The window a speaker is being given is a future replaced each time they say
+    something else, so a new one in its place is the wait having started again —
+    which is the thing under test, and which waiting out a real window would
+    only be able to guess at.
+    """
+    for _ in range(HOLDING_ATTEMPTS):
+        if tool._holding.get(user_id) is not waiting:
+            return
+        await asyncio.sleep(0)
+
+    raise AssertionError("the wait never started again")
+
+
+async def test_a_line_waits_for_the_speaker_to_stop_talking(
+    quotes_file, speech, speaker
+):
+    """The failure this exists for: the bot answering over the rest of a sentence."""
+    tool = _tool(speaker, quiet=PATIENT_QUIET_WINDOW)
+
+    saying = await _quoting(tool)
+
+    assert speaker.played == []
+    saying.cancel()
+
+
+async def test_a_line_is_said_once_the_speaker_has_gone_quiet(
+    quotes_file, speech, speaker
+):
+    tool = _tool(speaker, quiet=QUIET_WINDOW)
+
+    await _hear(tool, TRIGGER)
+
+    assert speaker.played == [(SOURCE, QUOTE)]
+    assert tool._holding == {}
+
+
+async def test_talking_on_starts_the_wait_again(quotes_file, speech, speaker):
+    """What is waited out is the speaker finishing, not a pause after the trigger."""
+    tool = _tool(speaker, quiet=PATIENT_QUIET_WINDOW)
+    saying = await _quoting(tool)
+    waiting = tool._holding[SPEAKER_ID]
+
+    await _hear(tool, "anyway, where were we")
+    await _restarted(tool, waiting)
+
+    assert speaker.played == []
+    saying.cancel()
+
+
+async def test_the_rest_of_the_channel_does_not_hold_a_line_up(
+    quotes_file, speech, speaker
+):
+    """Somebody else talking is a conversation, not an unfinished sentence."""
+    tool = _tool(speaker, quiet=PATIENT_QUIET_WINDOW)
+    saying = await _quoting(tool)
+    waiting = tool._holding[SPEAKER_ID]
+
+    await _hear(tool, "nothing to do with any of it", OTHER_SPEAKER, OTHER_SPEAKER_ID)
+
+    assert tool._holding[SPEAKER_ID] is waiting
+    saying.cancel()
+
+
+async def test_a_speaker_holding_a_line_sets_off_no_other(
+    quotes_file, speech, speaker
+):
+    """Whatever else is in the rest of the sentence, what they get is the one line."""
+    tool = _tool(speaker, quiet=PATIENT_QUIET_WINDOW)
+    saying = await _quoting(tool)
+
+    await _hear(tool, OTHER_TRIGGER)
+
+    assert speaker.played == []
+    assert tool._recent.ready(OTHER_TRIGGER)
+    saying.cancel()
+
+
+async def test_somebody_holding_a_line_can_still_answer_a_round(
+    quotes_file, speech, speaker, board
+):
+    """Their own sentence is on hold; a round somebody else opened is not."""
+    tool = _tool(speaker, board=board, quiet=PATIENT_QUIET_WINDOW)
+    saying = await _quoting(tool)
+    tool._rounds[OTHER_MOVIE] = Round(
+        OTHER_MOVIE, ANSWER_WINDOW, TIE_WINDOW, asker=ASKER_ID
+    )
+
+    await _hear(tool, f"What is {OTHER_MOVIE}")
+
+    assert board.balance(SPEAKER_ID) == ONE_CREDIT
+    saying.cancel()
+
+
+async def test_the_question_is_only_asked_once_the_wait_is_over(
+    quotes_file, speech, speaker, board
+):
+    """A round opened while the line is still held is one nobody has heard."""
+    tool = _tool(speaker, board=board, quiet=PATIENT_QUIET_WINDOW)
+    saying = await _quoting(tool, user=ASKER, user_id=ASKER_ID)
+
+    await _hear(tool, ANSWER)
+
+    assert board.balance(SPEAKER_ID) == NOTHING
+    saying.cancel()
+
+
+async def test_no_quiet_window_says_the_line_where_it_was_heard(
+    quotes_file, speech, speaker
+):
+    """Which is what the tool did before there was a window at all."""
+    tool = _tool(speaker, quiet=NO_WINDOW)
+
+    await _hear(tool, TRIGGER)
+
+    assert speaker.played == [(SOURCE, QUOTE)]
+    assert tool._holding == {}
+
+
+def test_the_quiet_window_comes_from_the_server(quotes_file, speech, speaker):
+    tool = _tool(speaker, config={QUIET_SECONDS_KEY: SHORT_WINDOW}, quiet=None)
+
+    assert tool._quiet == SHORT_WINDOW
+
+
+def test_a_server_that_sets_no_quiet_window_gets_the_default(
+    quotes_file, speech, speaker
+):
+    tool = _tool(speaker, quiet=None)
+
+    assert tool._quiet == DEFAULT_QUIET_SECONDS
+
+
+def test_a_quiet_window_that_is_not_a_number_will_not_start(
+    quotes_file, speech, speaker
+):
+    with pytest.raises(ValueError, match=QUIET_SECONDS_KEY):
+        _tool(speaker, config={QUIET_SECONDS_KEY: "a moment"})
 
 
 # ── the pre-warm ──────────────────────────────────
