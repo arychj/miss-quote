@@ -378,6 +378,24 @@ Keys are matched through the same slug that names the transcript directory, so `
 | `triggers` | `what happened`, `what did we do`, `recap`, `read me your notes`, `tell me about` | How asking **starts**; which evening is a clause after it. **Replaces** the default |
 | `address_window_seconds` | `15` | How long the name is held when it arrives in an utterance of its own, so the speaker's next one can be the question. `0` wants the whole question in one breath |
 | `clause_window_seconds` | `1.5` | How long a question that named no evening waits to see whether one is still coming. Covered by the preamble, so it costs nothing to listen to. `0` answers the moment the question lands |
+| `post_transcripts` | `false` | Whether the room watches itself being transcribed, in one message in `channel` that is rewritten as it talks; see [showing it as it is said](#showing-it-as-it-is-said) |
+| `transcript_lines` | `10` | How many lines are up at once |
+| `transcript_refresh_seconds` | `2` | How long the feed waits after each write before writing again. Held at `0.25`; `0` turns the feed off |
+
+#### Showing it as it is said {#showing-it-as-it-is-said}
+
+`post_transcripts` puts the last `transcript_lines` of what the room has said into **one message** in the same `channel` the summary goes to, and rewrites that message as the room talks. It is off unless a channel asks for it, and that is a deliberate asymmetry rather than caution: the transcript on disk is a file in a volume with a retention window, while the same words in a text channel are permanent, searchable, and readable by everyone in the server rather than everyone who was in the room.
+
+**It writes on change, not on a timer.** An utterance adds a line to a ring and nothing else; a loop per room writes the block when what it would say differs from what is on the message, then waits out `transcript_refresh_seconds` before looking again. A quiet room costs nothing, and a burst of four people landing together is one edit rather than four.
+
+That shape is what keeps it inside Discord's limits. Editing a message is roughly **five requests every five seconds per channel** — against two every ten minutes for a voice channel's status, which is why this is a message and [`scoreboard`](#scoreboard) is a topic. The default of two seconds spends a quarter of that, leaving room for a summary or a fine posted in the same channel. Below `0.25` is held there, because discord.py sleeps out a rate limit instead of failing: asking for more buys a feed that silently runs behind a room that thinks it is watching itself live.
+
+The wait is measured from the **end** of a write, so an edit that spent a second sitting out a rate limit is followed by the whole interval rather than by an already-queued next one. A slow Discord slows the feed instead of building a backlog.
+
+Two things are worth knowing before you turn it on:
+
+- **Lines are fenced and trimmed.** Each is `Name: what they said`, cut to 180 characters so one person reading a paragraph aloud cannot clear the rest off, with backticks removed and whitespace collapsed. The code fence is what stops an ASR transcript of somebody saying "at everyone" from pinging the server.
+- **A restart posts a new message.** Which message is being written to is held in memory only, so a redeploy leaves the old block where it was, stale, and starts another. The alternative is a stored ID to keep in step with a channel somebody may have cleared, for a block a reader can see has stopped moving.
 
 #### Writing it down
 

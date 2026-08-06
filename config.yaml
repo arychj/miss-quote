@@ -694,6 +694,37 @@ servers:
               #   - read me your notes
               #   - tell me about
 
+              # Whether the room watches itself: the last few lines of what has
+              # been said, kept in ONE message in `channel` above and rewritten
+              # as the room talks, rather than a message per line.
+              #
+              # Off, and think before turning it on. The transcript on disk is a
+              # file in a volume with a retention window; the same words in a
+              # text channel are permanent, searchable, and readable by everyone
+              # in the server rather than everyone who was in the room. A
+              # channel that names nowhere to post shows nothing either.
+              #
+              # post_transcripts: false
+
+              # How many lines are up at once. About what a client shows without
+              # anybody scrolling; what the evening said is the transcript, and
+              # there is a tool above for asking about that.
+              #
+              # transcript_lines: 10
+
+              # How long the feed waits after each write before writing again.
+              # Nothing is written unless something was said, so this is a floor
+              # on a busy room rather than a tick.
+              #
+              # Editing a message is about five requests every five seconds per
+              # channel, so two seconds is a quarter of the allowance — enough
+              # that a summary posted in the same channel is not queueing behind
+              # the transcript. Below 0.25 is held there: discord.py sleeps out
+              # a rate limit rather than failing, so asking for more only buys a
+              # feed that silently runs behind. 0 turns the feed off.
+              #
+              # transcript_refresh_seconds: 2
+
       # Says things out loud. Every other tool that answers a channel goes
       # through this one, so a server without it hears nothing: fines are still
       # counted, rounds are still paid, and neither is spoken. Which is said
