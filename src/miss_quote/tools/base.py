@@ -191,6 +191,21 @@ class Ticker(Protocol):
         """
         ...
 
+    async def clear(self, server: str, channel: str) -> None:
+        """
+        Take the message down, if one is up.
+
+        For text that stops being current rather than changing again — a feed
+        whose room has emptied. Nothing comes back, unlike `show`, because there
+        is nothing a caller could do about a failure: what it wanted was the
+        message gone, and it is not going to ask a second time on the way out of
+        a channel it has already left.
+
+        Clearing what was never shown is not an error. So is clearing a message
+        somebody else deleted first.
+        """
+        ...
+
 
 class SilentTicker:
     """
@@ -204,6 +219,9 @@ class SilentTicker:
         logger.debug("Nowhere to show %d characters for %s.", len(text), server)
 
         return False
+
+    async def clear(self, server: str, channel: str) -> None:
+        logger.debug("Nothing to take down in '%s' for %s.", channel, server)
 
 
 @runtime_checkable

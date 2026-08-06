@@ -8,11 +8,21 @@ that keeps being edited. It is for text worth reading while it is current and no
 worth a channel full of messages afterwards — a running transcript being the one
 thing that wants it.
 
-**The message is held in memory and nowhere else.** A restart posts a new one and
-leaves the old one where it was, stale and no longer written to. Persisting the
-ID would buy an edit across a redeploy at the cost of a file to keep in step with
-a channel somebody may have cleared in the meantime, and a stale block that stops
-updating is a thing a reader can see for themselves.
+**The message is pinned while it is live**, which is what makes it reachable
+while a room is talking rather than something to scroll for. Deleting it unpins
+it, so taking the feed down needs no second call and nothing is left holding one
+of a channel's fifty pins.
+
+**The pin list is the memory.** Which message is being written to is held in
+memory and nowhere else, so a process that goes away mid-session leaves one
+behind — pinned, and no longer written to. Rather than persist an ID to a file
+that would have to be kept in step with a channel somebody may have cleared, the
+next post reads the channel's pins and takes down whatever this bot left there.
+Fifty pins is a ceiling a slow leak would eventually reach; a leak that is swept
+on the way past never gets there. See `_swept`.
+
+This bot pins nothing else. If it ever does, `_swept` is the line that has to
+learn the difference.
 
 **Rate limits are why this exists at all.** Editing a message is a per-channel
 bucket of roughly five requests every five seconds, where setting a voice
@@ -47,6 +57,12 @@ REFUSED = 400
 # What a message cut to the limit ends with, so a reader can tell text that ran
 # out from text that was cut off.
 ELLIPSIS = "…"
+
+# What Discord will not take a fifty-first of. Its own case because it is the one
+# refusal that says something about the channel rather than about the request:
+# every other 400 here is a message Discord would never accept, and this one is a
+# channel that has no room for another pin.
+PINS_FULL = 30003
 
 
 class DiscordTicker:
@@ -133,17 +149,67 @@ class DiscordTicker:
 
         return True
 
+    async def clear(self, server: str, channel: str) -> None:
+        """
+        Delete the message being rewritten, if there is one.
+
+        What the feed is for is a room watching itself, and a room that has
+        emptied is not watching anything: what would be left is the last thing
+        said before everybody went to bed, sitting in the channel looking
+        current. The summary is what the evening leaves behind.
+
+        Deleting is all of it. A message that is gone is off the pin list by
+        definition, so there is no unpinning to do and nothing left holding one
+        of the channel's fifty.
+
+        Nothing is reported. A message somebody deleted first is the state being
+        asked for, and everything else is a channel the bot is on its way out of
+        — there is no next attempt to make it worth telling anybody about, so a
+        failure is a line in the log and a handle let go of either way.
+        """
+        held = self._shown.pop((server, channel), None)
+        if held is None:
+            return
+
+        try:
+            await held.delete()
+        except discord.NotFound:
+            logger.debug(
+                "The message showing %s's transcript in '%s' was already gone.",
+                server,
+                channel,
+            )
+        except discord.Forbidden:
+            logger.warning(
+                "Not allowed to delete in '%s'; %s's transcript will stay up. "
+                "The bot needs Manage Messages on the channel.",
+                channel,
+                server,
+            )
+        except (discord.HTTPException, OSError, asyncio.TimeoutError) as exc:
+            logger.warning(
+                "Could not take %s's transcript out of '%s': %s", server, channel, exc
+            )
+        else:
+            logger.info("Took %s's transcript out of '#%s'.", server, channel)
+
     async def _post(self, server: str, channel: str, target: Any, body: str) -> bool:
         """
-        Put the first message up, and hold on to it for every one after.
+        Put the first message up, pin it, and hold on to it for every one after.
 
         Held only on success, so a channel the bot cannot post in is tried again
         next time rather than remembered as somewhere it already posted.
+
+        The sweep comes first. Anything this bot left pinned here is a feed from
+        a process that went away mid-session, and posting beside it would leave
+        two blocks up with only one of them moving — as well as spending a pin
+        that nothing will ever come back for.
         """
+        await self._swept(server, channel, target)
+
         try:
-            self._shown[(server, channel)] = await target.send(
-                body, allowed_mentions=_unmentioned()
-            )
+            posted = await target.send(body, allowed_mentions=_unmentioned())
+            self._shown[(server, channel)] = posted
         except discord.Forbidden:
             logger.warning(
                 "Not allowed to post in '%s'; %s will not get a transcript there. "
@@ -170,7 +236,83 @@ class DiscordTicker:
 
         logger.info("Showing %s's transcript in '#%s'.", server, channel)
 
+        await self._pinned(server, channel, posted)
+
         return True
+
+    async def _pinned(self, server: str, channel: str, message: Any) -> None:
+        """
+        Pin the block, so a room talking can reach it rather than scroll for it.
+
+        Never fatal. The message is up, which is the thing that was asked for; a
+        feed nobody can reach from the pin list is worse than one that scrolls
+        and better than none. A channel with no room left for a pin is worth its
+        own line, because what has to be done about it is emptying a pin list
+        rather than granting a permission.
+        """
+        try:
+            await message.pin()
+        except discord.Forbidden:
+            logger.warning(
+                "Not allowed to pin in '%s'; %s's transcript will not be pinned. "
+                "The bot needs Manage Messages on the channel.",
+                channel,
+                server,
+            )
+        except discord.HTTPException as exc:
+            if exc.code == PINS_FULL:
+                logger.warning(
+                    "'%s' has no room for another pin, so %s's transcript stays "
+                    "unpinned. Something has to come off the pin list.",
+                    channel,
+                    server,
+                )
+                return
+
+            logger.warning("Could not pin the transcript in '%s': %s", channel, exc)
+        except (OSError, asyncio.TimeoutError) as exc:
+            logger.warning(
+                "Could not reach Discord to pin the transcript in '%s': %s",
+                channel,
+                exc,
+            )
+
+    async def _swept(self, server: str, channel: str, target: Any) -> None:
+        """
+        Take down anything this bot left pinned in the channel.
+
+        What that is, is a feed from a process that went away mid-session: the
+        message it was writing to is held in memory, so nothing came back for it
+        and it is both stale and holding one of the channel's fifty pins. The
+        pin list is where those are findable, which is the whole reason the live
+        message is pinned at all.
+
+        Only this bot's own messages, and this bot pins nothing else — a pin
+        somebody put on a message of somebody else's is not ours to take off,
+        and one it put on a message of the bot's is a person pinning something
+        the bot is about to delete anyway.
+
+        Never fatal, and swallowed whole: this runs on the way to posting, and a
+        channel whose pins cannot be read is a feed that goes up beside its
+        predecessor rather than no feed at all.
+        """
+        me = getattr(getattr(target, "guild", None), "me", None)
+        if me is None:
+            return
+
+        try:
+            for pinned in await target.pins():
+                if pinned.author.id != me.id:
+                    continue
+
+                await pinned.delete()
+                logger.info(
+                    "Took a transcript %s left pinned in '#%s' after a restart.",
+                    server,
+                    channel,
+                )
+        except (discord.HTTPException, OSError, asyncio.TimeoutError) as exc:
+            logger.warning("Could not read what is pinned in '%s': %s", channel, exc)
 
 
 def _unmentioned() -> discord.AllowedMentions:
