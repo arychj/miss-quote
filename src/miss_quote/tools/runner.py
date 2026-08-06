@@ -32,8 +32,10 @@ from miss_quote.tools.base import (
     Service,
     SilentAnnouncer,
     SilentSpeaker,
+    SilentTicker,
     SilentTopic,
     Speaker,
+    Ticker,
     Tool,
     Toolbox,
     ToolContext,
@@ -68,6 +70,7 @@ class ToolRunner:
         speaker: Speaker | None = None,
         topic: Topic | None = None,
         announcer: Announcer | None = None,
+        ticker: Ticker | None = None,
     ) -> None:
         servers = file_cfg.servers if servers is None else servers
         registry = TOOLS if registry is None else registry
@@ -75,6 +78,7 @@ class ToolRunner:
         self._speaker = SilentSpeaker() if speaker is None else speaker
         self._topic = SilentTopic() if topic is None else topic
         self._announcer = SilentAnnouncer() if announcer is None else announcer
+        self._ticker = SilentTicker() if ticker is None else ticker
         self._on_utterance: dict[int, list[Tool]] = {}
         self._on_finished: dict[int, list[Tool]] = {}
         self._on_joined: dict[int, list[Tool]] = {}
@@ -128,6 +132,7 @@ class ToolRunner:
                         tools=toolbox.view(tool_class),
                         topic=self._topic,
                         announcer=self._announcer,
+                        ticker=self._ticker,
                     )
                 )
             except Exception as exc:

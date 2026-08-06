@@ -17,6 +17,7 @@ from miss_quote.bot.announcer import DiscordAnnouncer
 from miss_quote.bot.audio_sink import STTAudioSink
 from miss_quote.bot.presence import DiscordPresence
 from miss_quote.bot.speaker import DiscordSpeaker
+from miss_quote.bot.ticker import DiscordTicker
 from miss_quote.bot.topic import DiscordTopic
 from miss_quote.config import (
     MONITORED_CHANNELS_KEY,
@@ -145,8 +146,17 @@ class STTBot:
         self._speaker = DiscordSpeaker(self._guild)
         self._topic = DiscordTopic(self._guild)
         self._announcer = DiscordAnnouncer(self._guild)
+
+        # Built on the announcer rather than beside it: resolving a channel name
+        # is a question with one answer, and two of them would disagree the
+        # moment either changed.
+        self._ticker = DiscordTicker(self._announcer)
+
         self._tools = ToolRunner(
-            speaker=self._speaker, topic=self._topic, announcer=self._announcer
+            speaker=self._speaker,
+            topic=self._topic,
+            announcer=self._announcer,
+            ticker=self._ticker,
         )
         self._processor = STTProcessor(self._tools)
         self._sessions: dict[int, TranscriptSession] = {}

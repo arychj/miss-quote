@@ -46,9 +46,10 @@ a moment: a tool defining only these handles nothing, and is still reported as
 inert.
 
 A tool is handed a `Topic`, which is how it puts one line where the channel can
-read it, and an `Announcer`, which is how it posts something longer somewhere it
-will still be later. Nothing in this package imports discord: both are somewhere
-to put words, and the bot supplies them against a voice channel and a named text
+read it, an `Announcer`, which is how it posts something longer somewhere it will
+still be later, and a `Ticker`, which is how it keeps one message and goes on
+rewriting it. Nothing in this package imports discord: all three are somewhere to
+put words, and the bot supplies them against a voice channel and a named text
 channel. A `Speaker` — somewhere to play audio — is handed over on the same
 terms, but only the tool that owns playback reads it; everything else answers out
 loud by asking that tool.
@@ -163,6 +164,46 @@ class Announcer(Protocol):
         read half of.
         """
         ...
+
+
+@runtime_checkable
+class Ticker(Protocol):
+    """Somewhere a tool can keep one message that goes on changing."""
+
+    async def show(self, server: str, channel: str, text: str) -> bool:
+        """
+        Put text in a channel and keep rewriting the same message with it.
+
+        The third of the three, and the one the other two cannot be: `Topic` is
+        one line that replaces the last one and holds no history, `Announcer`
+        adds a message that joins the ones before it, and this holds one message
+        and edits it in place. What it is for is text worth reading while it is
+        current and not worth a channel full of messages afterwards — a running
+        transcript being the one that exists.
+
+        Whoever implements this owns the message: which one it is, when a new
+        one has to be posted because the old one is gone, and what happens to it
+        across a restart. The caller says what it should say now.
+
+        False is worth reporting to whoever asked and nothing else; nothing
+        retries on its own, since what would be sent again is about to be
+        replaced by the next thing to say anyway.
+        """
+        ...
+
+
+class SilentTicker:
+    """
+    A ticker with nowhere to show anything.
+
+    The runner's default, so a tool that has something to show always has one
+    and never has to check. False, because nothing was shown.
+    """
+
+    async def show(self, server: str, channel: str, text: str) -> bool:
+        logger.debug("Nowhere to show %d characters for %s.", len(text), server)
+
+        return False
 
 
 @runtime_checkable
@@ -337,6 +378,7 @@ class ToolContext:
     tools: Toolbox = field(default_factory=Toolbox)
     topic: Topic = field(default_factory=SilentTopic)
     announcer: Announcer = field(default_factory=SilentAnnouncer)
+    ticker: Ticker = field(default_factory=SilentTicker)
 
 
 class Tool:
@@ -375,6 +417,7 @@ class Tool:
         self.tools = context.tools
         self.topic = context.topic
         self.announcer = context.announcer
+        self.ticker = context.ticker
 
     def __repr__(self) -> str:
         return f"<{type(self).__name__} {self.name!r} for {self.server!r}>"
